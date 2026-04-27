@@ -8,3 +8,5 @@ version = "0.1.0"
 
 [workspace.dependencies]
 protocol = { path = "crates/protocol" }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
