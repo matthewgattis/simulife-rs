@@ -1,0 +1,199 @@
+use std::sync::Arc;
+
+use protocol::{CHUNK_EDGE, Chunk};
+use winit::{
+    application::ApplicationHandler,
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, EventLoopProxy},
+    window::{Window, WindowId},
+};
+
+use crate::net;
+use crate::render::RenderState;
+
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    Network(NetworkStatus),
+    Chunks(Vec<Chunk>),
+}
+
+#[derive(Debug, Clone)]
+pub enum NetworkStatus {
+    Connecting,
+    Connected { world_chunks_x: u32, world_chunks_y: u32 },
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    pub center: glam::Vec2,
+    pub cells_visible_y: f32,
+}
+
+impl Camera {
+    pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
+        let cells_y = self.cells_visible_y.max(1.0);
+        let cells_x = cells_y * aspect;
+        let scale_x = 2.0 / cells_x;
+        let scale_y = -2.0 / cells_y;
+        glam::Mat4::from_cols_array_2d(&[
+            [scale_x, 0.0, 0.0, 0.0],
+            [0.0, scale_y, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-self.center.x * scale_x, -self.center.y * scale_y, 0.0, 1.0],
+        ])
+    }
+}
+
+pub struct App {
+    state: Option<RenderState>,
+    network: NetworkStatus,
+    chunks: Vec<Chunk>,
+    camera: Camera,
+    dragging: bool,
+    last_cursor: Option<glam::Vec2>,
+    proxy: EventLoopProxy<UserEvent>,
+    rt: Arc<tokio::runtime::Runtime>,
+    network_started: bool,
+}
+
+impl App {
+    pub fn new(rt: Arc<tokio::runtime::Runtime>, proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            state: None,
+            network: NetworkStatus::Connecting,
+            chunks: Vec::new(),
+            camera: Camera {
+                center: glam::Vec2::ZERO,
+                cells_visible_y: 64.0,
+            },
+            dragging: false,
+            last_cursor: None,
+            proxy,
+            rt,
+            network_started: false,
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("cellular-automata viewer")
+                        .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 768.0)),
+                )
+                .expect("create window"),
+        );
+        let state = pollster::block_on(RenderState::new(window))
+            .expect("initialize wgpu");
+        self.state = Some(state);
+
+        if !self.network_started {
+            self.network_started = true;
+            let proxy = self.proxy.clone();
+            self.rt.spawn(async move {
+                if let Err(e) = net::run_client(proxy.clone()).await {
+                    let _ = proxy.send_event(UserEvent::Network(
+                        NetworkStatus::Failed(format!("{e:#}")),
+                    ));
+                }
+            });
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Network(status) => {
+                println!("network: {status:?}");
+                if let NetworkStatus::Connected {
+                    world_chunks_x,
+                    world_chunks_y,
+                } = &status
+                {
+                    let edge = CHUNK_EDGE as f32;
+                    let world_w = (*world_chunks_x as f32) * edge;
+                    let world_h = (*world_chunks_y as f32) * edge;
+                    self.camera.center = glam::vec2(world_w * 0.5, world_h * 0.5);
+                    self.camera.cells_visible_y = world_h * 1.1;
+                }
+                self.network = status;
+            }
+            UserEvent::Chunks(chunks) => {
+                println!("loaded {} chunks", chunks.len());
+                self.chunks = chunks;
+            }
+        }
+        if let Some(state) = &self.state {
+            state.window().request_redraw();
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        let response = state.handle_window_event(&event);
+        if response.repaint {
+            state.window().request_redraw();
+        }
+        if response.consumed {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                state.resize(size.width, size.height);
+                state.window().request_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let cursor = glam::vec2(position.x as f32, position.y as f32);
+                if self.dragging {
+                    if let Some(last) = self.last_cursor {
+                        let delta = cursor - last;
+                        let cells_per_pixel =
+                            self.camera.cells_visible_y / state.height().max(1) as f32;
+                        self.camera.center -= delta * cells_per_pixel;
+                        state.window().request_redraw();
+                    }
+                }
+                self.last_cursor = Some(cursor);
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button,
+                ..
+            } => {
+                if button == MouseButton::Left {
+                    self.dragging = button_state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 50.0,
+                };
+                let factor = (-scroll * 0.1).exp();
+                self.camera.cells_visible_y =
+                    (self.camera.cells_visible_y * factor).clamp(4.0, 4096.0);
+                state.window().request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                state.render(&self.network, &self.chunks, &self.camera);
+            }
+            _ => {}
+        }
+    }
+}
