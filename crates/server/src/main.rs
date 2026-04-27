@@ -5,6 +5,8 @@ use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Occupant, ServerMessage,
 };
 use quinn::{Endpoint, ServerConfig};
+use tracing::{debug, error, info};
+use tracing_subscriber::EnvFilter;
 
 const LISTEN_ADDR: &str = "127.0.0.1:4433";
 const WORLD_CHUNKS_X: u32 = 4;
@@ -18,35 +20,43 @@ struct World {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install default rustls crypto provider");
 
     let world = Arc::new(build_world(WORLD_CHUNKS_X, WORLD_CHUNKS_Y));
-    println!(
-        "world: {}×{} chunks ({} cells)",
-        world.chunks_x,
-        world.chunks_y,
-        world.chunks.len() * CHUNK_AREA
+    info!(
+        chunks_x = world.chunks_x,
+        chunks_y = world.chunks_y,
+        cells = world.chunks.len() * CHUNK_AREA,
+        "world built"
     );
 
     let (server_config, cert_der) = make_server_config()?;
     let addr: SocketAddr = LISTEN_ADDR.parse()?;
     let endpoint = Endpoint::server(server_config, addr)?;
 
-    println!("server listening on {addr}");
-    println!("self-signed cert ({} bytes DER) — clients must trust this", cert_der.len());
+    info!(%addr, "server listening");
+    info!(cert_bytes = cert_der.len(), "self-signed cert generated (clients must trust this)");
 
     while let Some(incoming) = endpoint.accept().await {
         let world = Arc::clone(&world);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(incoming, world).await {
-                eprintln!("connection error: {e:#}");
+                error!("connection error: {e:#}");
             }
         });
     }
 
     Ok(())
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,quinn=warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 fn build_world(chunks_x: u32, chunks_y: u32) -> World {
@@ -100,17 +110,21 @@ fn make_server_config() -> Result<(ServerConfig, Vec<u8>)> {
 
 async fn handle_connection(incoming: quinn::Incoming, world: Arc<World>) -> Result<()> {
     let conn = incoming.await?;
-    println!("connection from {}", conn.remote_address());
+    let remote = conn.remote_address();
+    info!(%remote, "connection accepted");
 
     loop {
         let stream = match conn.accept_bi().await {
             Ok(s) => s,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                info!(%remote, "connection closed");
+                return Ok(());
+            }
         };
         let world = Arc::clone(&world);
         tokio::spawn(async move {
             if let Err(e) = handle_stream(stream, world).await {
-                eprintln!("stream error: {e:#}");
+                error!("stream error: {e:#}");
             }
         });
     }
@@ -122,7 +136,7 @@ async fn handle_stream(
 ) -> Result<()> {
     let buf = recv.read_to_end(64 * 1024).await?;
     let msg: ClientMessage = rmp_serde::from_slice(&buf)?;
-    println!("received: {msg:?}");
+    debug!(?msg, "received");
 
     let response = match msg {
         ClientMessage::Hello => ServerMessage::Welcome {

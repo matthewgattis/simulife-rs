@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use protocol::{CHUNK_EDGE, Cell, Chunk, Occupant};
+use tracing::info;
 use wgpu::util::DeviceExt;
 use winit::{event::WindowEvent, window::Window};
 
@@ -50,11 +51,8 @@ impl RenderState {
             .ok_or_else(|| anyhow::anyhow!("surface incompatible with adapter"))?;
         surface.configure(&device, &config);
 
-        println!(
-            "wgpu adapter: {} ({:?})",
-            adapter.get_info().name,
-            adapter.get_info().backend
-        );
+        let info_ = adapter.get_info();
+        info!(adapter = %info_.name, backend = ?info_.backend, "wgpu adapter selected");
 
         let egui_ctx = egui::Context::default();
         let egui_winit = egui_winit::State::new(

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
+use tracing::info;
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::{NetworkStatus, UserEvent};
@@ -16,7 +17,7 @@ pub async fn run_client(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
 
     let server_addr = SERVER_ADDR.parse()?;
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
-    println!("connected to {}", conn.remote_address());
+    info!(remote = %conn.remote_address(), "connected");
 
     let welcome = request(&conn, &ClientMessage::Hello).await?;
     let (world_chunks_x, world_chunks_y) = match welcome {
@@ -34,7 +35,7 @@ pub async fn run_client(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
     let batch = request(&conn, &ClientMessage::Subscribe).await?;
     match batch {
         ServerMessage::ChunkBatch(chunks) => {
-            println!("received {} chunks", chunks.len());
+            info!(count = chunks.len(), "received chunk batch");
             let _ = proxy.send_event(UserEvent::Chunks(chunks));
         }
         other => bail!("expected ChunkBatch, got {other:?}"),

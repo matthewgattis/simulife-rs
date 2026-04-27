@@ -19,3 +19,5 @@ egui-wgpu.workspace = true
 egui-winit.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

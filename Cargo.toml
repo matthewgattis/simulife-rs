@@ -23,3 +23,5 @@ egui-wgpu = "0.32"
 egui-winit = "0.32"
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use protocol::{CHUNK_EDGE, Chunk};
+use tracing::info;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
@@ -110,7 +111,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Network(status) => {
-                println!("network: {status:?}");
+                info!(?status, "network status");
                 if let NetworkStatus::Connected {
                     world_chunks_x,
                     world_chunks_y,
@@ -125,7 +126,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.network = status;
             }
             UserEvent::Chunks(chunks) => {
-                println!("loaded {} chunks", chunks.len());
+                info!(count = chunks.len(), "world snapshot loaded");
                 self.chunks = chunks;
             }
         }
