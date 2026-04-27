@@ -1,9 +1,18 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use protocol::{
-    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Occupant, ServerMessage,
+    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Genome, Occupant,
+    ServerMessage,
 };
 use quinn::{Endpoint, ServerConfig};
 use tokio::sync::broadcast;
@@ -53,6 +62,7 @@ struct SimState {
     chunks_y: u32,
     world: std::sync::Mutex<Vec<Chunk>>,
     tick_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    next_plant_id: AtomicU32,
 }
 
 #[tokio::main]
@@ -71,6 +81,7 @@ async fn main() -> Result<()> {
         chunks_y: args.world_height,
         world: std::sync::Mutex::new(chunks),
         tick_tx,
+        next_plant_id: AtomicU32::new(1),
     });
 
     info!(
@@ -233,9 +244,71 @@ async fn handle_connection(incoming: quinn::Incoming, state: Arc<SimState>) -> R
         }
     });
 
+    let uni_conn = conn.clone();
+    let uni_state = Arc::clone(&state);
+    let uni_task = tokio::spawn(async move {
+        accept_client_uni_streams(uni_conn, uni_state).await;
+    });
+
     let result = handle_request_streams(conn, state).await;
     push_task.abort();
+    uni_task.abort();
     result
+}
+
+async fn accept_client_uni_streams(conn: quinn::Connection, state: Arc<SimState>) {
+    loop {
+        let recv = match conn.accept_uni().await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = handle_client_uni(recv, state).await {
+                warn!("client uni stream error: {e:#}");
+            }
+        });
+    }
+}
+
+async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) -> Result<()> {
+    let buf = recv.read_to_end(64 * 1024).await?;
+    let msg: ClientMessage = rmp_serde::from_slice(&buf)?;
+    debug!(?msg, "received client command");
+
+    match msg {
+        ClientMessage::SpawnSprout { x, y, facing } => {
+            spawn_sprout(&state, x, y, facing);
+        }
+        other => warn!(?other, "unexpected message on client uni stream"),
+    }
+    Ok(())
+}
+
+fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
+    let edge = CHUNK_EDGE as i32;
+    let max_x = state.chunks_x as i32 * edge;
+    let max_y = state.chunks_y as i32 * edge;
+    if x < 0 || y < 0 || x >= max_x || y >= max_y {
+        warn!(x, y, "spawn out of bounds");
+        return;
+    }
+    let cx = x / edge;
+    let cy = y / edge;
+    let lx = (x % edge) as usize;
+    let ly = (y % edge) as usize;
+    let chunk_idx = (cy as usize) * (state.chunks_x as usize) + (cx as usize);
+    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+
+    let plant = state.next_plant_id.fetch_add(1, Ordering::Relaxed);
+    let mut chunks = state.world.lock().expect("sim lock poisoned");
+    chunks[chunk_idx].cells[cell_idx].occupant = Occupant::Sprout {
+        plant,
+        energy: 100,
+        facing,
+        genome: Box::new(Genome { bytes: Vec::new() }),
+    };
+    info!(x, y, plant, ?facing, "sprout spawned");
 }
 
 async fn handle_request_streams(conn: quinn::Connection, state: Arc<SimState>) -> Result<()> {
@@ -266,17 +339,23 @@ async fn handle_stream(
     debug!(?msg, "received");
 
     let response = match msg {
-        ClientMessage::Hello => ServerMessage::Welcome {
+        ClientMessage::Hello => Some(ServerMessage::Welcome {
             world_chunks_x: state.chunks_x,
             world_chunks_y: state.chunks_y,
-        },
+        }),
         ClientMessage::Subscribe => {
             let chunks = state.world.lock().expect("sim lock poisoned").clone();
-            ServerMessage::ChunkBatch(chunks)
+            Some(ServerMessage::ChunkBatch(chunks))
+        }
+        ClientMessage::SpawnSprout { .. } => {
+            warn!("SpawnSprout arrived on bidi stream; expected on uni");
+            None
         }
     };
-    let bytes = rmp_serde::to_vec(&response)?;
-    send.write_all(&bytes).await?;
+    if let Some(response) = response {
+        let bytes = rmp_serde::to_vec(&response)?;
+        send.write_all(&bytes).await?;
+    }
     send.finish()?;
 
     Ok(())

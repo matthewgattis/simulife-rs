@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, info, warn};
 use winit::event_loop::EventLoopProxy;
 
@@ -10,6 +11,7 @@ use crate::app::{NetworkStatus, UserEvent};
 pub async fn run_client(
     server_addr: SocketAddr,
     proxy: EventLoopProxy<UserEvent>,
+    mut outgoing: UnboundedReceiver<ClientMessage>,
 ) -> Result<()> {
     let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connecting));
 
@@ -41,6 +43,15 @@ pub async fn run_client(
         other => bail!("expected ChunkBatch, got {other:?}"),
     }
 
+    let outgoing_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = outgoing.recv().await {
+            if let Err(e) = send_command(&outgoing_conn, &msg).await {
+                warn!("send command failed: {e:#}");
+            }
+        }
+    });
+
     info!("listening for tick updates");
     loop {
         let mut recv = match conn.accept_uni().await {
@@ -60,6 +71,13 @@ pub async fn run_client(
             other => warn!(?other, "unexpected push message"),
         }
     }
+}
+
+async fn send_command(conn: &quinn::Connection, msg: &ClientMessage) -> Result<()> {
+    let mut send = conn.open_uni().await?;
+    send.write_all(&rmp_serde::to_vec(msg)?).await?;
+    send.finish()?;
+    Ok(())
 }
 
 async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<ServerMessage> {

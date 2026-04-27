@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use protocol::{CHUNK_EDGE, Chunk};
+use protocol::{CHUNK_EDGE, Chunk, ClientMessage};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 use winit::{
     application::ApplicationHandler,
@@ -44,6 +45,12 @@ impl Camera {
             [-self.center.x * scale_x, -self.center.y * scale_y, 0.0, 1.0],
         ])
     }
+
+    pub fn pixel_to_world(&self, pixel: glam::Vec2, window_size: glam::Vec2) -> glam::Vec2 {
+        let cells_per_pixel = self.cells_visible_y / window_size.y.max(1.0);
+        let offset = pixel - window_size * 0.5;
+        self.center + offset * cells_per_pixel
+    }
 }
 
 pub struct App {
@@ -54,6 +61,8 @@ pub struct App {
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
     server_addr: SocketAddr,
+    outgoing: UnboundedSender<ClientMessage>,
+    pending_outgoing_rx: Option<UnboundedReceiver<ClientMessage>>,
     proxy: EventLoopProxy<UserEvent>,
     rt: Arc<tokio::runtime::Runtime>,
     network_started: bool,
@@ -64,6 +73,8 @@ impl App {
         rt: Arc<tokio::runtime::Runtime>,
         proxy: EventLoopProxy<UserEvent>,
         server_addr: SocketAddr,
+        outgoing_tx: UnboundedSender<ClientMessage>,
+        outgoing_rx: UnboundedReceiver<ClientMessage>,
     ) -> Self {
         Self {
             state: None,
@@ -76,6 +87,8 @@ impl App {
             dragging: false,
             last_cursor: None,
             server_addr,
+            outgoing: outgoing_tx,
+            pending_outgoing_rx: Some(outgoing_rx),
             proxy,
             rt,
             network_started: false,
@@ -105,8 +118,12 @@ impl ApplicationHandler<UserEvent> for App {
             self.network_started = true;
             let proxy = self.proxy.clone();
             let server_addr = self.server_addr;
+            let outgoing_rx = self
+                .pending_outgoing_rx
+                .take()
+                .expect("outgoing receiver consumed twice");
             self.rt.spawn(async move {
-                if let Err(e) = net::run_client(server_addr, proxy.clone()).await {
+                if let Err(e) = net::run_client(server_addr, proxy.clone(), outgoing_rx).await {
                     let _ = proxy.send_event(UserEvent::Network(
                         NetworkStatus::Failed(format!("{e:#}")),
                     ));
@@ -203,7 +220,14 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window().request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.render(&self.network, self.server_addr, &self.chunks, &self.camera);
+                state.render(
+                    &self.network,
+                    self.server_addr,
+                    &self.chunks,
+                    &self.camera,
+                    self.last_cursor,
+                    &self.outgoing,
+                );
             }
             _ => {}
         }

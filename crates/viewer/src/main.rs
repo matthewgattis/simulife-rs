@@ -6,6 +6,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::EventLoop;
 
@@ -32,7 +33,9 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
-    let mut app = App::new(rt, proxy, args.server_addr);
+    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+
+    let mut app = App::new(rt, proxy, args.server_addr, outgoing_tx, outgoing_rx);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

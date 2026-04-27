@@ -64,6 +64,7 @@ pub struct Chunk {
 pub enum ClientMessage {
     Hello,
     Subscribe,
+    SpawnSprout { x: i32, y: i32, facing: Direction },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -1,7 +1,8 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
-use protocol::{CHUNK_EDGE, Cell, Chunk, Occupant};
+use protocol::{CHUNK_EDGE, Cell, Chunk, ClientMessage, Direction, Occupant};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 use wgpu::util::DeviceExt;
 use winit::{event::WindowEvent, window::Window};
@@ -103,6 +104,8 @@ impl RenderState {
         server_addr: SocketAddr,
         chunks: &[Chunk],
         camera: &Camera,
+        cursor_px: Option<glam::Vec2>,
+        outgoing: &UnboundedSender<ClientMessage>,
     ) {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -124,9 +127,16 @@ impl RenderState {
         self.cell_renderer
             .upload_instances(&self.device, &self.queue, &instances);
 
+        let cursor_world = cursor_px.map(|px| {
+            camera.pixel_to_world(
+                px,
+                glam::vec2(self.config.width as f32, self.config.height as f32),
+            )
+        });
+
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, network, server_addr, chunks.len());
+            draw_ui(ctx, network, server_addr, chunks.len(), cursor_world, outgoing);
         });
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
@@ -432,6 +442,8 @@ fn draw_ui(
     network: &NetworkStatus,
     server_addr: SocketAddr,
     chunk_count: usize,
+    cursor_world: Option<glam::Vec2>,
+    outgoing: &UnboundedSender<ClientMessage>,
 ) {
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
@@ -460,5 +472,27 @@ fn draw_ui(
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
             ui.label("Drag = pan, Scroll = zoom");
+            ui.separator();
+            match cursor_world {
+                Some(w) => {
+                    ui.label(format!("Cursor: ({:.0}, {:.0})", w.x, w.y));
+                    let x = w.x.floor() as i32;
+                    let y = w.y.floor() as i32;
+                    let connected = matches!(network, NetworkStatus::Connected { .. });
+                    if ui
+                        .add_enabled(connected, egui::Button::new("Spawn sprout here"))
+                        .clicked()
+                    {
+                        let _ = outgoing.send(ClientMessage::SpawnSprout {
+                            x,
+                            y,
+                            facing: Direction::North,
+                        });
+                    }
+                }
+                None => {
+                    ui.label("Cursor: —");
+                }
+            }
         });
 }
