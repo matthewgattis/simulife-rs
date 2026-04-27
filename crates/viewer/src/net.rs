@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
@@ -7,15 +7,15 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::{NetworkStatus, UserEvent};
 
-pub const SERVER_ADDR: &str = "127.0.0.1:4433";
-
-pub async fn run_client(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
+pub async fn run_client(
+    server_addr: SocketAddr,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<()> {
     let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connecting));
 
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(make_insecure_client_config()?);
 
-    let server_addr = SERVER_ADDR.parse()?;
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
     info!(remote = %conn.remote_address(), "connected");
 

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use protocol::{CHUNK_EDGE, Chunk};
 use tracing::info;
@@ -53,13 +53,18 @@ pub struct App {
     camera: Camera,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
+    server_addr: SocketAddr,
     proxy: EventLoopProxy<UserEvent>,
     rt: Arc<tokio::runtime::Runtime>,
     network_started: bool,
 }
 
 impl App {
-    pub fn new(rt: Arc<tokio::runtime::Runtime>, proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(
+        rt: Arc<tokio::runtime::Runtime>,
+        proxy: EventLoopProxy<UserEvent>,
+        server_addr: SocketAddr,
+    ) -> Self {
         Self {
             state: None,
             network: NetworkStatus::Connecting,
@@ -70,6 +75,7 @@ impl App {
             },
             dragging: false,
             last_cursor: None,
+            server_addr,
             proxy,
             rt,
             network_started: false,
@@ -98,8 +104,9 @@ impl ApplicationHandler<UserEvent> for App {
         if !self.network_started {
             self.network_started = true;
             let proxy = self.proxy.clone();
+            let server_addr = self.server_addr;
             self.rt.spawn(async move {
-                if let Err(e) = net::run_client(proxy.clone()).await {
+                if let Err(e) = net::run_client(server_addr, proxy.clone()).await {
                     let _ = proxy.send_event(UserEvent::Network(
                         NetworkStatus::Failed(format!("{e:#}")),
                     ));
@@ -192,7 +199,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window().request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.render(&self.network, &self.chunks, &self.camera);
+                state.render(&self.network, self.server_addr, &self.chunks, &self.camera);
             }
             _ => {}
         }

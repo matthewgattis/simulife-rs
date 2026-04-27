@@ -1,6 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Occupant, ServerMessage,
 };
@@ -8,9 +9,39 @@ use quinn::{Endpoint, ServerConfig};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
-const LISTEN_ADDR: &str = "127.0.0.1:4433";
-const WORLD_CHUNKS_X: u32 = 4;
-const WORLD_CHUNKS_Y: u32 = 4;
+#[derive(Parser, Debug)]
+#[command(version, about = "cellular-automata simulation server")]
+struct Args {
+    /// Address to bind the QUIC listener on.
+    #[arg(long, default_value = "127.0.0.1:4433")]
+    listen: SocketAddr,
+
+    /// Path to a TLS certificate (DER). If both --cert-path and --key-path are
+    /// provided, the cert is loaded from disk; if the files don't exist, a
+    /// fresh self-signed cert is generated and written there. If neither path
+    /// is provided, an ephemeral cert is generated per startup.
+    #[arg(long, requires = "key_path")]
+    cert_path: Option<PathBuf>,
+
+    /// Path to the matching PKCS#8 private key (DER). See --cert-path.
+    #[arg(long, requires = "cert_path")]
+    key_path: Option<PathBuf>,
+
+    /// World size in chunks (X axis).
+    #[arg(long, default_value_t = 4)]
+    world_width: u32,
+
+    /// World size in chunks (Y axis).
+    #[arg(long, default_value_t = 4)]
+    world_height: u32,
+}
+
+#[derive(Debug)]
+enum CertSource {
+    Ephemeral,
+    LoadedFromDisk,
+    GeneratedAndSaved,
+}
 
 struct World {
     chunks_x: u32,
@@ -21,12 +52,13 @@ struct World {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    let args = Args::parse();
 
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install default rustls crypto provider");
 
-    let world = Arc::new(build_world(WORLD_CHUNKS_X, WORLD_CHUNKS_Y));
+    let world = Arc::new(build_world(args.world_width, args.world_height));
     info!(
         chunks_x = world.chunks_x,
         chunks_y = world.chunks_y,
@@ -34,12 +66,11 @@ async fn main() -> Result<()> {
         "world built"
     );
 
-    let (server_config, cert_der) = make_server_config()?;
-    let addr: SocketAddr = LISTEN_ADDR.parse()?;
-    let endpoint = Endpoint::server(server_config, addr)?;
+    let (server_config, cert_source) = make_server_config(&args)?;
+    let endpoint = Endpoint::server(server_config, args.listen)?;
 
-    info!(%addr, "server listening");
-    info!(cert_bytes = cert_der.len(), "self-signed cert generated (clients must trust this)");
+    info!(addr = %args.listen, "server listening");
+    info!(?cert_source, "tls cert ready");
 
     while let Some(incoming) = endpoint.accept().await {
         let world = Arc::clone(&world);
@@ -93,19 +124,42 @@ fn build_world(chunks_x: u32, chunks_y: u32) -> World {
     }
 }
 
-fn make_server_config() -> Result<(ServerConfig, Vec<u8>)> {
+fn make_server_config(args: &Args) -> Result<(ServerConfig, CertSource)> {
+    match (&args.cert_path, &args.key_path) {
+        (Some(cp), Some(kp)) if cp.exists() && kp.exists() => {
+            let cert_der = std::fs::read(cp).with_context(|| format!("reading {cp:?}"))?;
+            let key_der = std::fs::read(kp).with_context(|| format!("reading {kp:?}"))?;
+            Ok((build_config(cert_der, key_der)?, CertSource::LoadedFromDisk))
+        }
+        (Some(cp), Some(kp)) => {
+            let (cert_der, key_der) = generate_self_signed()?;
+            std::fs::write(cp, &cert_der).with_context(|| format!("writing {cp:?}"))?;
+            std::fs::write(kp, &key_der).with_context(|| format!("writing {kp:?}"))?;
+            Ok((
+                build_config(cert_der, key_der)?,
+                CertSource::GeneratedAndSaved,
+            ))
+        }
+        (None, None) => {
+            let (cert_der, key_der) = generate_self_signed()?;
+            Ok((build_config(cert_der, key_der)?, CertSource::Ephemeral))
+        }
+        _ => unreachable!("clap enforces both cert-path and key-path or neither"),
+    }
+}
+
+fn generate_self_signed() -> Result<(Vec<u8>, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .context("generate self-signed cert")?;
-    let cert_der = cert.cert.der().to_vec();
-    let key_der = cert.key_pair.serialize_der();
+    Ok((cert.cert.der().to_vec(), cert.key_pair.serialize_der()))
+}
 
-    let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
+fn build_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig> {
+    let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
     let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
         rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
     );
-
-    let config = ServerConfig::with_single_cert(cert_chain, private_key)?;
-    Ok((config, cert_der))
+    Ok(ServerConfig::with_single_cert(cert_chain, private_key)?)
 }
 
 async fn handle_connection(incoming: quinn::Incoming, world: Arc<World>) -> Result<()> {

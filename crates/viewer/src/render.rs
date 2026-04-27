@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use protocol::{CHUNK_EDGE, Cell, Chunk, Occupant};
@@ -7,7 +7,6 @@ use wgpu::util::DeviceExt;
 use winit::{event::WindowEvent, window::Window};
 
 use crate::app::{Camera, NetworkStatus};
-use crate::net::SERVER_ADDR;
 
 pub struct RenderState {
     window: Arc<Window>,
@@ -98,7 +97,13 @@ impl RenderState {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn render(&mut self, network: &NetworkStatus, chunks: &[Chunk], camera: &Camera) {
+    pub fn render(
+        &mut self,
+        network: &NetworkStatus,
+        server_addr: SocketAddr,
+        chunks: &[Chunk],
+        camera: &Camera,
+    ) {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -121,7 +126,7 @@ impl RenderState {
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, network, chunks.len());
+            draw_ui(ctx, network, server_addr, chunks.len());
         });
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
@@ -422,7 +427,12 @@ fn cell_color(cell: &Cell) -> [f32; 3] {
     }
 }
 
-fn draw_ui(ctx: &egui::Context, network: &NetworkStatus, chunk_count: usize) {
+fn draw_ui(
+    ctx: &egui::Context,
+    network: &NetworkStatus,
+    server_addr: SocketAddr,
+    chunk_count: usize,
+) {
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
         .resizable(false)
@@ -437,7 +447,7 @@ fn draw_ui(ctx: &egui::Context, network: &NetworkStatus, chunk_count: usize) {
                     world_chunks_y,
                 } => {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
-                    ui.label(format!("Server: {SERVER_ADDR}"));
+                    ui.label(format!("Server: {server_addr}"));
                     ui.label(format!(
                         "World: {world_chunks_x} × {world_chunks_y} chunks"
                     ));
