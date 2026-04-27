@@ -2292,6 +2292,11 @@ dependencies = [
  "anyhow",
  "pollster",
  "protocol",
+ "quinn",
+ "rmp-serde",
+ "rustls",
+ "serde",
+ "tokio",
  "wgpu",
  "winit",
 ]

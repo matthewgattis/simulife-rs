@@ -1,23 +1,55 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use protocol::{ClientMessage, ServerMessage};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     window::{Window, WindowId},
 };
 
+const SERVER_ADDR: &str = "127.0.0.1:4433";
+
+#[derive(Debug, Clone)]
+enum UserEvent {
+    Network(NetworkStatus),
+}
+
+#[derive(Debug, Clone)]
+enum NetworkStatus {
+    Connecting,
+    Connected { world_chunks_x: u32, world_chunks_y: u32 },
+    Failed(String),
+}
+
 fn main() -> Result<()> {
-    let event_loop = EventLoop::new()?;
-    let mut app = App::default();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install default rustls crypto provider");
+
+    let rt = Arc::new(tokio::runtime::Runtime::new()?);
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+
+    let mut app = App {
+        state: None,
+        network: NetworkStatus::Connecting,
+        proxy,
+        rt,
+        network_started: false,
+    };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-#[derive(Default)]
 struct App {
     state: Option<RenderState>,
+    network: NetworkStatus,
+    proxy: EventLoopProxy<UserEvent>,
+    rt: Arc<tokio::runtime::Runtime>,
+    network_started: bool,
 }
 
 struct RenderState {
@@ -28,7 +60,7 @@ struct RenderState {
     config: wgpu::SurfaceConfiguration,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -45,6 +77,30 @@ impl ApplicationHandler for App {
         let state = pollster::block_on(RenderState::new(window))
             .expect("initialize wgpu");
         self.state = Some(state);
+
+        if !self.network_started {
+            self.network_started = true;
+            let proxy = self.proxy.clone();
+            self.rt.spawn(async move {
+                if let Err(e) = run_client(proxy.clone()).await {
+                    let _ = proxy.send_event(UserEvent::Network(
+                        NetworkStatus::Failed(format!("{e:#}")),
+                    ));
+                }
+            });
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Network(status) => {
+                println!("network: {status:?}");
+                self.network = status;
+                if let Some(state) = &self.state {
+                    state.window.request_redraw();
+                }
+            }
+        }
     }
 
     fn window_event(
@@ -64,7 +120,6 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 state.render();
-                state.window.request_redraw();
             }
             _ => {}
         }
@@ -162,5 +217,90 @@ impl RenderState {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+    }
+}
+
+async fn run_client(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
+    let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connecting));
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(make_insecure_client_config()?);
+
+    let server_addr = SERVER_ADDR.parse()?;
+    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    println!("connected to {}", conn.remote_address());
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let hello = rmp_serde::to_vec(&ClientMessage::Hello)?;
+    send.write_all(&hello).await?;
+    send.finish()?;
+
+    let buf = recv.read_to_end(64 * 1024).await?;
+    let welcome: ServerMessage = rmp_serde::from_slice(&buf)?;
+
+    match welcome {
+        ServerMessage::Welcome { world_chunks_x, world_chunks_y } => {
+            let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
+                world_chunks_x,
+                world_chunks_y,
+            }));
+        }
+        other => {
+            let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Failed(format!(
+                "unexpected first message: {other:?}"
+            ))));
+        }
+    }
+
+    Ok(())
+}
+
+fn make_insecure_client_config() -> Result<quinn::ClientConfig> {
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+}
+
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
