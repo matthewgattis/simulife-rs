@@ -83,7 +83,7 @@ fn rect_sdf(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
 
 fn soil_color(cell: Cell) -> vec3<f32> {
     let base = select(0.10, 0.18, cell.sunlit != 0u);
-    let organic_tint = f32(cell.organic) / 255.0 * 0.18;
+    let organic_tint = f32(cell.organic) / 255.0 * 0.08;
     return vec3<f32>(
         base + organic_tint,
         base + organic_tint * 0.6,
@@ -92,12 +92,12 @@ fn soil_color(cell: Cell) -> vec3<f32> {
 }
 
 fn occupant_color(cell: Cell) -> vec3<f32> {
-    if (cell.kind == KIND_LEAF) { return vec3<f32>(0.20, 0.75, 0.30); }
-    if (cell.kind == KIND_ROOT) { return vec3<f32>(0.50, 0.30, 0.10); }
-    if (cell.kind == KIND_STEM) { return vec3<f32>(0.55, 0.45, 0.25); }
-    if (cell.kind == KIND_ANTENNA) { return vec3<f32>(0.30, 0.55, 0.95); }
-    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 0.85, 0.20); }
-    if (cell.kind == KIND_SEED) { return vec3<f32>(0.80, 0.70, 0.35); }
+    if (cell.kind == KIND_LEAF) { return vec3<f32>(0.15, 0.80, 0.25); }
+    if (cell.kind == KIND_ROOT) { return vec3<f32>(0.55, 0.25, 0.05); }
+    if (cell.kind == KIND_STEM) { return vec3<f32>(0.60, 0.40, 0.15); }
+    if (cell.kind == KIND_ANTENNA) { return vec3<f32>(0.15, 0.45, 1.00); }
+    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 1.00, 1.00); }
+    if (cell.kind == KIND_SEED) { return vec3<f32>(0.85, 0.65, 0.20); }
     return vec3<f32>(0.0);
 }
 
