@@ -62,6 +62,7 @@ const LAYER_BG: u32 = 1u;
 const LAYER_FG: u32 = 2u;
 
 const CLEAR_COLOR: vec3<f32> = vec3<f32>(0.05, 0.07, 0.10);
+const OUTLINE_COLOR: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
 
 @vertex
 fn vs_main(v: VsIn, i: InstanceIn) -> VsOut {
@@ -73,12 +74,11 @@ fn vs_main(v: VsIn, i: InstanceIn) -> VsOut {
     return out;
 }
 
-fn rect_mask(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, aw: vec2<f32>) -> f32 {
-    let lx = smoothstep(lo.x - aw.x, lo.x + aw.x, uv.x);
-    let hx = 1.0 - smoothstep(hi.x - aw.x, hi.x + aw.x, uv.x);
-    let ly = smoothstep(lo.y - aw.y, lo.y + aw.y, uv.y);
-    let hy = 1.0 - smoothstep(hi.y - aw.y, hi.y + aw.y, uv.y);
-    return lx * hx * ly * hy;
+fn rect_sdf(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
+    let center = (lo + hi) * 0.5;
+    let half_size = (hi - lo) * 0.5;
+    let q = abs(uv - center) - half_size;
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
 }
 
 fn soil_color(cell: Cell) -> vec3<f32> {
@@ -101,10 +101,10 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-fn occupant_alpha(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> f32 {
+// Returns (signed_distance, aa_width). Negative d = inside the shape.
+fn shape_sdf(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> vec2<f32> {
     let aa_radial = max(aa_axis.x, aa_axis.y);
 
-    if (cell.kind == KIND_EMPTY) { return 0.0; }
     if (cell.kind == KIND_LEAF) {
         var scale: vec2<f32>;
         if (cell.facing == FACING_N || cell.facing == FACING_S) {
@@ -113,32 +113,30 @@ fn occupant_alpha(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> f32 {
             scale = vec2<f32>(0.45, 0.25);
         }
         let p = (cell_uv - vec2<f32>(0.5)) / scale;
-        let d = length(p) - 1.0;
         let aa_d = max(aa_axis.x / scale.x, aa_axis.y / scale.y);
-        return 1.0 - smoothstep(-aa_d, aa_d, d);
+        return vec2<f32>(length(p) - 1.0, aa_d);
     }
     if (cell.kind == KIND_ROOT) {
-        let m = max(abs(cell_uv.x - 0.5), abs(cell_uv.y - 0.5)) - 0.3;
-        return 1.0 - smoothstep(-aa_radial, aa_radial, m);
+        return vec2<f32>(rect_sdf(cell_uv, vec2<f32>(0.2), vec2<f32>(0.8)), aa_radial);
     }
     if (cell.kind == KIND_STEM) {
-        var alpha = rect_mask(cell_uv, vec2<f32>(0.4, 0.4), vec2<f32>(0.6, 0.6), aa_axis);
+        var d = rect_sdf(cell_uv, vec2<f32>(0.4, 0.4), vec2<f32>(0.6, 0.6));
         if ((cell.connections & STEM_N) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5), aa_axis));
+            d = min(d, rect_sdf(cell_uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5)));
         }
         if ((cell.connections & STEM_E) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.5, 0.4), vec2<f32>(1.0, 0.6), aa_axis));
+            d = min(d, rect_sdf(cell_uv, vec2<f32>(0.5, 0.4), vec2<f32>(1.0, 0.6)));
         }
         if ((cell.connections & STEM_S) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.5), vec2<f32>(0.6, 1.0), aa_axis));
+            d = min(d, rect_sdf(cell_uv, vec2<f32>(0.4, 0.5), vec2<f32>(0.6, 1.0)));
         }
         if ((cell.connections & STEM_W) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.0, 0.4), vec2<f32>(0.5, 0.6), aa_axis));
+            d = min(d, rect_sdf(cell_uv, vec2<f32>(0.0, 0.4), vec2<f32>(0.5, 0.6)));
         }
-        return alpha;
+        return vec2<f32>(d, aa_radial);
     }
-    let d = length(cell_uv - vec2<f32>(0.5)) - 0.3;
-    return 1.0 - smoothstep(-aa_radial, aa_radial, d);
+    // antenna, sprout, seed: circle
+    return vec2<f32>(length(cell_uv - vec2<f32>(0.5)) - 0.3, aa_radial);
 }
 
 @fragment
@@ -160,9 +158,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = soil_color(cell);
     }
     if (show_fg && cell.kind != KIND_EMPTY) {
-        let alpha = occupant_alpha(cell, cell_uv, aa_axis);
+        let s = shape_sdf(cell, cell_uv, aa_axis);
+        let d = s.x;
+        let aa_w = s.y;
+        let outline_fade = 1.0 - smoothstep(0.05, 0.15, aa_w);
+        let outline_w = aa_w * 0.5 * outline_fade;
+        let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
+        let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
         let fg = occupant_color(cell);
-        color = mix(color, fg, alpha);
+        color = mix(color, OUTLINE_COLOR, alpha_outer);
+        color = mix(color, fg, alpha_inner);
     }
 
     return vec4<f32>(color, 1.0);
