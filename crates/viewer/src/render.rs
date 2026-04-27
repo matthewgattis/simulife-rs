@@ -467,8 +467,13 @@ fn draw_ui(
         .collapsible(false)
         .show(ctx, |ui| {
             match network {
-                NetworkStatus::Connecting => {
-                    ui.label("Connecting to server...");
+                NetworkStatus::Connecting(None) => {
+                    ui.label(format!("Connecting to {server_addr}..."));
+                }
+                NetworkStatus::Connecting(Some(reason)) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Reconnecting...");
+                    ui.label(format!("Server: {server_addr}"));
+                    ui.weak(format!("Last error: {reason}"));
                 }
                 NetworkStatus::Connected {
                     world_chunks_x,
@@ -479,10 +484,6 @@ fn draw_ui(
                     ui.label(format!(
                         "World: {world_chunks_x} × {world_chunks_y} chunks"
                     ));
-                }
-                NetworkStatus::Failed(reason) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "Connection failed");
-                    ui.label(reason);
                 }
             }
             ui.separator();

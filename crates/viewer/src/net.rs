@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
@@ -8,15 +8,48 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::{NetworkStatus, UserEvent};
 
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const KEEP_ALIVE: Duration = Duration::from_secs(2);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
+
+enum SessionEnd {
+    ServerClosed,
+    Shutdown,
+}
+
 pub async fn run_client(
     server_addr: SocketAddr,
     proxy: EventLoopProxy<UserEvent>,
     mut outgoing: UnboundedReceiver<ClientMessage>,
-) -> Result<()> {
-    let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connecting));
+) {
+    let mut last_reason: Option<String> = None;
+    loop {
+        let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connecting(
+            last_reason.clone(),
+        )));
 
+        match run_session(server_addr, &proxy, &mut outgoing).await {
+            Ok(SessionEnd::Shutdown) => return,
+            Ok(SessionEnd::ServerClosed) => {
+                last_reason = Some("server closed connection".to_string());
+                warn!("server closed connection; will reconnect");
+            }
+            Err(e) => {
+                last_reason = Some(format!("{e:#}"));
+                warn!("connection error: {e:#}; will reconnect");
+            }
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn run_session(
+    server_addr: SocketAddr,
+    proxy: &EventLoopProxy<UserEvent>,
+    outgoing: &mut UnboundedReceiver<ClientMessage>,
+) -> Result<SessionEnd> {
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(make_insecure_client_config()?);
+    endpoint.set_default_client_config(make_client_config()?);
 
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
     info!(remote = %conn.remote_address(), "connected");
@@ -43,41 +76,36 @@ pub async fn run_client(
         other => bail!("expected ChunkBatch, got {other:?}"),
     }
 
-    let outgoing_conn = conn.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = outgoing.recv().await {
-            if let Err(e) = send_command(&outgoing_conn, &msg).await {
-                warn!("send command failed: {e:#}");
-            }
-        }
-    });
-
-    info!("listening for tick updates");
+    info!("session live; multiplexing outgoing + incoming");
     loop {
-        let mut recv = match conn.accept_uni().await {
-            Ok(r) => r,
-            Err(e) => {
-                info!("server stream closed: {e}");
-                return Ok(());
+        tokio::select! {
+            biased;
+            outgoing_msg = outgoing.recv() => {
+                match outgoing_msg {
+                    Some(msg) => send_command(&conn, &msg).await?,
+                    None => return Ok(SessionEnd::Shutdown),
+                }
             }
-        };
-        let buf = recv.read_to_end(8 * 1024 * 1024).await?;
-        let msg: ServerMessage = rmp_serde::from_slice(&buf)?;
-        match msg {
-            ServerMessage::ChunkBatch(chunks) => {
-                debug!(count = chunks.len(), "tick chunk batch");
-                let _ = proxy.send_event(UserEvent::Chunks(chunks));
+            stream = conn.accept_uni() => {
+                let mut recv = match stream {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("accept_uni: {e}");
+                        return Ok(SessionEnd::ServerClosed);
+                    }
+                };
+                let buf = recv.read_to_end(8 * 1024 * 1024).await?;
+                let msg: ServerMessage = rmp_serde::from_slice(&buf)?;
+                match msg {
+                    ServerMessage::ChunkBatch(chunks) => {
+                        debug!(count = chunks.len(), "tick chunk batch");
+                        let _ = proxy.send_event(UserEvent::Chunks(chunks));
+                    }
+                    other => warn!(?other, "unexpected push message"),
+                }
             }
-            other => warn!(?other, "unexpected push message"),
         }
     }
-}
-
-async fn send_command(conn: &quinn::Connection, msg: &ClientMessage) -> Result<()> {
-    let mut send = conn.open_uni().await?;
-    send.write_all(&rmp_serde::to_vec(msg)?).await?;
-    send.finish()?;
-    Ok(())
 }
 
 async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<ServerMessage> {
@@ -88,13 +116,26 @@ async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<Server
     Ok(rmp_serde::from_slice(&buf)?)
 }
 
-fn make_insecure_client_config() -> Result<quinn::ClientConfig> {
+async fn send_command(conn: &quinn::Connection, msg: &ClientMessage) -> Result<()> {
+    let mut send = conn.open_uni().await?;
+    send.write_all(&rmp_serde::to_vec(msg)?).await?;
+    send.finish()?;
+    Ok(())
+}
+
+fn make_client_config() -> Result<quinn::ClientConfig> {
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    let mut config = quinn::ClientConfig::new(Arc::new(quic));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(KEEP_ALIVE));
+    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
 
 #[derive(Debug)]

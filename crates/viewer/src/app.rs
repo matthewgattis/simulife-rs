@@ -22,9 +22,8 @@ pub enum UserEvent {
 
 #[derive(Debug, Clone)]
 pub enum NetworkStatus {
-    Connecting,
+    Connecting(Option<String>),
     Connected { world_chunks_x: u32, world_chunks_y: u32 },
-    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +65,7 @@ pub struct App {
     network: NetworkStatus,
     chunks: Vec<Chunk>,
     camera: Camera,
+    centered_once: bool,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
     context_menu: Option<ContextMenu>,
@@ -87,12 +87,13 @@ impl App {
     ) -> Self {
         Self {
             state: None,
-            network: NetworkStatus::Connecting,
+            network: NetworkStatus::Connecting(None),
             chunks: Vec::new(),
             camera: Camera {
                 center: glam::Vec2::ZERO,
                 cells_visible_y: 64.0,
             },
+            centered_once: false,
             dragging: false,
             last_cursor: None,
             context_menu: None,
@@ -133,11 +134,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .take()
                 .expect("outgoing receiver consumed twice");
             self.rt.spawn(async move {
-                if let Err(e) = net::run_client(server_addr, proxy.clone(), outgoing_rx).await {
-                    let _ = proxy.send_event(UserEvent::Network(
-                        NetworkStatus::Failed(format!("{e:#}")),
-                    ));
-                }
+                net::run_client(server_addr, proxy, outgoing_rx).await;
             });
         }
     }
@@ -151,11 +148,14 @@ impl ApplicationHandler<UserEvent> for App {
                     world_chunks_y,
                 } = &status
                 {
-                    let edge = CHUNK_EDGE as f32;
-                    let world_w = (*world_chunks_x as f32) * edge;
-                    let world_h = (*world_chunks_y as f32) * edge;
-                    self.camera.center = glam::vec2(world_w * 0.5, world_h * 0.5);
-                    self.camera.cells_visible_y = world_h * 1.1;
+                    if !self.centered_once {
+                        let edge = CHUNK_EDGE as f32;
+                        let world_w = (*world_chunks_x as f32) * edge;
+                        let world_h = (*world_chunks_y as f32) * edge;
+                        self.camera.center = glam::vec2(world_w * 0.5, world_h * 0.5);
+                        self.camera.cells_visible_y = world_h * 1.1;
+                        self.centered_once = true;
+                    }
                 }
                 self.network = status;
             }
