@@ -5,8 +5,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
+    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -30,6 +31,13 @@ pub enum NetworkStatus {
 pub struct Camera {
     pub center: glam::Vec2,
     pub cells_visible_y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenu {
+    pub world_x: i32,
+    pub world_y: i32,
+    pub screen_pos: glam::Vec2,
 }
 
 impl Camera {
@@ -60,6 +68,7 @@ pub struct App {
     camera: Camera,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
+    context_menu: Option<ContextMenu>,
     server_addr: SocketAddr,
     outgoing: UnboundedSender<ClientMessage>,
     pending_outgoing_rx: Option<UnboundedReceiver<ClientMessage>>,
@@ -86,6 +95,7 @@ impl App {
             },
             dragging: false,
             last_cursor: None,
+            context_menu: None,
             server_addr,
             outgoing: outgoing_tx,
             pending_outgoing_rx: Some(outgoing_rx),
@@ -204,9 +214,47 @@ impl ApplicationHandler<UserEvent> for App {
                 state: button_state,
                 button,
                 ..
+            } => match (button, button_state) {
+                (MouseButton::Right, ElementState::Pressed) => {
+                    if let Some(cursor) = self.last_cursor {
+                        let win_size = glam::vec2(
+                            state.width().max(1) as f32,
+                            state.height().max(1) as f32,
+                        );
+                        let world = self.camera.pixel_to_world(cursor, win_size);
+                        self.context_menu = Some(ContextMenu {
+                            world_x: world.x.floor() as i32,
+                            world_y: world.y.floor() as i32,
+                            screen_pos: cursor,
+                        });
+                        state.window().request_redraw();
+                    }
+                }
+                (MouseButton::Left, ElementState::Pressed) => {
+                    if self.context_menu.is_some() {
+                        self.context_menu = None;
+                        state.window().request_redraw();
+                    } else {
+                        self.dragging = true;
+                    }
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    self.dragging = false;
+                }
+                _ => {}
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
             } => {
-                if button == MouseButton::Left {
-                    self.dragging = button_state == ElementState::Pressed;
+                if self.context_menu.is_some() {
+                    self.context_menu = None;
+                    state.window().request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -226,6 +274,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &self.chunks,
                     &self.camera,
                     self.last_cursor,
+                    &mut self.context_menu,
                     &self.outgoing,
                 );
             }

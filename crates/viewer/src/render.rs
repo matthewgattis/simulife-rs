@@ -1,13 +1,13 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
-use protocol::{CHUNK_EDGE, Cell, Chunk, ClientMessage, Direction, Occupant};
+use protocol::{CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 use wgpu::util::DeviceExt;
 use winit::{event::WindowEvent, window::Window};
 
-use crate::app::{Camera, NetworkStatus};
+use crate::app::{Camera, ContextMenu, NetworkStatus};
 
 pub struct RenderState {
     window: Arc<Window>,
@@ -84,6 +84,10 @@ impl RenderState {
         &self.window
     }
 
+    pub fn width(&self) -> u32 {
+        self.config.width
+    }
+
     pub fn height(&self) -> u32 {
         self.config.height
     }
@@ -105,6 +109,7 @@ impl RenderState {
         chunks: &[Chunk],
         camera: &Camera,
         cursor_px: Option<glam::Vec2>,
+        context_menu: &mut Option<ContextMenu>,
         outgoing: &UnboundedSender<ClientMessage>,
     ) {
         let frame = match self.surface.get_current_texture() {
@@ -133,10 +138,21 @@ impl RenderState {
                 glam::vec2(self.config.width as f32, self.config.height as f32),
             )
         });
+        let hovered_cell = cursor_world
+            .map(|w| (w.x.floor() as i32, w.y.floor() as i32))
+            .and_then(|(x, y)| find_cell(chunks, x, y));
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, network, server_addr, chunks.len(), cursor_world, outgoing);
+            draw_ui(
+                ctx,
+                network,
+                server_addr,
+                chunks.len(),
+                cursor_world,
+                hovered_cell,
+            );
+            draw_context_menu(ctx, context_menu, chunks, outgoing);
         });
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
@@ -443,7 +459,7 @@ fn draw_ui(
     server_addr: SocketAddr,
     chunk_count: usize,
     cursor_world: Option<glam::Vec2>,
-    outgoing: &UnboundedSender<ClientMessage>,
+    hovered_cell: Option<(ChunkCoord, &Cell)>,
 ) {
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
@@ -471,23 +487,16 @@ fn draw_ui(
             }
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
-            ui.label("Drag = pan, Scroll = zoom");
+            ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
             ui.separator();
             match cursor_world {
                 Some(w) => {
                     ui.label(format!("Cursor: ({:.0}, {:.0})", w.x, w.y));
-                    let x = w.x.floor() as i32;
-                    let y = w.y.floor() as i32;
-                    let connected = matches!(network, NetworkStatus::Connected { .. });
-                    if ui
-                        .add_enabled(connected, egui::Button::new("Spawn sprout here"))
-                        .clicked()
-                    {
-                        let _ = outgoing.send(ClientMessage::SpawnSprout {
-                            x,
-                            y,
-                            facing: Direction::North,
-                        });
+                    if let Some((coord, cell)) = hovered_cell {
+                        ui.label(format!("Chunk: ({}, {})", coord.x, coord.y));
+                        cell_details_ui(ui, cell);
+                    } else {
+                        ui.weak("(outside world)");
                     }
                 }
                 None => {
@@ -495,4 +504,97 @@ fn draw_ui(
                 }
             }
         });
+}
+
+fn draw_context_menu(
+    ctx: &egui::Context,
+    context_menu: &mut Option<ContextMenu>,
+    chunks: &[Chunk],
+    outgoing: &UnboundedSender<ClientMessage>,
+) {
+    let Some(menu) = *context_menu else {
+        return;
+    };
+    let cell_at_menu = find_cell(chunks, menu.world_x, menu.world_y);
+
+    egui::Area::new(egui::Id::new("context-menu"))
+        .fixed_pos([menu.screen_pos.x, menu.screen_pos.y])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(200.0);
+                ui.label(
+                    egui::RichText::new(format!("Cell ({}, {})", menu.world_x, menu.world_y))
+                        .strong(),
+                );
+                ui.separator();
+                if let Some((coord, cell)) = cell_at_menu {
+                    ui.label(format!("Chunk: ({}, {})", coord.x, coord.y));
+                    cell_details_ui(ui, cell);
+                    ui.separator();
+                    if ui.button("Spawn sprout (facing N)").clicked() {
+                        let _ = outgoing.send(ClientMessage::SpawnSprout {
+                            x: menu.world_x,
+                            y: menu.world_y,
+                            facing: Direction::North,
+                        });
+                        *context_menu = None;
+                    }
+                } else {
+                    ui.weak("(outside world)");
+                    ui.separator();
+                }
+                if ui.button("Close").clicked() {
+                    *context_menu = None;
+                }
+            });
+        });
+}
+
+fn cell_details_ui(ui: &mut egui::Ui, cell: &Cell) {
+    ui.label(format!("organic: {}", cell.organic));
+    ui.label(format!("soil_energy: {}", cell.soil_energy));
+    ui.label(format!("sunlit: {}", cell.sunlit));
+    ui.label(format!("occupant: {}", occupant_label(&cell.occupant)));
+}
+
+fn occupant_label(occ: &Occupant) -> String {
+    match occ {
+        Occupant::Empty => "empty".to_string(),
+        Occupant::Leaf { plant, energy } => {
+            format!("leaf (plant {plant}, energy {energy})")
+        }
+        Occupant::Root { plant, energy } => {
+            format!("root (plant {plant}, energy {energy})")
+        }
+        Occupant::Stem { plant, energy } => {
+            format!("stem (plant {plant}, energy {energy})")
+        }
+        Occupant::Antenna { plant, energy } => {
+            format!("antenna (plant {plant}, energy {energy})")
+        }
+        Occupant::Sprout {
+            plant,
+            energy,
+            facing,
+            ..
+        } => format!("sprout (plant {plant}, energy {energy}, facing {facing:?})"),
+        Occupant::Seed {
+            plant,
+            energy,
+            facing,
+            ..
+        } => format!("seed (plant {plant}, energy {energy}, facing {facing:?})"),
+    }
+}
+
+fn find_cell(chunks: &[Chunk], x: i32, y: i32) -> Option<(ChunkCoord, &Cell)> {
+    let edge = CHUNK_EDGE as i32;
+    let cx = x.div_euclid(edge);
+    let cy = y.div_euclid(edge);
+    let lx = x.rem_euclid(edge) as usize;
+    let ly = y.rem_euclid(edge) as usize;
+    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+    let chunk = chunks.iter().find(|c| c.coord.x == cx && c.coord.y == cy)?;
+    chunk.cells.get(cell_idx).map(|cell| (chunk.coord, cell))
 }
