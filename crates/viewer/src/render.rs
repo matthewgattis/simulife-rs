@@ -12,16 +12,40 @@ use winit::{event::WindowEvent, window::Window};
 
 use crate::app::{Camera, ContextMenu, NetworkStatus};
 
+const MSAA_SAMPLES: u32 = 4;
+
 pub struct RenderState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    msaa_view: wgpu::TextureView,
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     cell_renderer: CellRenderer,
+}
+
+fn make_msaa_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("msaa color"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 impl RenderState {
@@ -66,9 +90,11 @@ impl RenderState {
             None,
             Some(2048),
         );
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&device, config.format, None, MSAA_SAMPLES, false);
 
         let cell_renderer = CellRenderer::new(&device, config.format);
+        let msaa_view = make_msaa_view(&device, &config);
 
         Ok(Self {
             window,
@@ -76,6 +102,7 @@ impl RenderState {
             device,
             queue,
             config,
+            msaa_view,
             egui_ctx,
             egui_winit,
             egui_renderer,
@@ -103,6 +130,7 @@ impl RenderState {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.msaa_view = make_msaa_view(&self.device, &self.config);
     }
 
     pub fn render(
@@ -192,8 +220,8 @@ impl RenderState {
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
+                        view: &self.msaa_view,
+                        resolve_target: Some(&view),
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.05,
@@ -201,7 +229,7 @@ impl RenderState {
                                 b: 0.10,
                                 a: 1.0,
                             }),
-                            store: wgpu::StoreOp::Store,
+                            store: wgpu::StoreOp::Discard,
                         },
                     })],
                     depth_stencil_attachment: None,
@@ -363,7 +391,11 @@ impl CellRenderer {
                 conservative: false,
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });

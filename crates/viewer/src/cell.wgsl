@@ -47,27 +47,38 @@ const STEM_E: u32 = 2u;
 const STEM_S: u32 = 4u;
 const STEM_W: u32 = 8u;
 
+fn aa_inside(d: f32) -> f32 {
+    let aw = fwidth(d);
+    return 1.0 - smoothstep(-aw, aw, d);
+}
+
 fn rect_mask(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
-    return step(lo.x, uv.x) * step(uv.x, hi.x)
-         * step(lo.y, uv.y) * step(uv.y, hi.y);
+    let aw = fwidth(uv);
+    let lx = smoothstep(lo.x - aw.x, lo.x + aw.x, uv.x);
+    let hx = 1.0 - smoothstep(hi.x - aw.x, hi.x + aw.x, uv.x);
+    let ly = smoothstep(lo.y - aw.y, lo.y + aw.y, uv.y);
+    let hy = 1.0 - smoothstep(hi.y - aw.y, hi.y + aw.y, uv.y);
+    return lx * hx * ly * hy;
 }
 
 fn shape_alpha(uv: vec2<f32>, kind: u32, param: u32) -> f32 {
     if (kind == KIND_CIRCLE) {
         let d = length(uv - vec2<f32>(0.5)) - 0.4;
-        return 1.0 - smoothstep(-0.02, 0.02, d);
+        return aa_inside(d);
     }
     if (kind == KIND_SQUARE) {
         let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.4;
-        return 1.0 - smoothstep(-0.02, 0.02, m);
+        return aa_inside(m);
     }
     if (kind == KIND_OVAL_H) {
         let p = (uv - vec2<f32>(0.5)) / vec2<f32>(0.45, 0.25);
-        return 1.0 - smoothstep(0.95, 1.05, length(p));
+        let d = length(p) - 1.0;
+        return aa_inside(d);
     }
     if (kind == KIND_OVAL_V) {
         let p = (uv - vec2<f32>(0.5)) / vec2<f32>(0.25, 0.45);
-        return 1.0 - smoothstep(0.95, 1.05, length(p));
+        let d = length(p) - 1.0;
+        return aa_inside(d);
     }
     if (kind == KIND_STEM) {
         var alpha = rect_mask(uv, vec2<f32>(0.3, 0.3), vec2<f32>(0.7, 0.7));
