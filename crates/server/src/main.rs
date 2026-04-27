@@ -1,6 +1,6 @@
 use std::{
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -15,6 +15,7 @@ use protocol::{
     STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, ServerMessage,
 };
 use quinn::{Endpoint, ServerConfig};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -48,6 +49,18 @@ struct Args {
     /// Simulation tick rate in Hz.
     #[arg(long, default_value_t = 10)]
     tick_hz: u32,
+
+    /// Path to a world snapshot file. Loaded at startup if it exists
+    /// (overriding --world-width/--world-height); otherwise a fresh world is
+    /// built and saved here on graceful shutdown. Without this flag, the
+    /// world is ephemeral.
+    #[arg(long)]
+    world_file: Option<PathBuf>,
+
+    /// Seconds between auto-saves to --world-file. Set to 0 to disable
+    /// auto-saves; the final shutdown save still runs.
+    #[arg(long, default_value_t = 30)]
+    autosave_secs: u64,
 }
 
 #[derive(Debug)]
@@ -65,6 +78,58 @@ struct SimState {
     next_plant_id: AtomicU32,
 }
 
+#[derive(Serialize, Deserialize)]
+struct WorldSnapshot {
+    chunks_x: u32,
+    chunks_y: u32,
+    next_plant_id: u32,
+    chunks: Vec<Chunk>,
+}
+
+fn load_world(path: &Path) -> Result<WorldSnapshot> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {path:?}"))?;
+    let snapshot: WorldSnapshot = rmp_serde::from_slice(&bytes)?;
+    info!(
+        path = %path.display(),
+        bytes = bytes.len(),
+        chunks = snapshot.chunks.len(),
+        chunks_x = snapshot.chunks_x,
+        chunks_y = snapshot.chunks_y,
+        next_plant_id = snapshot.next_plant_id,
+        "world loaded",
+    );
+    Ok(snapshot)
+}
+
+fn save_world(path: &Path, state: &SimState) -> Result<()> {
+    let snapshot = WorldSnapshot {
+        chunks_x: state.chunks_x,
+        chunks_y: state.chunks_y,
+        next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
+        chunks: state.world.lock().expect("sim lock poisoned").clone(),
+    };
+    let bytes = rmp_serde::to_vec(&snapshot)?;
+    std::fs::write(path, &bytes).with_context(|| format!("write {path:?}"))?;
+    info!(path = %path.display(), bytes = bytes.len(), "world saved");
+    Ok(())
+}
+
+fn load_or_build(args: &Args) -> Result<WorldSnapshot> {
+    if let Some(path) = &args.world_file {
+        if path.exists() {
+            return load_world(path);
+        }
+    }
+    let mut chunks = build_world(args.world_width, args.world_height);
+    place_showcase(&mut chunks, args.world_width);
+    Ok(WorldSnapshot {
+        chunks_x: args.world_width,
+        chunks_y: args.world_height,
+        next_plant_id: 1,
+        chunks,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -74,23 +139,40 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("install default rustls crypto provider");
 
-    let mut chunks = build_world(args.world_width, args.world_height);
-    place_showcase(&mut chunks, args.world_width);
+    let initial = load_or_build(&args)?;
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
-        chunks_x: args.world_width,
-        chunks_y: args.world_height,
-        world: std::sync::Mutex::new(chunks),
+        chunks_x: initial.chunks_x,
+        chunks_y: initial.chunks_y,
+        world: std::sync::Mutex::new(initial.chunks),
         tick_tx,
-        next_plant_id: AtomicU32::new(1),
+        next_plant_id: AtomicU32::new(initial.next_plant_id),
     });
 
     info!(
         chunks_x = state.chunks_x,
         chunks_y = state.chunks_y,
         cells = (state.chunks_x as usize) * (state.chunks_y as usize) * CHUNK_AREA,
-        "world built"
+        "world ready"
     );
+
+    if args.autosave_secs > 0 {
+        if let Some(path) = args.world_file.clone() {
+            let save_state = Arc::clone(&state);
+            let interval = Duration::from_secs(args.autosave_secs);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = save_world(&path, &save_state) {
+                        warn!("autosave failed: {e:#}");
+                    }
+                }
+            });
+            info!(autosave_secs = args.autosave_secs, "autosave enabled");
+        }
+    }
 
     let sim_state = Arc::clone(&state);
     let tick_hz = args.tick_hz.max(1);
@@ -105,6 +187,24 @@ async fn main() -> Result<()> {
     info!(addr = %args.listen, "server listening");
     info!(?cert_source, "tls cert ready");
 
+    let serve_state = Arc::clone(&state);
+    tokio::select! {
+        _ = serve(serve_state, endpoint) => {},
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received, shutting down");
+        }
+    }
+
+    if let Some(path) = &args.world_file {
+        if let Err(e) = save_world(path, &state) {
+            error!("final save failed: {e:#}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve(state: Arc<SimState>, endpoint: Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -113,8 +213,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-
-    Ok(())
 }
 
 fn init_tracing() {
