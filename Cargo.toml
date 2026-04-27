@@ -10,3 +10,8 @@ version = "0.1.0"
 protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
+tokio = { version = "1", features = ["full"] }
+quinn = "0.11"
+rustls = "0.23"
+rcgen = "0.13"
+anyhow = "1"

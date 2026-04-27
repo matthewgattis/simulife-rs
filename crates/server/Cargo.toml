@@ -5,3 +5,10 @@ version.workspace = true
 
 [dependencies]
 protocol.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+anyhow.workspace = true
