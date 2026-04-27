@@ -74,7 +74,8 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("install default rustls crypto provider");
 
-    let chunks = build_world(args.world_width, args.world_height);
+    let mut chunks = build_world(args.world_width, args.world_height);
+    place_showcase(&mut chunks, args.world_width);
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
         chunks_x: args.world_width,
@@ -120,6 +121,84 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,quinn=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
+    let entries: Vec<(i32, i32, Occupant)> = vec![
+        (
+            10,
+            20,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 200,
+            },
+        ),
+        (
+            12,
+            20,
+            Occupant::Root {
+                plant: 1,
+                energy: 200,
+            },
+        ),
+        (
+            14,
+            20,
+            Occupant::Stem {
+                plant: 1,
+                energy: 200,
+            },
+        ),
+        (
+            16,
+            20,
+            Occupant::Antenna {
+                plant: 1,
+                energy: 200,
+            },
+        ),
+        (
+            18,
+            20,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 200,
+                facing: Direction::North,
+                genome: Box::new(Genome { bytes: Vec::new() }),
+            },
+        ),
+        (
+            20,
+            20,
+            Occupant::Seed {
+                plant: 1,
+                energy: 200,
+                facing: Direction::East,
+                genome: Box::new(Genome { bytes: Vec::new() }),
+            },
+        ),
+    ];
+    for (x, y, occupant) in entries {
+        place_at(chunks, chunks_x, x, y, occupant);
+    }
+}
+
+fn place_at(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32, occupant: Occupant) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let edge = CHUNK_EDGE as i32;
+    let cx = x / edge;
+    let cy = y / edge;
+    let lx = (x % edge) as usize;
+    let ly = (y % edge) as usize;
+    let chunk_idx = (cy as usize) * (chunks_x as usize) + (cx as usize);
+    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+    if let Some(chunk) = chunks.get_mut(chunk_idx) {
+        if let Some(cell) = chunk.cells.get_mut(cell_idx) {
+            cell.occupant = occupant;
+        }
+    }
 }
 
 fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
