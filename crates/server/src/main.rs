@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Genome, Occupant,
-    ServerMessage,
+    STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, ServerMessage,
 };
 use quinn::{Endpoint, ServerConfig};
 use tokio::sync::broadcast;
@@ -124,57 +124,79 @@ fn init_tracing() {
 }
 
 fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
+    let plant = 1u32;
+    let energy = 200u16;
+    let bare_genome = || Box::new(Genome { bytes: Vec::new() });
+
     let entries: Vec<(i32, i32, Occupant)> = vec![
         (
             10,
             20,
             Occupant::Leaf {
-                plant: 1,
-                energy: 200,
+                plant,
+                energy,
+                facing: Direction::East,
             },
         ),
         (
             12,
             20,
-            Occupant::Root {
-                plant: 1,
-                energy: 200,
+            Occupant::Leaf {
+                plant,
+                energy,
+                facing: Direction::North,
             },
         ),
-        (
-            14,
-            20,
-            Occupant::Stem {
-                plant: 1,
-                energy: 200,
-            },
-        ),
+        (14, 20, Occupant::Root { plant, energy }),
         (
             16,
             20,
-            Occupant::Antenna {
-                plant: 1,
-                energy: 200,
+            Occupant::Stem {
+                plant,
+                energy,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
             },
         ),
         (
             18,
             20,
-            Occupant::Sprout {
-                plant: 1,
-                energy: 200,
-                facing: Direction::North,
-                genome: Box::new(Genome { bytes: Vec::new() }),
+            Occupant::Stem {
+                plant,
+                energy,
+                connections: STEM_CONNECT_NORTH
+                    | STEM_CONNECT_EAST
+                    | STEM_CONNECT_SOUTH
+                    | STEM_CONNECT_WEST,
             },
         ),
         (
             20,
             20,
+            Occupant::Stem {
+                plant,
+                energy,
+                connections: STEM_CONNECT_EAST | STEM_CONNECT_SOUTH,
+            },
+        ),
+        (22, 20, Occupant::Antenna { plant, energy }),
+        (
+            24,
+            20,
+            Occupant::Sprout {
+                plant,
+                energy,
+                facing: Direction::North,
+                genome: bare_genome(),
+            },
+        ),
+        (
+            26,
+            20,
             Occupant::Seed {
-                plant: 1,
-                energy: 200,
+                plant,
+                energy,
                 facing: Direction::East,
-                genome: Box::new(Genome { bytes: Vec::new() }),
+                genome: bare_genome(),
             },
         ),
     ];

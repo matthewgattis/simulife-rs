@@ -1,7 +1,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
-use protocol::{CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant};
+use protocol::{
+    CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant, STEM_CONNECT_EAST,
+    STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 use wgpu::util::DeviceExt;
@@ -224,8 +227,17 @@ impl RenderState {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CellInstance {
     cell_pos: [f32; 2],
-    color: [f32; 3],
+    bg_color: [f32; 3],
+    fg_color: [f32; 3],
+    shape: u32,
 }
+
+const SHAPE_NONE: u32 = 0;
+const SHAPE_CIRCLE: u32 = 1;
+const SHAPE_SQUARE: u32 = 2;
+const SHAPE_OVAL_H: u32 = 3;
+const SHAPE_OVAL_V: u32 = 4;
+const SHAPE_STEM: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -309,13 +321,23 @@ impl CellRenderer {
                         attributes: &[
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x2,
-                                offset: 0,
+                                offset: std::mem::offset_of!(CellInstance, cell_pos) as u64,
                                 shader_location: 1,
                             },
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x3,
-                                offset: 8,
+                                offset: std::mem::offset_of!(CellInstance, bg_color) as u64,
                                 shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: std::mem::offset_of!(CellInstance, fg_color) as u64,
+                                shader_location: 3,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32,
+                                offset: std::mem::offset_of!(CellInstance, shape) as u64,
+                                shader_location: 4,
                             },
                         ],
                     },
@@ -428,28 +450,47 @@ fn build_instances(chunks: &[Chunk]) -> Vec<CellInstance> {
         for (i, cell) in chunk.cells.iter().enumerate() {
             let lx = (i % edge) as f32;
             let ly = (i / edge) as f32;
+            let bg = soil_tint(cell.sunlit, cell.organic);
+            let (fg, shape) = occupant_visual(&cell.occupant);
             instances.push(CellInstance {
                 cell_pos: [cx + lx, cy + ly],
-                color: cell_color(cell),
+                bg_color: bg,
+                fg_color: fg,
+                shape,
             });
         }
     }
     instances
 }
 
-fn cell_color(cell: &Cell) -> [f32; 3] {
-    match &cell.occupant {
-        Occupant::Empty => {
-            let base = if cell.sunlit { 0.18 } else { 0.10 };
-            let organic_tint = (cell.organic as f32) / 255.0 * 0.18;
-            [base + organic_tint, base + organic_tint * 0.6, base * 0.8]
+fn soil_tint(sunlit: bool, organic: u16) -> [f32; 3] {
+    let base = if sunlit { 0.18 } else { 0.10 };
+    let organic_tint = (organic as f32) / 255.0 * 0.18;
+    [
+        base + organic_tint,
+        base + organic_tint * 0.6,
+        base * 0.8,
+    ]
+}
+
+fn occupant_visual(occ: &Occupant) -> ([f32; 3], u32) {
+    match occ {
+        Occupant::Empty => ([0.0; 3], SHAPE_NONE),
+        Occupant::Leaf { facing, .. } => {
+            let kind = match facing {
+                Direction::North | Direction::South => SHAPE_OVAL_V,
+                Direction::East | Direction::West => SHAPE_OVAL_H,
+            };
+            ([0.20, 0.75, 0.30], kind)
         }
-        Occupant::Leaf { .. } => [0.20, 0.75, 0.30],
-        Occupant::Root { .. } => [0.50, 0.30, 0.10],
-        Occupant::Stem { .. } => [0.55, 0.45, 0.25],
-        Occupant::Antenna { .. } => [0.55, 0.30, 0.85],
-        Occupant::Sprout { .. } => [1.00, 0.85, 0.20],
-        Occupant::Seed { .. } => [0.80, 0.70, 0.35],
+        Occupant::Root { .. } => ([0.50, 0.30, 0.10], SHAPE_SQUARE),
+        Occupant::Stem { connections, .. } => (
+            [0.55, 0.45, 0.25],
+            SHAPE_STEM | ((*connections as u32) << 8),
+        ),
+        Occupant::Antenna { .. } => ([0.30, 0.55, 0.95], SHAPE_CIRCLE),
+        Occupant::Sprout { .. } => ([1.00, 0.85, 0.20], SHAPE_CIRCLE),
+        Occupant::Seed { .. } => ([0.80, 0.70, 0.35], SHAPE_CIRCLE),
     }
 }
 
@@ -562,15 +603,22 @@ fn cell_details_ui(ui: &mut egui::Ui, cell: &Cell) {
 fn occupant_label(occ: &Occupant) -> String {
     match occ {
         Occupant::Empty => "empty".to_string(),
-        Occupant::Leaf { plant, energy } => {
-            format!("leaf (plant {plant}, energy {energy})")
-        }
+        Occupant::Leaf {
+            plant,
+            energy,
+            facing,
+        } => format!("leaf (plant {plant}, energy {energy}, facing {facing:?})"),
         Occupant::Root { plant, energy } => {
             format!("root (plant {plant}, energy {energy})")
         }
-        Occupant::Stem { plant, energy } => {
-            format!("stem (plant {plant}, energy {energy})")
-        }
+        Occupant::Stem {
+            plant,
+            energy,
+            connections,
+        } => format!(
+            "stem (plant {plant}, energy {energy}, conn {})",
+            connections_label(*connections)
+        ),
         Occupant::Antenna { plant, energy } => {
             format!("antenna (plant {plant}, energy {energy})")
         }
@@ -586,6 +634,27 @@ fn occupant_label(occ: &Occupant) -> String {
             facing,
             ..
         } => format!("seed (plant {plant}, energy {energy}, facing {facing:?})"),
+    }
+}
+
+fn connections_label(c: u8) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if c & STEM_CONNECT_NORTH != 0 {
+        parts.push("N");
+    }
+    if c & STEM_CONNECT_EAST != 0 {
+        parts.push("E");
+    }
+    if c & STEM_CONNECT_SOUTH != 0 {
+        parts.push("S");
+    }
+    if c & STEM_CONNECT_WEST != 0 {
+        parts.push("W");
+    }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join("|")
     }
 }
 

@@ -6,6 +6,11 @@ pub const CHUNK_AREA: usize = (CHUNK_EDGE as usize) * (CHUNK_EDGE as usize);
 pub type PlantId = u32;
 pub type Energy = u16;
 
+pub const STEM_CONNECT_NORTH: u8 = 1 << 0;
+pub const STEM_CONNECT_EAST: u8 = 1 << 1;
+pub const STEM_CONNECT_SOUTH: u8 = 1 << 2;
+pub const STEM_CONNECT_WEST: u8 = 1 << 3;
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkCoord {
     pub x: i32,
@@ -28,10 +33,24 @@ pub struct Genome {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Occupant {
     Empty,
-    Leaf { plant: PlantId, energy: Energy },
-    Root { plant: PlantId, energy: Energy },
-    Stem { plant: PlantId, energy: Energy },
-    Antenna { plant: PlantId, energy: Energy },
+    Leaf {
+        plant: PlantId,
+        energy: Energy,
+        facing: Direction,
+    },
+    Root {
+        plant: PlantId,
+        energy: Energy,
+    },
+    Stem {
+        plant: PlantId,
+        energy: Energy,
+        connections: u8,
+    },
+    Antenna {
+        plant: PlantId,
+        energy: Energy,
+    },
     Sprout {
         plant: PlantId,
         energy: Energy,
@@ -117,7 +136,11 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit: true,
-            occupant: Occupant::Leaf { plant: 1, energy: 30 },
+            occupant: Occupant::Leaf {
+                plant: 1,
+                energy: 30,
+                facing: Direction::East,
+            },
         };
 
         let original = Chunk {
@@ -152,10 +175,11 @@ mod tests {
         };
         assert_eq!(facing, Direction::West);
 
-        let Occupant::Leaf { energy, .. } = decoded.cells[100].occupant else {
+        let Occupant::Leaf { energy, facing, .. } = decoded.cells[100].occupant else {
             panic!("expected leaf at index 100");
         };
         assert_eq!(energy, 30);
+        assert_eq!(facing, Direction::East);
     }
 
     #[test]
