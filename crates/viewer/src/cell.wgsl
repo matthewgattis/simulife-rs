@@ -73,13 +73,7 @@ fn vs_main(v: VsIn, i: InstanceIn) -> VsOut {
     return out;
 }
 
-fn aa_inside(d: f32) -> f32 {
-    let aw = fwidth(d);
-    return 1.0 - smoothstep(-aw, aw, d);
-}
-
-fn rect_mask(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
-    let aw = fwidth(uv);
+fn rect_mask(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, aw: vec2<f32>) -> f32 {
     let lx = smoothstep(lo.x - aw.x, lo.x + aw.x, uv.x);
     let hx = 1.0 - smoothstep(hi.x - aw.x, hi.x + aw.x, uv.x);
     let ly = smoothstep(lo.y - aw.y, lo.y + aw.y, uv.y);
@@ -107,44 +101,51 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-fn occupant_alpha(cell: Cell, cell_uv: vec2<f32>) -> f32 {
+fn occupant_alpha(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> f32 {
+    let aa_radial = max(aa_axis.x, aa_axis.y);
+
     if (cell.kind == KIND_EMPTY) { return 0.0; }
     if (cell.kind == KIND_LEAF) {
-        var p: vec2<f32>;
+        var scale: vec2<f32>;
         if (cell.facing == FACING_N || cell.facing == FACING_S) {
-            p = (cell_uv - vec2<f32>(0.5)) / vec2<f32>(0.25, 0.45);
+            scale = vec2<f32>(0.25, 0.45);
         } else {
-            p = (cell_uv - vec2<f32>(0.5)) / vec2<f32>(0.45, 0.25);
+            scale = vec2<f32>(0.45, 0.25);
         }
-        return aa_inside(length(p) - 1.0);
+        let p = (cell_uv - vec2<f32>(0.5)) / scale;
+        let d = length(p) - 1.0;
+        let aa_d = max(aa_axis.x / scale.x, aa_axis.y / scale.y);
+        return 1.0 - smoothstep(-aa_d, aa_d, d);
     }
     if (cell.kind == KIND_ROOT) {
         let m = max(abs(cell_uv.x - 0.5), abs(cell_uv.y - 0.5)) - 0.3;
-        return aa_inside(m);
+        return 1.0 - smoothstep(-aa_radial, aa_radial, m);
     }
     if (cell.kind == KIND_STEM) {
-        var alpha = 0.0;
+        var alpha = rect_mask(cell_uv, vec2<f32>(0.4, 0.4), vec2<f32>(0.6, 0.6), aa_axis);
         if ((cell.connections & STEM_N) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5)));
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5), aa_axis));
         }
         if ((cell.connections & STEM_E) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.5, 0.4), vec2<f32>(1.0, 0.6)));
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.5, 0.4), vec2<f32>(1.0, 0.6), aa_axis));
         }
         if ((cell.connections & STEM_S) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.5), vec2<f32>(0.6, 1.0)));
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.5), vec2<f32>(0.6, 1.0), aa_axis));
         }
         if ((cell.connections & STEM_W) != 0u) {
-            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.0, 0.4), vec2<f32>(0.5, 0.6)));
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.0, 0.4), vec2<f32>(0.5, 0.6), aa_axis));
         }
         return alpha;
     }
     let d = length(cell_uv - vec2<f32>(0.5)) - 0.3;
-    return aa_inside(d);
+    return 1.0 - smoothstep(-aa_radial, aa_radial, d);
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let xy = in.chunk_uv * vec2<f32>(CHUNK_EDGE);
+    let aa_axis = fwidth(in.chunk_uv) * CHUNK_EDGE;
+
     let lx = clamp(u32(floor(xy.x)), 0u, CHUNK_EDGE_U - 1u);
     let ly = clamp(u32(floor(xy.y)), 0u, CHUNK_EDGE_U - 1u);
     let cell_uv = xy - vec2<f32>(f32(lx), f32(ly));
@@ -159,7 +160,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = soil_color(cell);
     }
     if (show_fg && cell.kind != KIND_EMPTY) {
-        let alpha = occupant_alpha(cell, cell_uv);
+        let alpha = occupant_alpha(cell, cell_uv, aa_axis);
         let fg = occupant_color(cell);
         color = mix(color, fg, alpha);
     }
