@@ -222,10 +222,11 @@ impl ApplicationHandler<UserEvent> for App {
                             state.height().max(1) as f32,
                         );
                         let world = self.camera.pixel_to_world(cursor, win_size);
+                        let scale = state.window().scale_factor() as f32;
                         self.context_menu = Some(ContextMenu {
                             world_x: world.x.floor() as i32,
                             world_y: world.y.floor() as i32,
-                            screen_pos: cursor,
+                            screen_pos: cursor / scale.max(1.0),
                         });
                         state.window().request_redraw();
                     }
