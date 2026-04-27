@@ -58,8 +58,9 @@ const STEM_E: u32 = 2u;
 const STEM_S: u32 = 4u;
 const STEM_W: u32 = 8u;
 
-const LAYER_BG: u32 = 1u;
+const LAYER_ORGANIC: u32 = 1u;
 const LAYER_FG: u32 = 2u;
+const LAYER_ENERGY: u32 = 4u;
 
 const CLEAR_COLOR: vec3<f32> = vec3<f32>(0.05, 0.07, 0.10);
 const OUTLINE_COLOR: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
@@ -81,23 +82,26 @@ fn rect_sdf(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
     return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
 }
 
-fn soil_color(cell: Cell) -> vec3<f32> {
-    let base = select(0.10, 0.18, cell.sunlit != 0u);
-    let organic_tint = f32(cell.organic) / 255.0 * 0.08;
-    return vec3<f32>(
-        base + organic_tint,
-        base + organic_tint * 0.6,
-        base * 0.8,
-    );
+fn soil_color(cell: Cell, show_organic: bool, show_energy: bool) -> vec3<f32> {
+    let brown = vec3<f32>(0.8, 0.6, 0.4);
+    let blue = vec3<f32>(0.4, 0.6, 1.0);
+    var color = vec3<f32>(1.0, 1.0, 1.0);
+    if (show_organic) {
+        color = mix(color, brown, f32(cell.organic) / 255.0);
+    }
+    if (show_energy) {
+        color = mix(color, blue, f32(cell.soil_energy) / 255.0);
+    }
+    return color;
 }
 
 fn occupant_color(cell: Cell) -> vec3<f32> {
-    if (cell.kind == KIND_LEAF) { return vec3<f32>(0.15, 0.80, 0.25); }
-    if (cell.kind == KIND_ROOT) { return vec3<f32>(0.55, 0.25, 0.05); }
-    if (cell.kind == KIND_STEM) { return vec3<f32>(0.60, 0.40, 0.15); }
-    if (cell.kind == KIND_ANTENNA) { return vec3<f32>(0.15, 0.45, 1.00); }
-    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 1.00, 1.00); }
-    if (cell.kind == KIND_SEED) { return vec3<f32>(0.85, 0.65, 0.20); }
+    if (cell.kind == KIND_LEAF) { return vec3<f32>(0.20, 0.75, 0.30); }
+    if (cell.kind == KIND_ROOT) { return vec3<f32>(0.50, 0.30, 0.10); }
+    if (cell.kind == KIND_STEM) { return vec3<f32>(0.55, 0.45, 0.25); }
+    if (cell.kind == KIND_ANTENNA) { return vec3<f32>(0.30, 0.55, 0.95); }
+    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 0.85, 0.20); }
+    if (cell.kind == KIND_SEED) { return vec3<f32>(0.80, 0.70, 0.35); }
     return vec3<f32>(0.0);
 }
 
@@ -153,13 +157,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cell_idx = in.chunk_first_cell + ly * CHUNK_EDGE_U + lx;
     let cell = cells[cell_idx];
 
-    let show_bg = (world.layer_flags & LAYER_BG) != 0u;
+    let show_organic = (world.layer_flags & LAYER_ORGANIC) != 0u;
+    let show_energy = (world.layer_flags & LAYER_ENERGY) != 0u;
     let show_fg = (world.layer_flags & LAYER_FG) != 0u;
 
-    var color = CLEAR_COLOR;
-    if (show_bg) {
-        color = soil_color(cell);
-    }
+    var color = soil_color(cell, show_organic, show_energy);
     if (show_fg && cell.kind != KIND_EMPTY) {
         let s = shape_sdf(cell, cell_uv, aa_axis);
         let d = s.x;
@@ -170,7 +172,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
         let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
         let fg = occupant_color(cell);
-        color = mix(color, OUTLINE_COLOR, alpha_outer);
+        //color = mix(color, OUTLINE_COLOR, alpha_outer);
         color = mix(color, fg, alpha_inner);
     }
 

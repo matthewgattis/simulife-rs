@@ -14,8 +14,9 @@ use crate::app::{Camera, ContextMenu, NetworkStatus};
 
 const MSAA_SAMPLES: u32 = 4;
 
-pub const LAYER_BG: u32 = 1 << 0;
+pub const LAYER_ORGANIC: u32 = 1 << 0;
 pub const LAYER_FG: u32 = 1 << 1;
+pub const LAYER_ENERGY: u32 = 1 << 2;
 
 pub struct RenderState {
     window: Arc<Window>,
@@ -728,10 +729,16 @@ fn draw_ui(
             ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
             ui.separator();
             ui.label("Layers:");
-            let mut bg = (*layer_flags & LAYER_BG) != 0;
+            let mut organic = (*layer_flags & LAYER_ORGANIC) != 0;
+            let mut energy = (*layer_flags & LAYER_ENERGY) != 0;
             let mut fg = (*layer_flags & LAYER_FG) != 0;
-            if ui.checkbox(&mut bg, "Soil").changed() {
-                *layer_flags = (*layer_flags & !LAYER_BG) | (if bg { LAYER_BG } else { 0 });
+            if ui.checkbox(&mut organic, "Organic").changed() {
+                *layer_flags = (*layer_flags & !LAYER_ORGANIC)
+                    | (if organic { LAYER_ORGANIC } else { 0 });
+            }
+            if ui.checkbox(&mut energy, "Energy").changed() {
+                *layer_flags = (*layer_flags & !LAYER_ENERGY)
+                    | (if energy { LAYER_ENERGY } else { 0 });
             }
             if ui.checkbox(&mut fg, "Occupants").changed() {
                 *layer_flags = (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });

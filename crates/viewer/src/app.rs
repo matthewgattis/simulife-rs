@@ -12,7 +12,7 @@ use winit::{
 };
 
 use crate::net;
-use crate::render::{LAYER_BG, LAYER_FG, RenderState};
+use crate::render::{LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
@@ -94,7 +94,7 @@ impl App {
                 center: glam::Vec2::ZERO,
                 cells_visible_y: 64.0,
             },
-            layer_flags: LAYER_BG | LAYER_FG,
+            layer_flags: LAYER_ORGANIC | LAYER_FG | LAYER_ENERGY,
             centered_once: false,
             dragging: false,
             last_cursor: None,
