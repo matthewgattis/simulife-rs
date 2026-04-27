@@ -279,7 +279,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.server_addr,
                     &self.chunks,
                     &self.camera,
-                    self.layer_flags,
+                    &mut self.layer_flags,
                     self.last_cursor,
                     &mut self.context_menu,
                     &self.outgoing,

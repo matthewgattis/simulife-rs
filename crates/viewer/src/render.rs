@@ -147,7 +147,7 @@ impl RenderState {
         server_addr: SocketAddr,
         chunks: &[Chunk],
         camera: &Camera,
-        layer_flags: u32,
+        layer_flags: &mut u32,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
         outgoing: &UnboundedSender<ClientMessage>,
@@ -167,8 +167,6 @@ impl RenderState {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         self.chunk_renderer
             .upload_camera(&self.queue, camera.view_proj(aspect));
-        self.chunk_renderer
-            .upload_world(&self.queue, layer_flags);
 
         let cursor_world = cursor_px.map(|px| {
             camera.pixel_to_world(
@@ -189,9 +187,12 @@ impl RenderState {
                 chunks.len(),
                 cursor_world,
                 hovered_cell,
+                layer_flags,
             );
             draw_context_menu(ctx, context_menu, chunks, outgoing);
         });
+
+        self.chunk_renderer.upload_world(&self.queue, *layer_flags);
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
 
@@ -695,6 +696,7 @@ fn draw_ui(
     chunk_count: usize,
     cursor_world: Option<glam::Vec2>,
     hovered_cell: Option<(ChunkCoord, &Cell)>,
+    layer_flags: &mut u32,
 ) {
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
@@ -724,6 +726,16 @@ fn draw_ui(
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
             ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
+            ui.separator();
+            ui.label("Layers:");
+            let mut bg = (*layer_flags & LAYER_BG) != 0;
+            let mut fg = (*layer_flags & LAYER_FG) != 0;
+            if ui.checkbox(&mut bg, "Soil").changed() {
+                *layer_flags = (*layer_flags & !LAYER_BG) | (if bg { LAYER_BG } else { 0 });
+            }
+            if ui.checkbox(&mut fg, "Occupants").changed() {
+                *layer_flags = (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
+            }
             ui.separator();
             match cursor_world {
                 Some(w) => {
