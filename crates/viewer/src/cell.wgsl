@@ -113,8 +113,11 @@ fn shape_sdf(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> vec2<f32> {
             scale = vec2<f32>(0.45, 0.25);
         }
         let p = (cell_uv - vec2<f32>(0.5)) / scale;
-        let d = length(p) - 1.0;
-        return vec2<f32>(d, fwidth(d));
+        let l = max(length(p), 1e-6);
+        let d = l - 1.0;
+        let grad_uv = vec2<f32>(p.x / l / scale.x, p.y / l / scale.y);
+        let aa_d = abs(grad_uv.x) * aa_axis.x + abs(grad_uv.y) * aa_axis.y;
+        return vec2<f32>(d, aa_d);
     }
     if (cell.kind == KIND_ROOT) {
         return vec2<f32>(rect_sdf(cell_uv, vec2<f32>(0.2), vec2<f32>(0.8)), aa_radial);
