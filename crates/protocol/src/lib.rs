@@ -63,12 +63,14 @@ pub struct Chunk {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientMessage {
     Hello,
+    Subscribe,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ServerMessage {
     Welcome { world_chunks_x: u32, world_chunks_y: u32 },
     ChunkSnapshot(Chunk),
+    ChunkBatch(Vec<Chunk>),
 }
 
 #[cfg(test)]

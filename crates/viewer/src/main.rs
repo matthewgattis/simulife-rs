@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use anyhow::Result;
-use protocol::{ClientMessage, ServerMessage};
+use anyhow::{Result, bail};
+use protocol::{Chunk, ClientMessage, ServerMessage};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -14,6 +14,7 @@ const SERVER_ADDR: &str = "127.0.0.1:4433";
 #[derive(Debug, Clone)]
 enum UserEvent {
     Network(NetworkStatus),
+    Chunks(Vec<Chunk>),
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ fn main() -> Result<()> {
     let mut app = App {
         state: None,
         network: NetworkStatus::Connecting,
+        chunks: Vec::new(),
         proxy,
         rt,
         network_started: false,
@@ -47,6 +49,7 @@ fn main() -> Result<()> {
 struct App {
     state: Option<RenderState>,
     network: NetworkStatus,
+    chunks: Vec<Chunk>,
     proxy: EventLoopProxy<UserEvent>,
     rt: Arc<tokio::runtime::Runtime>,
     network_started: bool,
@@ -99,10 +102,14 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Network(status) => {
                 println!("network: {status:?}");
                 self.network = status;
-                if let Some(state) = &self.state {
-                    state.window.request_redraw();
-                }
             }
+            UserEvent::Chunks(chunks) => {
+                println!("loaded {} chunks", chunks.len());
+                self.chunks = chunks;
+            }
+        }
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
         }
     }
 
@@ -131,7 +138,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.render(&self.network);
+                state.render(&self.network, self.chunks.len());
             }
             _ => {}
         }
@@ -209,7 +216,7 @@ impl RenderState {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self, network: &NetworkStatus) {
+    fn render(&mut self, network: &NetworkStatus, chunk_count: usize) {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -224,7 +231,7 @@ impl RenderState {
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, network);
+            draw_ui(ctx, network, chunk_count);
         });
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
@@ -291,29 +298,33 @@ impl RenderState {
     }
 }
 
-fn draw_ui(ctx: &egui::Context, network: &NetworkStatus) {
+fn draw_ui(ctx: &egui::Context, network: &NetworkStatus, chunk_count: usize) {
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
         .resizable(false)
         .collapsible(false)
-        .show(ctx, |ui| match network {
-            NetworkStatus::Connecting => {
-                ui.label("Connecting to server...");
+        .show(ctx, |ui| {
+            match network {
+                NetworkStatus::Connecting => {
+                    ui.label("Connecting to server...");
+                }
+                NetworkStatus::Connected {
+                    world_chunks_x,
+                    world_chunks_y,
+                } => {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
+                    ui.label(format!("Server: {SERVER_ADDR}"));
+                    ui.label(format!(
+                        "World: {world_chunks_x} × {world_chunks_y} chunks"
+                    ));
+                }
+                NetworkStatus::Failed(reason) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Connection failed");
+                    ui.label(reason);
+                }
             }
-            NetworkStatus::Connected {
-                world_chunks_x,
-                world_chunks_y,
-            } => {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
-                ui.label(format!("Server: {SERVER_ADDR}"));
-                ui.label(format!(
-                    "World: {world_chunks_x} × {world_chunks_y} chunks"
-                ));
-            }
-            NetworkStatus::Failed(reason) => {
-                ui.colored_label(egui::Color32::LIGHT_RED, "Connection failed");
-                ui.label(reason);
-            }
+            ui.separator();
+            ui.label(format!("Loaded chunks: {chunk_count}"));
         });
 }
 
@@ -327,30 +338,37 @@ async fn run_client(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
     println!("connected to {}", conn.remote_address());
 
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let welcome = request(&conn, &ClientMessage::Hello).await?;
+    let (world_chunks_x, world_chunks_y) = match welcome {
+        ServerMessage::Welcome {
+            world_chunks_x,
+            world_chunks_y,
+        } => (world_chunks_x, world_chunks_y),
+        other => bail!("unexpected first message: {other:?}"),
+    };
+    let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
+        world_chunks_x,
+        world_chunks_y,
+    }));
 
-    let hello = rmp_serde::to_vec(&ClientMessage::Hello)?;
-    send.write_all(&hello).await?;
-    send.finish()?;
-
-    let buf = recv.read_to_end(64 * 1024).await?;
-    let welcome: ServerMessage = rmp_serde::from_slice(&buf)?;
-
-    match welcome {
-        ServerMessage::Welcome { world_chunks_x, world_chunks_y } => {
-            let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
-                world_chunks_x,
-                world_chunks_y,
-            }));
+    let batch = request(&conn, &ClientMessage::Subscribe).await?;
+    match batch {
+        ServerMessage::ChunkBatch(chunks) => {
+            println!("received {} chunks", chunks.len());
+            let _ = proxy.send_event(UserEvent::Chunks(chunks));
         }
-        other => {
-            let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Failed(format!(
-                "unexpected first message: {other:?}"
-            ))));
-        }
+        other => bail!("expected ChunkBatch, got {other:?}"),
     }
 
     Ok(())
+}
+
+async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<ServerMessage> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&rmp_serde::to_vec(msg)?).await?;
+    send.finish()?;
+    let buf = recv.read_to_end(8 * 1024 * 1024).await?;
+    Ok(rmp_serde::from_slice(&buf)?)
 }
 
 fn make_insecure_client_config() -> Result<quinn::ClientConfig> {
