@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -6,7 +6,8 @@ use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Occupant, ServerMessage,
 };
 use quinn::{Endpoint, ServerConfig};
-use tracing::{debug, error, info};
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -34,6 +35,10 @@ struct Args {
     /// World size in chunks (Y axis).
     #[arg(long, default_value_t = 4)]
     world_height: u32,
+
+    /// Simulation tick rate in Hz.
+    #[arg(long, default_value_t = 10)]
+    tick_hz: u32,
 }
 
 #[derive(Debug)]
@@ -43,10 +48,11 @@ enum CertSource {
     GeneratedAndSaved,
 }
 
-struct World {
+struct SimState {
     chunks_x: u32,
     chunks_y: u32,
-    chunks: Vec<Chunk>,
+    world: std::sync::Mutex<Vec<Chunk>>,
+    tick_tx: broadcast::Sender<Arc<Vec<u8>>>,
 }
 
 #[tokio::main]
@@ -58,13 +64,28 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("install default rustls crypto provider");
 
-    let world = Arc::new(build_world(args.world_width, args.world_height));
+    let chunks = build_world(args.world_width, args.world_height);
+    let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
+    let state = Arc::new(SimState {
+        chunks_x: args.world_width,
+        chunks_y: args.world_height,
+        world: std::sync::Mutex::new(chunks),
+        tick_tx,
+    });
+
     info!(
-        chunks_x = world.chunks_x,
-        chunks_y = world.chunks_y,
-        cells = world.chunks.len() * CHUNK_AREA,
+        chunks_x = state.chunks_x,
+        chunks_y = state.chunks_y,
+        cells = (state.chunks_x as usize) * (state.chunks_y as usize) * CHUNK_AREA,
         "world built"
     );
+
+    let sim_state = Arc::clone(&state);
+    let tick_hz = args.tick_hz.max(1);
+    tokio::spawn(async move {
+        run_sim_loop(sim_state, tick_hz).await;
+    });
+    info!(tick_hz, "sim loop started");
 
     let (server_config, cert_source) = make_server_config(&args)?;
     let endpoint = Endpoint::server(server_config, args.listen)?;
@@ -73,9 +94,9 @@ async fn main() -> Result<()> {
     info!(?cert_source, "tls cert ready");
 
     while let Some(incoming) = endpoint.accept().await {
-        let world = Arc::clone(&world);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, world).await {
+            if let Err(e) = handle_connection(incoming, state).await {
                 error!("connection error: {e:#}");
             }
         });
@@ -90,7 +111,7 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-fn build_world(chunks_x: u32, chunks_y: u32) -> World {
+fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
     let mut chunks = Vec::with_capacity((chunks_x * chunks_y) as usize);
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
@@ -117,10 +138,47 @@ fn build_world(chunks_x: u32, chunks_y: u32) -> World {
             });
         }
     }
-    World {
-        chunks_x,
-        chunks_y,
-        chunks,
+    chunks
+}
+
+async fn run_sim_loop(state: Arc<SimState>, tick_hz: u32) {
+    let mut interval = tokio::time::interval(Duration::from_millis(1000 / tick_hz as u64));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut tick: u64 = 0;
+
+    loop {
+        interval.tick().await;
+        tick = tick.wrapping_add(1);
+
+        let snapshot_chunks = {
+            let mut chunks = state.world.lock().expect("sim lock poisoned");
+            mutate_world(&mut chunks, tick);
+            chunks.clone()
+        };
+
+        let msg = ServerMessage::ChunkBatch(snapshot_chunks);
+        match rmp_serde::to_vec(&msg) {
+            Ok(bytes) => {
+                let _ = state.tick_tx.send(Arc::new(bytes));
+            }
+            Err(e) => error!("serialize tick failed: {e:#}"),
+        }
+    }
+}
+
+fn mutate_world(chunks: &mut [Chunk], tick: u64) {
+    let edge = CHUNK_EDGE as i64;
+    for chunk in chunks {
+        let cx = chunk.coord.x as i64;
+        let cy = chunk.coord.y as i64;
+        for (i, cell) in chunk.cells.iter_mut().enumerate() {
+            let lx = (i as i64) % edge;
+            let ly = (i as i64) / edge;
+            let world_x = cx * edge + lx;
+            let world_y = cy * edge + ly;
+            let phase = (world_x + world_y).wrapping_sub(tick as i64).div_euclid(6);
+            cell.sunlit = phase.rem_euclid(2) == 0;
+        }
     }
 }
 
@@ -162,11 +220,26 @@ fn build_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig> {
     Ok(ServerConfig::with_single_cert(cert_chain, private_key)?)
 }
 
-async fn handle_connection(incoming: quinn::Incoming, world: Arc<World>) -> Result<()> {
+async fn handle_connection(incoming: quinn::Incoming, state: Arc<SimState>) -> Result<()> {
     let conn = incoming.await?;
     let remote = conn.remote_address();
     info!(%remote, "connection accepted");
 
+    let push_conn = conn.clone();
+    let push_rx = state.tick_tx.subscribe();
+    let push_task = tokio::spawn(async move {
+        if let Err(e) = push_loop(push_conn, push_rx).await {
+            warn!("push loop ended: {e:#}");
+        }
+    });
+
+    let result = handle_request_streams(conn, state).await;
+    push_task.abort();
+    result
+}
+
+async fn handle_request_streams(conn: quinn::Connection, state: Arc<SimState>) -> Result<()> {
+    let remote = conn.remote_address();
     loop {
         let stream = match conn.accept_bi().await {
             Ok(s) => s,
@@ -175,9 +248,9 @@ async fn handle_connection(incoming: quinn::Incoming, world: Arc<World>) -> Resu
                 return Ok(());
             }
         };
-        let world = Arc::clone(&world);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(stream, world).await {
+            if let Err(e) = handle_stream(stream, state).await {
                 error!("stream error: {e:#}");
             }
         });
@@ -186,7 +259,7 @@ async fn handle_connection(incoming: quinn::Incoming, world: Arc<World>) -> Resu
 
 async fn handle_stream(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
-    world: Arc<World>,
+    state: Arc<SimState>,
 ) -> Result<()> {
     let buf = recv.read_to_end(64 * 1024).await?;
     let msg: ClientMessage = rmp_serde::from_slice(&buf)?;
@@ -194,14 +267,40 @@ async fn handle_stream(
 
     let response = match msg {
         ClientMessage::Hello => ServerMessage::Welcome {
-            world_chunks_x: world.chunks_x,
-            world_chunks_y: world.chunks_y,
+            world_chunks_x: state.chunks_x,
+            world_chunks_y: state.chunks_y,
         },
-        ClientMessage::Subscribe => ServerMessage::ChunkBatch(world.chunks.clone()),
+        ClientMessage::Subscribe => {
+            let chunks = state.world.lock().expect("sim lock poisoned").clone();
+            ServerMessage::ChunkBatch(chunks)
+        }
     };
     let bytes = rmp_serde::to_vec(&response)?;
     send.write_all(&bytes).await?;
     send.finish()?;
 
     Ok(())
+}
+
+async fn push_loop(
+    conn: quinn::Connection,
+    mut rx: broadcast::Receiver<Arc<Vec<u8>>>,
+) -> Result<()> {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let bytes = match rx.recv().await {
+            Ok(b) => b,
+            Err(RecvError::Lagged(n)) => {
+                warn!(skipped = n, "push receiver lagged");
+                continue;
+            }
+            Err(RecvError::Closed) => return Ok(()),
+        };
+        let mut send = match conn.open_uni().await {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+        send.write_all(&bytes).await?;
+        send.finish()?;
+    }
 }

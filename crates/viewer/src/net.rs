@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
-use tracing::info;
+use tracing::{debug, info, warn};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::{NetworkStatus, UserEvent};
@@ -35,13 +35,31 @@ pub async fn run_client(
     let batch = request(&conn, &ClientMessage::Subscribe).await?;
     match batch {
         ServerMessage::ChunkBatch(chunks) => {
-            info!(count = chunks.len(), "received chunk batch");
+            info!(count = chunks.len(), "received initial chunk batch");
             let _ = proxy.send_event(UserEvent::Chunks(chunks));
         }
         other => bail!("expected ChunkBatch, got {other:?}"),
     }
 
-    Ok(())
+    info!("listening for tick updates");
+    loop {
+        let mut recv = match conn.accept_uni().await {
+            Ok(r) => r,
+            Err(e) => {
+                info!("server stream closed: {e}");
+                return Ok(());
+            }
+        };
+        let buf = recv.read_to_end(8 * 1024 * 1024).await?;
+        let msg: ServerMessage = rmp_serde::from_slice(&buf)?;
+        match msg {
+            ServerMessage::ChunkBatch(chunks) => {
+                debug!(count = chunks.len(), "tick chunk batch");
+                let _ = proxy.send_event(UserEvent::Chunks(chunks));
+            }
+            other => warn!(?other, "unexpected push message"),
+        }
+    }
 }
 
 async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<ServerMessage> {

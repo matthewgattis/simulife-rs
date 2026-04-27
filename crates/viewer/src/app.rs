@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use protocol::{CHUNK_EDGE, Chunk};
-use tracing::info;
+use tracing::{debug, info};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
@@ -133,7 +133,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.network = status;
             }
             UserEvent::Chunks(chunks) => {
-                info!(count = chunks.len(), "world snapshot loaded");
+                if chunks.len() != self.chunks.len() {
+                    info!(count = chunks.len(), "world snapshot loaded");
+                } else {
+                    debug!(count = chunks.len(), "world ticked");
+                }
                 self.chunks = chunks;
             }
         }
