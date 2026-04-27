@@ -63,11 +63,11 @@ fn rect_mask(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
 
 fn shape_alpha(uv: vec2<f32>, kind: u32, param: u32) -> f32 {
     if (kind == KIND_CIRCLE) {
-        let d = length(uv - vec2<f32>(0.5)) - 0.4;
+        let d = length(uv - vec2<f32>(0.5)) - 0.3;
         return aa_inside(d);
     }
     if (kind == KIND_SQUARE) {
-        let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.4;
+        let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.3;
         return aa_inside(m);
     }
     if (kind == KIND_OVAL_H) {
@@ -81,7 +81,7 @@ fn shape_alpha(uv: vec2<f32>, kind: u32, param: u32) -> f32 {
         return aa_inside(d);
     }
     if (kind == KIND_STEM) {
-        var alpha = rect_mask(uv, vec2<f32>(0.3, 0.3), vec2<f32>(0.7, 0.7));
+        var alpha = 0.0;
         if ((param & STEM_N) != 0u) {
             alpha = max(alpha, rect_mask(uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5)));
         }
