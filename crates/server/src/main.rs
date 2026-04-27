@@ -109,9 +109,45 @@ fn save_world(path: &Path, state: &SimState) -> Result<()> {
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
     };
     let bytes = rmp_serde::to_vec(&snapshot)?;
-    std::fs::write(path, &bytes).with_context(|| format!("write {path:?}"))?;
+    atomic_save(path, &bytes)?;
     info!(path = %path.display(), bytes = bytes.len(), "world saved");
     Ok(())
+}
+
+/// Crash-safe save: write `<path>.tmp`, fsync, rotate `<path>` → `<path>.bak`,
+/// then atomically rename tmp → live. The live path is always either the old
+/// version or the new one, never partial. fsync ensures the tmp's bytes hit
+/// disk before we commit it via rename, so a process or kernel crash between
+/// the write and the rename can't leave a torn save behind.
+fn atomic_save(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let tmp = with_extension_suffix(path, "tmp");
+    let bak = with_extension_suffix(path, "bak");
+
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {tmp:?}"))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write {tmp:?}"))?;
+        file.sync_all()
+            .with_context(|| format!("fsync {tmp:?}"))?;
+    }
+
+    if path.exists() {
+        std::fs::rename(path, &bak)
+            .with_context(|| format!("rotate {path:?} -> {bak:?}"))?;
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
+    Ok(())
+}
+
+fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".");
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 fn load_or_build(args: &Args) -> Result<WorldSnapshot> {
