@@ -161,8 +161,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let s = shape_sdf(cell, cell_uv, aa_axis);
         let d = s.x;
         let aa_w = s.y;
-        let outline_fade = 1.0 - smoothstep(0.05, 0.15, aa_w);
-        let outline_w = aa_w * 1.5 * outline_fade;
+        let aa_pixel = max(aa_axis.x, aa_axis.y);
+        let outline_fade = 1.0 - smoothstep(0.05, 0.15, aa_pixel);
+        let outline_w = aa_w * 1.0 * outline_fade;
         let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
         let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
         let fg = occupant_color(cell);
