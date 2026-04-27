@@ -2,8 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use protocol::{
-    CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant, STEM_CONNECT_EAST,
-    STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
+    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant,
+    STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
@@ -13,6 +13,9 @@ use winit::{event::WindowEvent, window::Window};
 use crate::app::{Camera, ContextMenu, NetworkStatus};
 
 const MSAA_SAMPLES: u32 = 4;
+
+pub const LAYER_BG: u32 = 1 << 0;
+pub const LAYER_FG: u32 = 1 << 1;
 
 pub struct RenderState {
     window: Arc<Window>,
@@ -24,7 +27,7 @@ pub struct RenderState {
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
-    cell_renderer: CellRenderer,
+    chunk_renderer: ChunkRenderer,
 }
 
 fn make_msaa_view(
@@ -93,7 +96,7 @@ impl RenderState {
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, config.format, None, MSAA_SAMPLES, false);
 
-        let cell_renderer = CellRenderer::new(&device, config.format);
+        let chunk_renderer = ChunkRenderer::new(&device, config.format);
         let msaa_view = make_msaa_view(&device, &config);
 
         Ok(Self {
@@ -106,7 +109,7 @@ impl RenderState {
             egui_ctx,
             egui_winit,
             egui_renderer,
-            cell_renderer,
+            chunk_renderer,
         })
     }
 
@@ -133,12 +136,18 @@ impl RenderState {
         self.msaa_view = make_msaa_view(&self.device, &self.config);
     }
 
+    pub fn upload_chunks(&mut self, chunks: &[Chunk]) {
+        self.chunk_renderer
+            .upload_chunks(&self.device, &self.queue, chunks);
+    }
+
     pub fn render(
         &mut self,
         network: &NetworkStatus,
         server_addr: SocketAddr,
         chunks: &[Chunk],
         camera: &Camera,
+        layer_flags: u32,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
         outgoing: &UnboundedSender<ClientMessage>,
@@ -156,12 +165,10 @@ impl RenderState {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        self.cell_renderer
+        self.chunk_renderer
             .upload_camera(&self.queue, camera.view_proj(aspect));
-
-        let instances = build_instances(chunks);
-        self.cell_renderer
-            .upload_instances(&self.device, &self.queue, &instances);
+        self.chunk_renderer
+            .upload_world(&self.queue, layer_flags);
 
         let cursor_world = cursor_px.map(|px| {
             camera.pixel_to_world(
@@ -237,7 +244,7 @@ impl RenderState {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
-            self.cell_renderer.draw(&mut pass, instances.len() as u32);
+            self.chunk_renderer.draw(&mut pass);
             self.egui_renderer
                 .render(&mut pass, &paint_jobs, &screen_descriptor);
         }
@@ -253,36 +260,61 @@ impl RenderState {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CellInstance {
-    cell_pos: [f32; 2],
-    bg_color: [f32; 3],
-    fg_color: [f32; 3],
-    shape: u32,
-}
-
-const SHAPE_NONE: u32 = 0;
-const SHAPE_CIRCLE: u32 = 1;
-const SHAPE_SQUARE: u32 = 2;
-const SHAPE_OVAL_H: u32 = 3;
-const SHAPE_OVAL_V: u32 = 4;
-const SHAPE_STEM: u32 = 5;
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
-struct CellRenderer {
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct WorldUniform {
+    layer_flags: u32,
+    _pad: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChunkInstance {
+    chunk_pos: [f32; 2],
+    chunk_first_cell: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuCell {
+    organic: u32,
+    soil_energy: u32,
+    sunlit: u32,
+    kind: u32,
+    plant: u32,
+    energy: u32,
+    facing: u32,
+    connections: u32,
+}
+
+const GPU_KIND_EMPTY: u32 = 0;
+const GPU_KIND_LEAF: u32 = 1;
+const GPU_KIND_ROOT: u32 = 2;
+const GPU_KIND_STEM: u32 = 3;
+const GPU_KIND_ANTENNA: u32 = 4;
+const GPU_KIND_SPROUT: u32 = 5;
+const GPU_KIND_SEED: u32 = 6;
+
+struct ChunkRenderer {
     pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
+    cells_buffer: wgpu::Buffer,
+    cells_capacity: u64,
     camera_buffer: wgpu::Buffer,
+    world_buffer: wgpu::Buffer,
+    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
+    chunk_count: u32,
 }
 
-impl CellRenderer {
+impl ChunkRenderer {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cell shader"),
@@ -296,29 +328,65 @@ impl CellRenderer {
             mapped_at_creation: false,
         });
 
+        let world_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("world"),
+            size: std::mem::size_of::<WorldUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let initial_cells_capacity = (1024 * std::mem::size_of::<GpuCell>()) as u64;
+        let cells_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cells"),
+            size: initial_cells_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera bgl"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                label: Some("cell bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera bg"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
+        let bind_group = make_bind_group(
+            device,
+            &bind_group_layout,
+            &camera_buffer,
+            &world_buffer,
+            &cells_buffer,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cell pipeline layout"),
@@ -344,28 +412,19 @@ impl CellRenderer {
                         }],
                     },
                     wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<CellInstance>() as u64,
+                        array_stride: std::mem::size_of::<ChunkInstance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x2,
-                                offset: std::mem::offset_of!(CellInstance, cell_pos) as u64,
+                                offset: std::mem::offset_of!(ChunkInstance, chunk_pos) as u64,
                                 shader_location: 1,
                             },
                             wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: std::mem::offset_of!(CellInstance, bg_color) as u64,
-                                shader_location: 2,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: std::mem::offset_of!(CellInstance, fg_color) as u64,
-                                shader_location: 3,
-                            },
-                            wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Uint32,
-                                offset: std::mem::offset_of!(CellInstance, shape) as u64,
-                                shader_location: 4,
+                                offset: std::mem::offset_of!(ChunkInstance, chunk_first_cell)
+                                    as u64,
+                                shader_location: 2,
                             },
                         ],
                     },
@@ -414,9 +473,9 @@ impl CellRenderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let initial_instance_capacity = (1024 * std::mem::size_of::<CellInstance>()) as u64;
+        let initial_instance_capacity = (16 * std::mem::size_of::<ChunkInstance>()) as u64;
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instances"),
+            label: Some("chunk instances"),
             size: initial_instance_capacity,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -427,8 +486,13 @@ impl CellRenderer {
             quad_buffer,
             instance_buffer,
             instance_capacity: initial_instance_capacity,
+            cells_buffer,
+            cells_capacity: initial_cells_capacity,
             camera_buffer,
+            world_buffer,
+            bind_group_layout,
             bind_group,
+            chunk_count: 0,
         }
     }
 
@@ -439,90 +503,188 @@ impl CellRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    fn upload_instances(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        instances: &[CellInstance],
-    ) {
-        if instances.is_empty() {
+    fn upload_world(&self, queue: &wgpu::Queue, layer_flags: u32) {
+        let uniform = WorldUniform {
+            layer_flags,
+            _pad: [0; 3],
+        };
+        queue.write_buffer(&self.world_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn upload_chunks(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, chunks: &[Chunk]) {
+        if chunks.is_empty() {
+            self.chunk_count = 0;
             return;
         }
-        let bytes: &[u8] = bytemuck::cast_slice(instances);
-        if bytes.len() as u64 > self.instance_capacity {
+
+        let instances: Vec<ChunkInstance> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| ChunkInstance {
+                chunk_pos: [
+                    chunk.coord.x as f32 * CHUNK_EDGE as f32,
+                    chunk.coord.y as f32 * CHUNK_EDGE as f32,
+                ],
+                chunk_first_cell: (i * CHUNK_AREA) as u32,
+                _pad: 0,
+            })
+            .collect();
+
+        let mut gpu_cells = Vec::with_capacity(chunks.len() * CHUNK_AREA);
+        for chunk in chunks {
+            for cell in &chunk.cells {
+                gpu_cells.push(to_gpu_cell(cell));
+            }
+        }
+
+        let inst_bytes: &[u8] = bytemuck::cast_slice(&instances);
+        if inst_bytes.len() as u64 > self.instance_capacity {
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
-                size: bytes.len() as u64,
+                label: Some("chunk instances"),
+                size: inst_bytes.len() as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.instance_capacity = bytes.len() as u64;
+            self.instance_capacity = inst_bytes.len() as u64;
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytes);
+        queue.write_buffer(&self.instance_buffer, 0, inst_bytes);
+
+        let cells_bytes: &[u8] = bytemuck::cast_slice(&gpu_cells);
+        let needed = cells_bytes.len() as u64;
+        if needed > self.cells_capacity {
+            self.cells_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cells"),
+                size: needed,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.cells_capacity = needed;
+            self.bind_group = make_bind_group(
+                device,
+                &self.bind_group_layout,
+                &self.camera_buffer,
+                &self.world_buffer,
+                &self.cells_buffer,
+            );
+        }
+        queue.write_buffer(&self.cells_buffer, 0, cells_bytes);
+
+        self.chunk_count = chunks.len() as u32;
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, instance_count: u32) {
-        if instance_count == 0 {
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.chunk_count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..instance_count);
+        pass.draw(0..6, 0..self.chunk_count);
     }
 }
 
-fn build_instances(chunks: &[Chunk]) -> Vec<CellInstance> {
-    let edge = CHUNK_EDGE as usize;
-    let mut instances = Vec::with_capacity(chunks.len() * edge * edge);
-    for chunk in chunks {
-        let cx = chunk.coord.x as f32 * edge as f32;
-        let cy = chunk.coord.y as f32 * edge as f32;
-        for (i, cell) in chunk.cells.iter().enumerate() {
-            let lx = (i % edge) as f32;
-            let ly = (i / edge) as f32;
-            let bg = soil_tint(cell.sunlit, cell.organic);
-            let (fg, shape) = occupant_visual(&cell.occupant);
-            instances.push(CellInstance {
-                cell_pos: [cx + lx, cy + ly],
-                bg_color: bg,
-                fg_color: fg,
-                shape,
-            });
-        }
-    }
-    instances
+fn make_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera: &wgpu::Buffer,
+    world: &wgpu::Buffer,
+    cells: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cell bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: world.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: cells.as_entire_binding(),
+            },
+        ],
+    })
 }
 
-fn soil_tint(sunlit: bool, organic: u16) -> [f32; 3] {
-    let base = if sunlit { 0.18 } else { 0.10 };
-    let organic_tint = (organic as f32) / 255.0 * 0.18;
-    [
-        base + organic_tint,
-        base + organic_tint * 0.6,
-        base * 0.8,
-    ]
-}
-
-fn occupant_visual(occ: &Occupant) -> ([f32; 3], u32) {
-    match occ {
-        Occupant::Empty => ([0.0; 3], SHAPE_NONE),
-        Occupant::Leaf { facing, .. } => {
-            let kind = match facing {
-                Direction::North | Direction::South => SHAPE_OVAL_V,
-                Direction::East | Direction::West => SHAPE_OVAL_H,
-            };
-            ([0.20, 0.75, 0.30], kind)
-        }
-        Occupant::Root { .. } => ([0.50, 0.30, 0.10], SHAPE_SQUARE),
-        Occupant::Stem { connections, .. } => (
-            [0.55, 0.45, 0.25],
-            SHAPE_STEM | ((*connections as u32) << 8),
+fn to_gpu_cell(cell: &Cell) -> GpuCell {
+    let (kind, plant, energy, facing, connections) = match &cell.occupant {
+        Occupant::Empty => (GPU_KIND_EMPTY, 0, 0, 0, 0),
+        Occupant::Leaf {
+            plant,
+            energy,
+            facing,
+        } => (
+            GPU_KIND_LEAF,
+            *plant,
+            u32::from(*energy),
+            facing_to_u32(*facing),
+            0,
         ),
-        Occupant::Antenna { .. } => ([0.30, 0.55, 0.95], SHAPE_CIRCLE),
-        Occupant::Sprout { .. } => ([1.00, 0.85, 0.20], SHAPE_CIRCLE),
-        Occupant::Seed { .. } => ([0.80, 0.70, 0.35], SHAPE_CIRCLE),
+        Occupant::Root { plant, energy } => {
+            (GPU_KIND_ROOT, *plant, u32::from(*energy), 0, 0)
+        }
+        Occupant::Stem {
+            plant,
+            energy,
+            connections,
+        } => (
+            GPU_KIND_STEM,
+            *plant,
+            u32::from(*energy),
+            0,
+            u32::from(*connections),
+        ),
+        Occupant::Antenna { plant, energy } => {
+            (GPU_KIND_ANTENNA, *plant, u32::from(*energy), 0, 0)
+        }
+        Occupant::Sprout {
+            plant,
+            energy,
+            facing,
+            ..
+        } => (
+            GPU_KIND_SPROUT,
+            *plant,
+            u32::from(*energy),
+            facing_to_u32(*facing),
+            0,
+        ),
+        Occupant::Seed {
+            plant,
+            energy,
+            facing,
+            ..
+        } => (
+            GPU_KIND_SEED,
+            *plant,
+            u32::from(*energy),
+            facing_to_u32(*facing),
+            0,
+        ),
+    };
+    GpuCell {
+        organic: u32::from(cell.organic),
+        soil_energy: u32::from(cell.soil_energy),
+        sunlit: cell.sunlit as u32,
+        kind,
+        plant,
+        energy,
+        facing,
+        connections,
+    }
+}
+
+fn facing_to_u32(d: Direction) -> u32 {
+    match d {
+        Direction::North => 0,
+        Direction::East => 1,
+        Direction::South => 2,
+        Direction::West => 3,
     }
 }
 

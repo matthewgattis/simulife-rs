@@ -12,7 +12,7 @@ use winit::{
 };
 
 use crate::net;
-use crate::render::RenderState;
+use crate::render::{LAYER_BG, LAYER_FG, RenderState};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
@@ -65,6 +65,7 @@ pub struct App {
     network: NetworkStatus,
     chunks: Vec<Chunk>,
     camera: Camera,
+    layer_flags: u32,
     centered_once: bool,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
@@ -93,6 +94,7 @@ impl App {
                 center: glam::Vec2::ZERO,
                 cells_visible_y: 64.0,
             },
+            layer_flags: LAYER_BG | LAYER_FG,
             centered_once: false,
             dragging: false,
             last_cursor: None,
@@ -166,6 +168,9 @@ impl ApplicationHandler<UserEvent> for App {
                     debug!(count = chunks.len(), "world ticked");
                 }
                 self.chunks = chunks;
+                if let Some(state) = self.state.as_mut() {
+                    state.upload_chunks(&self.chunks);
+                }
             }
         }
         if let Some(state) = &self.state {
@@ -274,6 +279,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.server_addr,
                     &self.chunks,
                     &self.camera,
+                    self.layer_flags,
                     self.last_cursor,
                     &mut self.context_menu,
                     &self.outgoing,

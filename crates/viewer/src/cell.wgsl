@@ -2,50 +2,76 @@ struct Camera {
     view_proj: mat4x4<f32>,
 }
 
+struct World {
+    layer_flags: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct Cell {
+    organic: u32,
+    soil_energy: u32,
+    sunlit: u32,
+    kind: u32,
+    plant: u32,
+    energy: u32,
+    facing: u32,
+    connections: u32,
+}
+
 @group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<uniform> world: World;
+@group(0) @binding(2) var<storage, read> cells: array<Cell>;
 
 struct VsIn {
     @location(0) corner: vec2<f32>,
 }
 
 struct InstanceIn {
-    @location(1) cell_pos: vec2<f32>,
-    @location(2) bg_color: vec3<f32>,
-    @location(3) fg_color: vec3<f32>,
-    @location(4) shape: u32,
+    @location(1) chunk_pos: vec2<f32>,
+    @location(2) chunk_first_cell: u32,
 }
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) bg_color: vec3<f32>,
-    @location(2) fg_color: vec3<f32>,
-    @location(3) @interpolate(flat) shape: u32,
+    @location(0) chunk_uv: vec2<f32>,
+    @location(1) @interpolate(flat) chunk_first_cell: u32,
 }
 
-@vertex
-fn vs_main(v: VsIn, i: InstanceIn) -> VsOut {
-    var out: VsOut;
-    let world_pos = i.cell_pos + v.corner;
-    out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 0.0, 1.0);
-    out.uv = v.corner;
-    out.bg_color = i.bg_color;
-    out.fg_color = i.fg_color;
-    out.shape = i.shape;
-    return out;
-}
+const CHUNK_EDGE: f32 = 32.0;
+const CHUNK_EDGE_U: u32 = 32u;
 
-const KIND_NONE: u32 = 0u;
-const KIND_CIRCLE: u32 = 1u;
-const KIND_SQUARE: u32 = 2u;
-const KIND_OVAL_H: u32 = 3u;
-const KIND_OVAL_V: u32 = 4u;
-const KIND_STEM: u32 = 5u;
+const KIND_EMPTY: u32 = 0u;
+const KIND_LEAF: u32 = 1u;
+const KIND_ROOT: u32 = 2u;
+const KIND_STEM: u32 = 3u;
+const KIND_ANTENNA: u32 = 4u;
+const KIND_SPROUT: u32 = 5u;
+const KIND_SEED: u32 = 6u;
+
+const FACING_N: u32 = 0u;
+const FACING_S: u32 = 2u;
 
 const STEM_N: u32 = 1u;
 const STEM_E: u32 = 2u;
 const STEM_S: u32 = 4u;
 const STEM_W: u32 = 8u;
+
+const LAYER_BG: u32 = 1u;
+const LAYER_FG: u32 = 2u;
+
+const CLEAR_COLOR: vec3<f32> = vec3<f32>(0.05, 0.07, 0.10);
+
+@vertex
+fn vs_main(v: VsIn, i: InstanceIn) -> VsOut {
+    var out: VsOut;
+    let world_pos = i.chunk_pos + v.corner * CHUNK_EDGE;
+    out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 0.0, 1.0);
+    out.chunk_uv = v.corner;
+    out.chunk_first_cell = i.chunk_first_cell;
+    return out;
+}
 
 fn aa_inside(d: f32) -> f32 {
     let aw = fwidth(d);
@@ -61,49 +87,82 @@ fn rect_mask(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
     return lx * hx * ly * hy;
 }
 
-fn shape_alpha(uv: vec2<f32>, kind: u32, param: u32) -> f32 {
-    if (kind == KIND_CIRCLE) {
-        let d = length(uv - vec2<f32>(0.5)) - 0.3;
-        return aa_inside(d);
+fn soil_color(cell: Cell) -> vec3<f32> {
+    let base = select(0.10, 0.18, cell.sunlit != 0u);
+    let organic_tint = f32(cell.organic) / 255.0 * 0.18;
+    return vec3<f32>(
+        base + organic_tint,
+        base + organic_tint * 0.6,
+        base * 0.8,
+    );
+}
+
+fn occupant_color(cell: Cell) -> vec3<f32> {
+    if (cell.kind == KIND_LEAF) { return vec3<f32>(0.20, 0.75, 0.30); }
+    if (cell.kind == KIND_ROOT) { return vec3<f32>(0.50, 0.30, 0.10); }
+    if (cell.kind == KIND_STEM) { return vec3<f32>(0.55, 0.45, 0.25); }
+    if (cell.kind == KIND_ANTENNA) { return vec3<f32>(0.30, 0.55, 0.95); }
+    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 0.85, 0.20); }
+    if (cell.kind == KIND_SEED) { return vec3<f32>(0.80, 0.70, 0.35); }
+    return vec3<f32>(0.0);
+}
+
+fn occupant_alpha(cell: Cell, cell_uv: vec2<f32>) -> f32 {
+    if (cell.kind == KIND_EMPTY) { return 0.0; }
+    if (cell.kind == KIND_LEAF) {
+        var p: vec2<f32>;
+        if (cell.facing == FACING_N || cell.facing == FACING_S) {
+            p = (cell_uv - vec2<f32>(0.5)) / vec2<f32>(0.25, 0.45);
+        } else {
+            p = (cell_uv - vec2<f32>(0.5)) / vec2<f32>(0.45, 0.25);
+        }
+        return aa_inside(length(p) - 1.0);
     }
-    if (kind == KIND_SQUARE) {
-        let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.3;
+    if (cell.kind == KIND_ROOT) {
+        let m = max(abs(cell_uv.x - 0.5), abs(cell_uv.y - 0.5)) - 0.3;
         return aa_inside(m);
     }
-    if (kind == KIND_OVAL_H) {
-        let p = (uv - vec2<f32>(0.5)) / vec2<f32>(0.45, 0.25);
-        let d = length(p) - 1.0;
-        return aa_inside(d);
-    }
-    if (kind == KIND_OVAL_V) {
-        let p = (uv - vec2<f32>(0.5)) / vec2<f32>(0.25, 0.45);
-        let d = length(p) - 1.0;
-        return aa_inside(d);
-    }
-    if (kind == KIND_STEM) {
+    if (cell.kind == KIND_STEM) {
         var alpha = 0.0;
-        if ((param & STEM_N) != 0u) {
-            alpha = max(alpha, rect_mask(uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5)));
+        if ((cell.connections & STEM_N) != 0u) {
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.0), vec2<f32>(0.6, 0.5)));
         }
-        if ((param & STEM_E) != 0u) {
-            alpha = max(alpha, rect_mask(uv, vec2<f32>(0.5, 0.4), vec2<f32>(1.0, 0.6)));
+        if ((cell.connections & STEM_E) != 0u) {
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.5, 0.4), vec2<f32>(1.0, 0.6)));
         }
-        if ((param & STEM_S) != 0u) {
-            alpha = max(alpha, rect_mask(uv, vec2<f32>(0.4, 0.5), vec2<f32>(0.6, 1.0)));
+        if ((cell.connections & STEM_S) != 0u) {
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.4, 0.5), vec2<f32>(0.6, 1.0)));
         }
-        if ((param & STEM_W) != 0u) {
-            alpha = max(alpha, rect_mask(uv, vec2<f32>(0.0, 0.4), vec2<f32>(0.5, 0.6)));
+        if ((cell.connections & STEM_W) != 0u) {
+            alpha = max(alpha, rect_mask(cell_uv, vec2<f32>(0.0, 0.4), vec2<f32>(0.5, 0.6)));
         }
         return alpha;
     }
-    return 0.0;
+    let d = length(cell_uv - vec2<f32>(0.5)) - 0.3;
+    return aa_inside(d);
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let kind = in.shape & 0xffu;
-    let param = (in.shape >> 8u) & 0xffu;
-    let alpha = shape_alpha(in.uv, kind, param);
-    let color = mix(in.bg_color, in.fg_color, alpha);
+    let xy = in.chunk_uv * vec2<f32>(CHUNK_EDGE);
+    let lx = clamp(u32(floor(xy.x)), 0u, CHUNK_EDGE_U - 1u);
+    let ly = clamp(u32(floor(xy.y)), 0u, CHUNK_EDGE_U - 1u);
+    let cell_uv = xy - vec2<f32>(f32(lx), f32(ly));
+    let cell_idx = in.chunk_first_cell + ly * CHUNK_EDGE_U + lx;
+    let cell = cells[cell_idx];
+
+    let show_bg = (world.layer_flags & LAYER_BG) != 0u;
+    let show_fg = (world.layer_flags & LAYER_FG) != 0u;
+
+    var color = CLEAR_COLOR;
+    if (show_bg) {
+        color = soil_color(cell);
+    }
+    if (show_fg && cell.kind != KIND_EMPTY) {
+        let alpha = occupant_alpha(cell, cell_uv);
+        let fg = occupant_color(cell);
+        color = mix(color, fg, alpha);
+    }
+
     return vec4<f32>(color, 1.0);
 }
