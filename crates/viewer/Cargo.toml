@@ -14,3 +14,6 @@ quinn.workspace = true
 rustls.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true

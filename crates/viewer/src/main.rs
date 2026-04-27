@@ -58,6 +58,9 @@ struct RenderState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -112,6 +115,15 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+
+        let response = state.egui_winit.on_window_event(&state.window, &event);
+        if response.repaint {
+            state.window.request_redraw();
+        }
+        if response.consumed {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -119,7 +131,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.render();
+                state.render(&self.network);
             }
             _ => {}
         }
@@ -162,12 +174,32 @@ impl RenderState {
             adapter.get_info().backend
         );
 
+        let egui_ctx = egui::Context::default();
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(2048),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            None,
+            1,
+            false,
+        );
+
         Ok(Self {
             window,
             surface,
             device,
             queue,
             config,
+            egui_ctx,
+            egui_winit,
+            egui_renderer,
         })
     }
 
@@ -177,7 +209,7 @@ impl RenderState {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, network: &NetworkStatus) {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -189,35 +221,100 @@ impl RenderState {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let raw_input = self.egui_winit.take_egui_input(&self.window);
+        let egui_output = self.egui_ctx.run(raw_input, |ctx| {
+            draw_ui(ctx, network);
+        });
+        self.egui_winit
+            .handle_platform_output(&self.window, egui_output.platform_output);
+
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(egui_output.shapes, egui_output.pixels_per_point);
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: egui_output.pixels_per_point,
+        };
+
+        for (id, image_delta) in &egui_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("clear encoder"),
+                label: Some("frame encoder"),
             });
+
+        self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.07,
-                            b: 0.10,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("clear + egui pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.07,
+                                b: 0.10,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer
+                .render(&mut pass, &paint_jobs, &screen_descriptor);
         }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+
+        for id in &egui_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
     }
+}
+
+fn draw_ui(ctx: &egui::Context, network: &NetworkStatus) {
+    egui::Window::new("Status")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| match network {
+            NetworkStatus::Connecting => {
+                ui.label("Connecting to server...");
+            }
+            NetworkStatus::Connected {
+                world_chunks_x,
+                world_chunks_y,
+            } => {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
+                ui.label(format!("Server: {SERVER_ADDR}"));
+                ui.label(format!(
+                    "World: {world_chunks_x} × {world_chunks_y} chunks"
+                ));
+            }
+            NetworkStatus::Failed(reason) => {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Connection failed");
+                ui.label(reason);
+            }
+        });
 }
 
 async fn run_client(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
