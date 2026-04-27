@@ -21,3 +21,5 @@ pollster = "0.4"
 egui = "0.32"
 egui-wgpu = "0.32"
 egui-winit = "0.32"
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
