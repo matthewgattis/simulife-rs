@@ -113,8 +113,8 @@ fn shape_sdf(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> vec2<f32> {
             scale = vec2<f32>(0.45, 0.25);
         }
         let p = (cell_uv - vec2<f32>(0.5)) / scale;
-        let aa_d = max(aa_axis.x / scale.x, aa_axis.y / scale.y);
-        return vec2<f32>(length(p) - 1.0, aa_d);
+        let d = length(p) - 1.0;
+        return vec2<f32>(d, fwidth(d));
     }
     if (cell.kind == KIND_ROOT) {
         return vec2<f32>(rect_sdf(cell_uv, vec2<f32>(0.2), vec2<f32>(0.8)), aa_radial);
@@ -162,7 +162,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let d = s.x;
         let aa_w = s.y;
         let outline_fade = 1.0 - smoothstep(0.05, 0.15, aa_w);
-        let outline_w = aa_w * 0.5 * outline_fade;
+        let outline_w = aa_w * 1.5 * outline_fade;
         let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
         let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
         let fg = occupant_color(cell);
