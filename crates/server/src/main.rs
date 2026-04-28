@@ -537,6 +537,7 @@ async fn run_sim_loop(state: Arc<SimState>) {
 const LEAF_PHOTOSYNTHESIS: Energy = 5;
 const UPKEEP_DEFAULT: Energy = 1;
 const UPKEEP_SEED: Energy = 0;
+const UPKEEP_SPROUT: Energy = 3;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -713,11 +714,14 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
 
 fn push_targets(occ: &Occupant) -> Vec<Direction> {
     match occ {
-        Occupant::Empty | Occupant::Seed { .. } => Vec::new(),
+        // Sprouts and seeds are terminal sinks — they accumulate energy but
+        // never push it back. (For sprouts, pushing back to the parent stem
+        // would just bounce: the stem would push to its children, putting
+        // the energy right back here.)
+        Occupant::Empty | Occupant::Seed { .. } | Occupant::Sprout { .. } => Vec::new(),
         Occupant::Leaf { parent, .. }
         | Occupant::Root { parent, .. }
-        | Occupant::Antenna { parent, .. }
-        | Occupant::Sprout { parent, .. } => parent.iter().copied().collect(),
+        | Occupant::Antenna { parent, .. } => parent.iter().copied().collect(),
         Occupant::Stem { children, .. } => bitmask_to_dirs(*children),
     }
 }
@@ -877,6 +881,7 @@ fn upkeep_for(occ: &Occupant) -> Energy {
     match occ {
         Occupant::Empty => 0,
         Occupant::Seed { .. } => UPKEEP_SEED,
+        Occupant::Sprout { .. } => UPKEEP_SPROUT,
         _ => UPKEEP_DEFAULT,
     }
 }
