@@ -186,7 +186,81 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
         }
     }
 
-    // Phase 4: directed push. Production cells push surplus to parent, stems
+    // Phase 4: prune stem children. For each stem with a children bitmask,
+    // remove bits whose neighbor is not a valid energy sink (a sprout, or a
+    // stem that itself has children). Pre-prune state is read into a parallel
+    // array first, so cascading happens one level per tick.
+    let total_cells = chunks.len() * CHUNK_AREA;
+    let mut pruned_children: Vec<Option<u8>> = vec![None; total_cells];
+    let bits = [
+        STEM_CONNECT_NORTH,
+        STEM_CONNECT_EAST,
+        STEM_CONNECT_SOUTH,
+        STEM_CONNECT_WEST,
+    ];
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let current_children =
+                        match &chunks[chunk_idx].cells[cell_idx].occupant {
+                            Occupant::Stem { children, .. } if *children != 0 => *children,
+                            _ => continue,
+                        };
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let mut kept = 0u8;
+                    for bit in bits {
+                        if current_children & bit == 0 {
+                            continue;
+                        }
+                        let dir = bit_to_dir(bit);
+                        let (dx, dy) = direction_to_delta(dir);
+                        let nx = wx + dx;
+                        let ny = wy + dy;
+                        if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                            continue;
+                        }
+                        let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                            + (nx / edge) as usize;
+                        let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                            + (nx % edge) as usize;
+                        let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
+                        if is_valid_child(&neighbor.occupant) {
+                            kept |= bit;
+                        }
+                    }
+                    if kept != current_children {
+                        pruned_children[linear_idx(chunks_x, wx, wy)] = Some(kept);
+                    }
+                }
+            }
+        }
+    }
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let Some(new_c) = pruned_children[linear_idx(chunks_x, wx, wy)] else {
+                        continue;
+                    };
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    if let Occupant::Stem { children, .. } =
+                        &mut chunks[chunk_idx].cells[cell_idx].occupant
+                    {
+                        *children = new_c;
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 5: directed push. Production cells push surplus to parent, stems
     // split surplus across children, sprouts/seeds are terminal sinks. Build
     // a delta array from the current state, then apply atomically — removes
     // any order dependency between cells in the same generation.
@@ -292,8 +366,9 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
         }
     }
 
-    // Phase 6: death — collect 0-energy occupants, then deposit organic over
-    // a 3x3 area and replace the cell with Empty.
+    // Phase 7: death — collect 0-energy occupants and stems with no push
+    // target (children == 0 AND parent is None or points at an empty cell),
+    // then deposit organic over a 3x3 area and replace the cell with Empty.
     let mut dying: Vec<(i32, i32)> = Vec::new();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
@@ -301,12 +376,13 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
                 for lx in 0..(CHUNK_EDGE as usize) {
                     let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
                     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    if matches!(
-                        occupant_energy(&chunks[chunk_idx].cells[cell_idx].occupant),
-                        Some(0)
-                    ) {
-                        let wx = cx as i32 * edge + lx as i32;
-                        let wy = cy as i32 * edge + ly as i32;
+                    let occ = &chunks[chunk_idx].cells[cell_idx].occupant;
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let energy_dead = matches!(occupant_energy(occ), Some(0));
+                    let stranded_stem =
+                        stem_has_no_push_target(occ, chunks, chunks_x, max_x, max_y, wx, wy);
+                    if energy_dead || stranded_stem {
                         dying.push((wx, wy));
                     }
                 }
@@ -329,7 +405,71 @@ fn push_targets(occ: &Occupant) -> Vec<Direction> {
         Occupant::Leaf { parent, .. }
         | Occupant::Root { parent, .. }
         | Occupant::Antenna { parent, .. } => parent.iter().copied().collect(),
-        Occupant::Stem { children, .. } => bitmask_to_dirs(*children),
+        // Stem with children: push to them. Stem with no children: fall back
+        // to parent (leaf-like) — happens after pruning has stripped dead /
+        // dead-end children.
+        Occupant::Stem {
+            children, parent, ..
+        } => {
+            if *children != 0 {
+                bitmask_to_dirs(*children)
+            } else {
+                parent.iter().copied().collect()
+            }
+        }
+    }
+}
+
+fn is_valid_child(occ: &Occupant) -> bool {
+    match occ {
+        Occupant::Sprout { .. } => true,
+        Occupant::Stem { children, .. } => *children != 0,
+        _ => false,
+    }
+}
+
+fn stem_has_no_push_target(
+    occ: &Occupant,
+    chunks: &[Chunk],
+    chunks_x: u32,
+    max_x: i32,
+    max_y: i32,
+    wx: i32,
+    wy: i32,
+) -> bool {
+    let Occupant::Stem {
+        children, parent, ..
+    } = occ
+    else {
+        return false;
+    };
+    if *children != 0 {
+        return false;
+    }
+    let Some(parent_dir) = parent else {
+        return true;
+    };
+    let edge = CHUNK_EDGE as i32;
+    let (dx, dy) = direction_to_delta(*parent_dir);
+    let nx = wx + dx;
+    let ny = wy + dy;
+    if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+        return true;
+    }
+    let n_chunk_idx = (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
+    let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize) + (nx % edge) as usize;
+    matches!(
+        chunks[n_chunk_idx].cells[n_cell_idx].occupant,
+        Occupant::Empty
+    )
+}
+
+fn bit_to_dir(bit: u8) -> Direction {
+    match bit {
+        STEM_CONNECT_NORTH => Direction::North,
+        STEM_CONNECT_EAST => Direction::East,
+        STEM_CONNECT_SOUTH => Direction::South,
+        _ => Direction::West,
     }
 }
 
