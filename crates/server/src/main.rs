@@ -86,12 +86,21 @@ struct WorldSnapshot {
     chunks: Vec<Chunk>,
 }
 
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+const ZSTD_LEVEL: i32 = 3;
+
 fn load_world(path: &Path) -> Result<WorldSnapshot> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {path:?}"))?;
-    let snapshot: WorldSnapshot = rmp_serde::from_slice(&bytes)?;
+    let raw = std::fs::read(path).with_context(|| format!("read {path:?}"))?;
+    let payload = if raw.starts_with(&ZSTD_MAGIC) {
+        zstd::decode_all(&raw[..]).context("zstd decode")?
+    } else {
+        raw.clone()
+    };
+    let snapshot: WorldSnapshot = rmp_serde::from_slice(&payload)?;
     info!(
         path = %path.display(),
-        bytes = bytes.len(),
+        on_disk = raw.len(),
+        decoded = payload.len(),
         chunks = snapshot.chunks.len(),
         chunks_x = snapshot.chunks_x,
         chunks_y = snapshot.chunks_y,
@@ -108,9 +117,17 @@ fn save_world(path: &Path, state: &SimState) -> Result<()> {
         next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
     };
-    let bytes = rmp_serde::to_vec(&snapshot)?;
-    atomic_save(path, &bytes)?;
-    info!(path = %path.display(), bytes = bytes.len(), "world saved");
+    let raw = rmp_serde::to_vec(&snapshot)?;
+    let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd encode")?;
+    atomic_save(path, &compressed)?;
+    let ratio = raw.len() as f64 / compressed.len().max(1) as f64;
+    info!(
+        path = %path.display(),
+        on_disk = compressed.len(),
+        uncompressed = raw.len(),
+        ratio = format!("{ratio:.1}x"),
+        "world saved",
+    );
     Ok(())
 }
 
