@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         next_plant_id: AtomicU32::new(initial.next_plant_id),
         current_tick: AtomicU64::new(initial.current_tick),
         control: std::sync::Mutex::new(SimControl {
-            paused: false,
+            paused: true,
             tick_hz: args.tick_hz.max(1),
             step_pending: 0,
         }),

@@ -380,9 +380,9 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
                     let wx = cx as i32 * edge + lx as i32;
                     let wy = cy as i32 * edge + ly as i32;
                     let energy_dead = matches!(occupant_energy(occ), Some(0));
-                    let stranded_stem =
-                        stem_has_no_push_target(occ, chunks, chunks_x, max_x, max_y, wx, wy);
-                    if energy_dead || stranded_stem {
+                    let stranded =
+                        cell_has_no_push_target(occ, chunks, chunks_x, max_x, max_y, wx, wy);
+                    if energy_dead || stranded {
                         dying.push((wx, wy));
                     }
                 }
@@ -428,7 +428,11 @@ fn is_valid_child(occ: &Occupant) -> bool {
     }
 }
 
-fn stem_has_no_push_target(
+/// True for cells that have nowhere to push energy: stems with no children
+/// AND a missing/empty parent, plus any production cell (leaf, root, antenna)
+/// whose parent is missing/empty. Sprouts and seeds are sinks — they don't
+/// push, so this rule doesn't apply to them.
+fn cell_has_no_push_target(
     occ: &Occupant,
     chunks: &[Chunk],
     chunks_x: u32,
@@ -437,20 +441,26 @@ fn stem_has_no_push_target(
     wx: i32,
     wy: i32,
 ) -> bool {
-    let Occupant::Stem {
-        children, parent, ..
-    } = occ
-    else {
-        return false;
+    let parent = match occ {
+        Occupant::Stem {
+            children, parent, ..
+        } => {
+            if *children != 0 {
+                return false;
+            }
+            *parent
+        }
+        Occupant::Leaf { parent, .. }
+        | Occupant::Root { parent, .. }
+        | Occupant::Antenna { parent, .. } => *parent,
+        _ => return false,
     };
-    if *children != 0 {
-        return false;
-    }
+
     let Some(parent_dir) = parent else {
         return true;
     };
     let edge = CHUNK_EDGE as i32;
-    let (dx, dy) = direction_to_delta(*parent_dir);
+    let (dx, dy) = direction_to_delta(parent_dir);
     let nx = wx + dx;
     let ny = wy + dy;
     if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
