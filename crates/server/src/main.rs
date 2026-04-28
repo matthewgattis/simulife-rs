@@ -11,8 +11,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use protocol::{
-    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Genome, Occupant,
-    STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, ServerMessage,
+    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Energy, Genome,
+    Occupant, STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
+    ServerMessage,
 };
 use quinn::{Endpoint, ServerConfig};
 use serde::{Deserialize, Serialize};
@@ -423,7 +424,6 @@ enum SimAction {
 }
 
 async fn run_sim_loop(state: Arc<SimState>) {
-    let mut tick: u64 = 0;
     loop {
         let action = {
             let mut ctrl = state.control.lock().expect("control poisoned");
@@ -447,11 +447,9 @@ async fn run_sim_loop(state: Arc<SimState>) {
             }
         }
 
-        tick = tick.wrapping_add(1);
-
         let snapshot_chunks = {
             let mut chunks = state.world.lock().expect("sim lock poisoned");
-            mutate_world(&mut chunks, tick);
+            mutate_world(&mut chunks, state.chunks_x, state.chunks_y);
             chunks.clone()
         };
 
@@ -465,19 +463,143 @@ async fn run_sim_loop(state: Arc<SimState>) {
     }
 }
 
-fn mutate_world(chunks: &mut [Chunk], tick: u64) {
-    let edge = CHUNK_EDGE as i64;
-    for chunk in chunks {
-        let cx = chunk.coord.x as i64;
-        let cy = chunk.coord.y as i64;
-        for (i, cell) in chunk.cells.iter_mut().enumerate() {
-            let lx = (i as i64) % edge;
-            let ly = (i as i64) / edge;
-            let world_x = cx * edge + lx;
-            let world_y = cy * edge + ly;
-            let phase = (world_x + world_y).wrapping_sub(tick as i64).div_euclid(6);
-            cell.sunlit = phase.rem_euclid(2) == 0;
+const LEAF_PHOTOSYNTHESIS: Energy = 5;
+const UPKEEP_DEFAULT: Energy = 1;
+const UPKEEP_SEED: Energy = 0;
+const ORGANIC_PER_DEATH: u16 = 16;
+
+fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
+    let prev = chunks.to_vec();
+    let edge = CHUNK_EDGE as i32;
+    let max_x = chunks_x as i32 * edge;
+    let max_y = chunks_y as i32 * edge;
+
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let world_x = cx as i32 * edge + lx as i32;
+                    let world_y = cy as i32 * edge + ly as i32;
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    chunks[chunk_idx].cells[cell_idx] =
+                        tick_cell(&prev, chunks_x, world_x, world_y, max_x, max_y);
+                }
+            }
         }
+    }
+}
+
+fn tick_cell(
+    prev: &[Chunk],
+    chunks_x: u32,
+    wx: i32,
+    wy: i32,
+    max_x: i32,
+    max_y: i32,
+) -> Cell {
+    let prev_self = cell_at(prev, chunks_x, wx, wy);
+    let mut next = prev_self.clone();
+
+    if next.sunlit {
+        if let Occupant::Leaf { energy, .. } = &mut next.occupant {
+            *energy = energy.saturating_add(LEAF_PHOTOSYNTHESIS);
+        }
+    }
+
+    if let Some(self_e) = occupant_energy(&next.occupant) {
+        let mut total = self_e as u32;
+        let mut count = 1u32;
+        let dirs: [(i32, i32, u8, u8); 4] = [
+            (0, -1, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH),
+            (1, 0, STEM_CONNECT_EAST, STEM_CONNECT_WEST),
+            (0, 1, STEM_CONNECT_SOUTH, STEM_CONNECT_NORTH),
+            (-1, 0, STEM_CONNECT_WEST, STEM_CONNECT_EAST),
+        ];
+        for (dx, dy, dir, opp) in dirs {
+            let nx = wx + dx;
+            let ny = wy + dy;
+            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                continue;
+            }
+            let neighbor = cell_at(prev, chunks_x, nx, ny);
+            if is_connected(prev_self, neighbor, dir, opp) {
+                if let Some(ne) = occupant_energy(&neighbor.occupant) {
+                    total = total.saturating_add(ne as u32);
+                    count += 1;
+                }
+            }
+        }
+        let avg = (total / count).min(Energy::MAX as u32) as Energy;
+        set_occupant_energy(&mut next.occupant, avg);
+    }
+
+    if let Some(e) = occupant_energy(&next.occupant) {
+        let cost = upkeep_for(&next.occupant);
+        let new_e = e.saturating_sub(cost);
+        set_occupant_energy(&mut next.occupant, new_e);
+    }
+
+    if matches!(occupant_energy(&next.occupant), Some(0)) {
+        next.organic = next.organic.saturating_add(ORGANIC_PER_DEATH);
+        next.occupant = Occupant::Empty;
+    }
+
+    next
+}
+
+fn cell_at(prev: &[Chunk], chunks_x: u32, wx: i32, wy: i32) -> &Cell {
+    let edge = CHUNK_EDGE as i32;
+    let cx = wx / edge;
+    let cy = wy / edge;
+    let lx = (wx % edge) as usize;
+    let ly = (wy % edge) as usize;
+    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+    &prev[chunk_idx].cells[cell_idx]
+}
+
+fn is_connected(self_cell: &Cell, neighbor: &Cell, dir_to_n: u8, opp_dir: u8) -> bool {
+    let self_link = matches!(
+        &self_cell.occupant,
+        Occupant::Stem { connections, .. } if connections & dir_to_n != 0
+    );
+    let neighbor_link = matches!(
+        &neighbor.occupant,
+        Occupant::Stem { connections, .. } if connections & opp_dir != 0
+    );
+    self_link || neighbor_link
+}
+
+fn occupant_energy(occ: &Occupant) -> Option<Energy> {
+    match occ {
+        Occupant::Empty => None,
+        Occupant::Leaf { energy, .. }
+        | Occupant::Root { energy, .. }
+        | Occupant::Stem { energy, .. }
+        | Occupant::Antenna { energy, .. }
+        | Occupant::Sprout { energy, .. }
+        | Occupant::Seed { energy, .. } => Some(*energy),
+    }
+}
+
+fn set_occupant_energy(occ: &mut Occupant, new_energy: Energy) {
+    match occ {
+        Occupant::Empty => {}
+        Occupant::Leaf { energy, .. }
+        | Occupant::Root { energy, .. }
+        | Occupant::Stem { energy, .. }
+        | Occupant::Antenna { energy, .. }
+        | Occupant::Sprout { energy, .. }
+        | Occupant::Seed { energy, .. } => *energy = new_energy,
+    }
+}
+
+fn upkeep_for(occ: &Occupant) -> Energy {
+    match occ {
+        Occupant::Empty => 0,
+        Occupant::Seed { .. } => UPKEEP_SEED,
+        _ => UPKEEP_DEFAULT,
     }
 }
 
