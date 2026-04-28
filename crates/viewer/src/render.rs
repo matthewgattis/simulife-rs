@@ -539,10 +539,33 @@ impl ChunkRenderer {
             })
             .collect();
 
+        let chunk_lookup: std::collections::HashMap<(i32, i32), usize> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ((c.coord.x, c.coord.y), i))
+            .collect();
+
+        let edge = CHUNK_EDGE as i32;
         let mut gpu_cells = Vec::with_capacity(chunks.len() * CHUNK_AREA);
         for chunk in chunks {
-            for cell in &chunk.cells {
-                gpu_cells.push(to_gpu_cell(cell));
+            let cx = chunk.coord.x;
+            let cy = chunk.coord.y;
+            for (i, cell) in chunk.cells.iter().enumerate() {
+                let lx = (i % (CHUNK_EDGE as usize)) as i32;
+                let ly = (i / (CHUNK_EDGE as usize)) as i32;
+                let wx = cx * edge + lx;
+                let wy = cy * edge + ly;
+                let mut gc = to_gpu_cell(cell);
+                if let Occupant::Stem { connections, .. } = &cell.occupant {
+                    gc.connections = effective_stem_connections(
+                        *connections,
+                        chunks,
+                        &chunk_lookup,
+                        wx,
+                        wy,
+                    );
+                }
+                gpu_cells.push(gc);
             }
         }
 
@@ -697,6 +720,49 @@ fn facing_to_u32(d: Direction) -> u32 {
         Direction::South => 2,
         Direction::West => 3,
     }
+}
+
+fn effective_stem_connections(
+    raw: u8,
+    chunks: &[Chunk],
+    lookup: &std::collections::HashMap<(i32, i32), usize>,
+    wx: i32,
+    wy: i32,
+) -> u32 {
+    let mut out = 0u32;
+    if raw & STEM_CONNECT_NORTH != 0 && neighbor_present(chunks, lookup, wx, wy - 1) {
+        out |= STEM_CONNECT_NORTH as u32;
+    }
+    if raw & STEM_CONNECT_EAST != 0 && neighbor_present(chunks, lookup, wx + 1, wy) {
+        out |= STEM_CONNECT_EAST as u32;
+    }
+    if raw & STEM_CONNECT_SOUTH != 0 && neighbor_present(chunks, lookup, wx, wy + 1) {
+        out |= STEM_CONNECT_SOUTH as u32;
+    }
+    if raw & STEM_CONNECT_WEST != 0 && neighbor_present(chunks, lookup, wx - 1, wy) {
+        out |= STEM_CONNECT_WEST as u32;
+    }
+    out
+}
+
+fn neighbor_present(
+    chunks: &[Chunk],
+    lookup: &std::collections::HashMap<(i32, i32), usize>,
+    wx: i32,
+    wy: i32,
+) -> bool {
+    let edge = CHUNK_EDGE as i32;
+    let cx = wx.div_euclid(edge);
+    let cy = wy.div_euclid(edge);
+    let lx = wx.rem_euclid(edge) as usize;
+    let ly = wy.rem_euclid(edge) as usize;
+    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+    if let Some(&chunk_idx) = lookup.get(&(cx, cy)) {
+        if let Some(cell) = chunks[chunk_idx].cells.get(cell_idx) {
+            return !matches!(cell.occupant, Occupant::Empty);
+        }
+    }
+    false
 }
 
 fn draw_ui(
