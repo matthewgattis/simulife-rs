@@ -556,6 +556,11 @@ fn attempt_growth(
     }
 
     if grew {
+        // Visually connect back to the parent stem too, so the new stem reads
+        // as part of the existing trunk rather than a disconnected hub.
+        if let Some(parent_dir) = parent {
+            connections |= dir_to_bitmask(parent_dir);
+        }
         let new_energy = sprout_energy.saturating_sub(GROWTH_THRESHOLD);
         if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             self_cell.occupant = Occupant::Stem {
