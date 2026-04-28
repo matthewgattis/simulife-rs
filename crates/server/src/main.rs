@@ -466,31 +466,114 @@ async fn run_sim_loop(state: Arc<SimState>) {
 const LEAF_PHOTOSYNTHESIS: Energy = 5;
 const UPKEEP_DEFAULT: Energy = 1;
 const UPKEEP_SEED: Energy = 0;
-const ORGANIC_PER_DEATH: u16 = 16;
+
+const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
+    [0, 1, 0],
+    [1, 2, 1],
+    [0, 1, 0],
+];
+const ANTENNA_PULL_KERNEL: [[u16; 3]; 3] = [
+    [0, 1, 0],
+    [1, 2, 1],
+    [0, 1, 0],
+];
+const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [
+    [1, 2, 1],
+    [2, 4, 2],
+    [1, 2, 1],
+];
+
+#[derive(Clone, Copy)]
+enum SoilField {
+    Organic,
+    Energy,
+}
 
 fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
-    let prev = chunks.to_vec();
     let edge = CHUNK_EDGE as i32;
     let max_x = chunks_x as i32 * edge;
     let max_y = chunks_y as i32 * edge;
 
+    // Phase 1: photosynthesis + conduction (read prev snapshot, write new).
+    let prev = chunks.to_vec();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
                 for lx in 0..(CHUNK_EDGE as usize) {
-                    let world_x = cx as i32 * edge + lx as i32;
-                    let world_y = cy as i32 * edge + ly as i32;
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
                     let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
                     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
                     chunks[chunk_idx].cells[cell_idx] =
-                        tick_cell(&prev, chunks_x, world_x, world_y, max_x, max_y);
+                        tick_phase1(&prev, chunks_x, wx, wy, max_x, max_y);
                 }
             }
         }
     }
+
+    // Phase 2: soil pulls. Serial — multiple roots near the same soil cell
+    // each take their share in iteration order until that cell is empty.
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let field = match &chunks[chunk_idx].cells[cell_idx].occupant {
+                        Occupant::Root { .. } => Some(SoilField::Organic),
+                        Occupant::Antenna { .. } => Some(SoilField::Energy),
+                        _ => None,
+                    };
+                    if let Some(field) = field {
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        apply_soil_pull(chunks, chunks_x, wx, wy, max_x, max_y, field);
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: upkeep.
+    for chunk in chunks.iter_mut() {
+        for cell in chunk.cells.iter_mut() {
+            if let Some(e) = occupant_energy(&cell.occupant) {
+                let cost = upkeep_for(&cell.occupant);
+                set_occupant_energy(&mut cell.occupant, e.saturating_sub(cost));
+            }
+        }
+    }
+
+    // Phase 4: death — collect 0-energy occupants, then deposit organic over
+    // a 3x3 area and replace the cell with Empty.
+    let mut dying: Vec<(i32, i32)> = Vec::new();
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    if matches!(
+                        occupant_energy(&chunks[chunk_idx].cells[cell_idx].occupant),
+                        Some(0)
+                    ) {
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        dying.push((wx, wy));
+                    }
+                }
+            }
+        }
+    }
+    for (wx, wy) in dying {
+        deposit_kernel(chunks, chunks_x, wx, wy, max_x, max_y, &DEATH_DEPOSIT_KERNEL);
+        if let Some(cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
+            cell.occupant = Occupant::Empty;
+        }
+    }
 }
 
-fn tick_cell(
+fn tick_phase1(
     prev: &[Chunk],
     chunks_x: u32,
     wx: i32,
@@ -534,18 +617,98 @@ fn tick_cell(
         set_occupant_energy(&mut next.occupant, avg);
     }
 
-    if let Some(e) = occupant_energy(&next.occupant) {
-        let cost = upkeep_for(&next.occupant);
-        let new_e = e.saturating_sub(cost);
-        set_occupant_energy(&mut next.occupant, new_e);
-    }
-
-    if matches!(occupant_energy(&next.occupant), Some(0)) {
-        next.organic = next.organic.saturating_add(ORGANIC_PER_DEATH);
-        next.occupant = Occupant::Empty;
-    }
-
     next
+}
+
+fn apply_soil_pull(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    wx: i32,
+    wy: i32,
+    max_x: i32,
+    max_y: i32,
+    field: SoilField,
+) {
+    let kernel = match field {
+        SoilField::Organic => &ROOT_PULL_KERNEL,
+        SoilField::Energy => &ANTENNA_PULL_KERNEL,
+    };
+    let mut total_pulled: u32 = 0;
+    for dy in -1..=1i32 {
+        for dx in -1..=1i32 {
+            let want = kernel[(dy + 1) as usize][(dx + 1) as usize];
+            if want == 0 {
+                continue;
+            }
+            let nx = wx + dx;
+            let ny = wy + dy;
+            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                continue;
+            }
+            if let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) {
+                let avail = match field {
+                    SoilField::Organic => cell.organic,
+                    SoilField::Energy => cell.soil_energy,
+                };
+                let actual = avail.min(want);
+                match field {
+                    SoilField::Organic => cell.organic -= actual,
+                    SoilField::Energy => cell.soil_energy -= actual,
+                }
+                total_pulled += actual as u32;
+            }
+        }
+    }
+    if total_pulled > 0 {
+        if let Some(cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
+            if let Some(e) = occupant_energy(&cell.occupant) {
+                let new_e =
+                    (e as u32 + total_pulled).min(Energy::MAX as u32) as Energy;
+                set_occupant_energy(&mut cell.occupant, new_e);
+            }
+        }
+    }
+}
+
+fn deposit_kernel(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    wx: i32,
+    wy: i32,
+    max_x: i32,
+    max_y: i32,
+    kernel: &[[u16; 3]; 3],
+) {
+    for dy in -1..=1i32 {
+        for dx in -1..=1i32 {
+            let weight = kernel[(dy + 1) as usize][(dx + 1) as usize];
+            if weight == 0 {
+                continue;
+            }
+            let nx = wx + dx;
+            let ny = wy + dy;
+            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                continue;
+            }
+            if let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) {
+                cell.organic = cell.organic.saturating_add(weight);
+            }
+        }
+    }
+}
+
+fn cell_at_mut(chunks: &mut [Chunk], chunks_x: u32, wx: i32, wy: i32) -> Option<&mut Cell> {
+    if wx < 0 || wy < 0 {
+        return None;
+    }
+    let edge = CHUNK_EDGE as i32;
+    let cx = wx / edge;
+    let cy = wy / edge;
+    let lx = (wx % edge) as usize;
+    let ly = (wy % edge) as usize;
+    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+    chunks.get_mut(chunk_idx)?.cells.get_mut(cell_idx)
 }
 
 fn cell_at(prev: &[Chunk], chunks_x: u32, wx: i32, wy: i32) -> &Cell {
