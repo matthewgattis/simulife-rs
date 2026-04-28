@@ -292,6 +292,8 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
     let energy = 200u16;
     let bare_genome = || Box::new(Genome { bytes: Vec::new() });
 
+    // Inert showcase row (parent: None, children: 0). Existing cells are
+    // visually distinct but disconnected from any plant tree.
     let entries: Vec<(i32, i32, Occupant)> = vec![
         (
             10,
@@ -300,6 +302,7 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant,
                 energy,
                 facing: Direction::East,
+                parent: None,
             },
         ),
         (
@@ -309,9 +312,18 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant,
                 energy,
                 facing: Direction::North,
+                parent: None,
             },
         ),
-        (14, 20, Occupant::Root { plant, energy }),
+        (
+            14,
+            20,
+            Occupant::Root {
+                plant,
+                energy,
+                parent: None,
+            },
+        ),
         (
             16,
             20,
@@ -319,6 +331,8 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant,
                 energy,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: None,
+                children: 0,
             },
         ),
         (
@@ -331,6 +345,8 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                     | STEM_CONNECT_EAST
                     | STEM_CONNECT_SOUTH
                     | STEM_CONNECT_WEST,
+                parent: None,
+                children: 0,
             },
         ),
         (
@@ -340,9 +356,19 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant,
                 energy,
                 connections: STEM_CONNECT_EAST | STEM_CONNECT_SOUTH,
+                parent: None,
+                children: 0,
             },
         ),
-        (22, 20, Occupant::Antenna { plant, energy }),
+        (
+            22,
+            20,
+            Occupant::Antenna {
+                plant,
+                energy,
+                parent: None,
+            },
+        ),
         (
             24,
             20,
@@ -351,6 +377,7 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 energy,
                 facing: Direction::North,
                 genome: bare_genome(),
+                parent: None,
             },
         ),
         (
@@ -361,10 +388,54 @@ fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 energy,
                 facing: Direction::East,
                 genome: bare_genome(),
+                parent: None,
             },
         ),
     ];
     for (x, y, occupant) in entries {
+        place_at(chunks, chunks_x, x, y, occupant);
+    }
+
+    // Viable mini-plant centered around (50, 50). A trunk stem with a leaf
+    // on its east side (production source) and a sprout above it (growth
+    // sink). Energy: leaf -> trunk -> sprout -> trunk (cycle), with leaf
+    // photosynthesis as the source.
+    let plant2 = 2u32;
+    let mini_plant: Vec<(i32, i32, Occupant)> = vec![
+        (
+            50,
+            51,
+            Occupant::Stem {
+                plant: plant2,
+                energy: 100,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_EAST,
+                parent: None,
+                children: STEM_CONNECT_NORTH,
+            },
+        ),
+        (
+            50,
+            50,
+            Occupant::Sprout {
+                plant: plant2,
+                energy: 100,
+                facing: Direction::North,
+                genome: bare_genome(),
+                parent: Some(Direction::South),
+            },
+        ),
+        (
+            51,
+            51,
+            Occupant::Leaf {
+                plant: plant2,
+                energy: 100,
+                facing: Direction::East,
+                parent: Some(Direction::West),
+            },
+        ),
+    ];
+    for (x, y, occupant) in mini_plant {
         place_at(chunks, chunks_x, x, y, occupant);
     }
 }
@@ -494,18 +565,12 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
     let max_x = chunks_x as i32 * edge;
     let max_y = chunks_y as i32 * edge;
 
-    // Phase 1: photosynthesis + conduction (read prev snapshot, write new).
-    let prev = chunks.to_vec();
-    for cy in 0..chunks_y {
-        for cx in 0..chunks_x {
-            for ly in 0..(CHUNK_EDGE as usize) {
-                for lx in 0..(CHUNK_EDGE as usize) {
-                    let wx = cx as i32 * edge + lx as i32;
-                    let wy = cy as i32 * edge + ly as i32;
-                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    chunks[chunk_idx].cells[cell_idx] =
-                        tick_phase1(&prev, chunks_x, wx, wy, max_x, max_y);
+    // Phase 1: photosynthesis (per-cell, in-place).
+    for chunk in chunks.iter_mut() {
+        for cell in chunk.cells.iter_mut() {
+            if cell.sunlit {
+                if let Occupant::Leaf { energy, .. } = &mut cell.occupant {
+                    *energy = energy.saturating_add(LEAF_PHOTOSYNTHESIS);
                 }
             }
         }
@@ -534,7 +599,7 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
         }
     }
 
-    // Phase 3: upkeep.
+    // Phase 3: upkeep (per-cell, in-place).
     for chunk in chunks.iter_mut() {
         for cell in chunk.cells.iter_mut() {
             if let Some(e) = occupant_energy(&cell.occupant) {
@@ -544,7 +609,80 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
         }
     }
 
-    // Phase 4: death — collect 0-energy occupants, then deposit organic over
+    // Phase 4: directed push. Production cells push surplus to parent, stems
+    // split surplus across children, sprouts push to parent. Build a delta
+    // array from the current state, then apply atomically — removes any
+    // order dependency between cells in the same generation.
+    let total_cells = chunks.len() * CHUNK_AREA;
+    let mut deltas: Vec<i32> = vec![0; total_cells];
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let cell = &chunks[chunk_idx].cells[cell_idx];
+
+                    let cur_energy = match occupant_energy(&cell.occupant) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let buffer = upkeep_for(&cell.occupant);
+                    if cur_energy <= buffer {
+                        continue;
+                    }
+                    let pushable = cur_energy - buffer;
+
+                    let targets = push_targets(&cell.occupant);
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let per_target = pushable / targets.len() as Energy;
+                    if per_target == 0 {
+                        continue;
+                    }
+                    let total_pushed = per_target * targets.len() as Energy;
+
+                    deltas[linear_idx(chunks_x, wx, wy)] -= total_pushed as i32;
+                    for dir in targets {
+                        let (dx, dy) = direction_to_delta(dir);
+                        let nx = wx + dx;
+                        let ny = wy + dy;
+                        if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                            continue;
+                        }
+                        deltas[linear_idx(chunks_x, nx, ny)] += per_target as i32;
+                    }
+                }
+            }
+        }
+    }
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let delta = deltas[linear_idx(chunks_x, wx, wy)];
+                    if delta == 0 {
+                        continue;
+                    }
+                    let cell = &mut chunks[chunk_idx].cells[cell_idx];
+                    if let Some(e) = occupant_energy(&cell.occupant) {
+                        let new_e = ((e as i32) + delta)
+                            .clamp(0, Energy::MAX as i32) as Energy;
+                        set_occupant_energy(&mut cell.occupant, new_e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 5: death — collect 0-energy occupants, then deposit organic over
     // a 3x3 area and replace the cell with Empty.
     let mut dying: Vec<(i32, i32)> = Vec::new();
     for cy in 0..chunks_y {
@@ -573,51 +711,51 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
     }
 }
 
-fn tick_phase1(
-    prev: &[Chunk],
-    chunks_x: u32,
-    wx: i32,
-    wy: i32,
-    max_x: i32,
-    max_y: i32,
-) -> Cell {
-    let prev_self = cell_at(prev, chunks_x, wx, wy);
-    let mut next = prev_self.clone();
-
-    if next.sunlit {
-        if let Occupant::Leaf { energy, .. } = &mut next.occupant {
-            *energy = energy.saturating_add(LEAF_PHOTOSYNTHESIS);
-        }
+fn push_targets(occ: &Occupant) -> Vec<Direction> {
+    match occ {
+        Occupant::Empty | Occupant::Seed { .. } => Vec::new(),
+        Occupant::Leaf { parent, .. }
+        | Occupant::Root { parent, .. }
+        | Occupant::Antenna { parent, .. }
+        | Occupant::Sprout { parent, .. } => parent.iter().copied().collect(),
+        Occupant::Stem { children, .. } => bitmask_to_dirs(*children),
     }
+}
 
-    if let Some(self_e) = occupant_energy(&next.occupant) {
-        let mut total = self_e as u32;
-        let mut count = 1u32;
-        let dirs: [(i32, i32, u8, u8); 4] = [
-            (0, -1, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH),
-            (1, 0, STEM_CONNECT_EAST, STEM_CONNECT_WEST),
-            (0, 1, STEM_CONNECT_SOUTH, STEM_CONNECT_NORTH),
-            (-1, 0, STEM_CONNECT_WEST, STEM_CONNECT_EAST),
-        ];
-        for (dx, dy, dir, opp) in dirs {
-            let nx = wx + dx;
-            let ny = wy + dy;
-            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
-                continue;
-            }
-            let neighbor = cell_at(prev, chunks_x, nx, ny);
-            if is_connected(prev_self, neighbor, dir, opp) {
-                if let Some(ne) = occupant_energy(&neighbor.occupant) {
-                    total = total.saturating_add(ne as u32);
-                    count += 1;
-                }
-            }
-        }
-        let avg = (total / count).min(Energy::MAX as u32) as Energy;
-        set_occupant_energy(&mut next.occupant, avg);
+fn bitmask_to_dirs(mask: u8) -> Vec<Direction> {
+    let mut dirs = Vec::new();
+    if mask & STEM_CONNECT_NORTH != 0 {
+        dirs.push(Direction::North);
     }
+    if mask & STEM_CONNECT_EAST != 0 {
+        dirs.push(Direction::East);
+    }
+    if mask & STEM_CONNECT_SOUTH != 0 {
+        dirs.push(Direction::South);
+    }
+    if mask & STEM_CONNECT_WEST != 0 {
+        dirs.push(Direction::West);
+    }
+    dirs
+}
 
-    next
+fn direction_to_delta(dir: Direction) -> (i32, i32) {
+    match dir {
+        Direction::North => (0, -1),
+        Direction::East => (1, 0),
+        Direction::South => (0, 1),
+        Direction::West => (-1, 0),
+    }
+}
+
+fn linear_idx(chunks_x: u32, wx: i32, wy: i32) -> usize {
+    let edge = CHUNK_EDGE as i32;
+    let cx = wx / edge;
+    let cy = wy / edge;
+    let lx = (wx % edge) as usize;
+    let ly = (wy % edge) as usize;
+    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+    chunk_idx * CHUNK_AREA + ly * (CHUNK_EDGE as usize) + lx
 }
 
 fn apply_soil_pull(
@@ -709,29 +847,6 @@ fn cell_at_mut(chunks: &mut [Chunk], chunks_x: u32, wx: i32, wy: i32) -> Option<
     let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
     chunks.get_mut(chunk_idx)?.cells.get_mut(cell_idx)
-}
-
-fn cell_at(prev: &[Chunk], chunks_x: u32, wx: i32, wy: i32) -> &Cell {
-    let edge = CHUNK_EDGE as i32;
-    let cx = wx / edge;
-    let cy = wy / edge;
-    let lx = (wx % edge) as usize;
-    let ly = (wy % edge) as usize;
-    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-    &prev[chunk_idx].cells[cell_idx]
-}
-
-fn is_connected(self_cell: &Cell, neighbor: &Cell, dir_to_n: u8, opp_dir: u8) -> bool {
-    let self_link = matches!(
-        &self_cell.occupant,
-        Occupant::Stem { connections, .. } if connections & dir_to_n != 0
-    );
-    let neighbor_link = matches!(
-        &neighbor.occupant,
-        Occupant::Stem { connections, .. } if connections & opp_dir != 0
-    );
-    self_link || neighbor_link
 }
 
 fn occupant_energy(occ: &Occupant) -> Option<Energy> {
@@ -896,6 +1011,7 @@ fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
         energy: 100,
         facing,
         genome: Box::new(Genome { bytes: Vec::new() }),
+        parent: None,
     };
     info!(x, y, plant, ?facing, "sprout spawned");
 }

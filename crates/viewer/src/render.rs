@@ -625,6 +625,7 @@ fn to_gpu_cell(cell: &Cell) -> GpuCell {
             plant,
             energy,
             facing,
+            ..
         } => (
             GPU_KIND_LEAF,
             *plant,
@@ -632,13 +633,14 @@ fn to_gpu_cell(cell: &Cell) -> GpuCell {
             facing_to_u32(*facing),
             0,
         ),
-        Occupant::Root { plant, energy } => {
+        Occupant::Root { plant, energy, .. } => {
             (GPU_KIND_ROOT, *plant, u32::from(*energy), 0, 0)
         }
         Occupant::Stem {
             plant,
             energy,
             connections,
+            ..
         } => (
             GPU_KIND_STEM,
             *plant,
@@ -646,7 +648,7 @@ fn to_gpu_cell(cell: &Cell) -> GpuCell {
             0,
             u32::from(*connections),
         ),
-        Occupant::Antenna { plant, energy } => {
+        Occupant::Antenna { plant, energy, .. } => {
             (GPU_KIND_ANTENNA, *plant, u32::from(*energy), 0, 0)
         }
         Occupant::Sprout {
@@ -852,33 +854,66 @@ fn occupant_label(occ: &Occupant) -> String {
             plant,
             energy,
             facing,
-        } => format!("leaf (plant {plant}, energy {energy}, facing {facing:?})"),
-        Occupant::Root { plant, energy } => {
-            format!("root (plant {plant}, energy {energy})")
-        }
+            parent,
+        } => format!(
+            "leaf (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
+            parent_label(*parent)
+        ),
+        Occupant::Root {
+            plant,
+            energy,
+            parent,
+        } => format!(
+            "root (plant {plant}, energy {energy}, parent {})",
+            parent_label(*parent)
+        ),
         Occupant::Stem {
             plant,
             energy,
             connections,
+            parent,
+            children,
         } => format!(
-            "stem (plant {plant}, energy {energy}, conn {})",
-            connections_label(*connections)
+            "stem (plant {plant}, energy {energy}, conn {}, parent {}, kids {})",
+            connections_label(*connections),
+            parent_label(*parent),
+            connections_label(*children)
         ),
-        Occupant::Antenna { plant, energy } => {
-            format!("antenna (plant {plant}, energy {energy})")
-        }
+        Occupant::Antenna {
+            plant,
+            energy,
+            parent,
+        } => format!(
+            "antenna (plant {plant}, energy {energy}, parent {})",
+            parent_label(*parent)
+        ),
         Occupant::Sprout {
             plant,
             energy,
             facing,
+            parent,
             ..
-        } => format!("sprout (plant {plant}, energy {energy}, facing {facing:?})"),
+        } => format!(
+            "sprout (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
+            parent_label(*parent)
+        ),
         Occupant::Seed {
             plant,
             energy,
             facing,
+            parent,
             ..
-        } => format!("seed (plant {plant}, energy {energy}, facing {facing:?})"),
+        } => format!(
+            "seed (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
+            parent_label(*parent)
+        ),
+    }
+}
+
+fn parent_label(p: Option<protocol::Direction>) -> String {
+    match p {
+        None => "—".to_string(),
+        Some(d) => format!("{d:?}"),
     }
 }
 

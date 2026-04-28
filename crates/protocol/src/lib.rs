@@ -37,31 +37,38 @@ pub enum Occupant {
         plant: PlantId,
         energy: Energy,
         facing: Direction,
+        parent: Option<Direction>,
     },
     Root {
         plant: PlantId,
         energy: Energy,
+        parent: Option<Direction>,
     },
     Stem {
         plant: PlantId,
         energy: Energy,
         connections: u8,
+        parent: Option<Direction>,
+        children: u8,
     },
     Antenna {
         plant: PlantId,
         energy: Energy,
+        parent: Option<Direction>,
     },
     Sprout {
         plant: PlantId,
         energy: Energy,
         facing: Direction,
         genome: Box<Genome>,
+        parent: Option<Direction>,
     },
     Seed {
         plant: PlantId,
         energy: Energy,
         facing: Direction,
         genome: Box<Genome>,
+        parent: Option<Direction>,
     },
 }
 
@@ -127,6 +134,7 @@ mod tests {
                 energy: 100,
                 facing: Direction::North,
                 genome: Box::new(Genome { bytes: vec![1, 2, 3] }),
+                parent: Some(Direction::South),
             },
         };
         cells[42] = Cell {
@@ -138,6 +146,7 @@ mod tests {
                 energy: 5,
                 facing: Direction::West,
                 genome: Box::new(Genome { bytes: vec![1, 2, 3] }),
+                parent: None,
             },
         };
         cells[100] = Cell {
@@ -148,6 +157,7 @@ mod tests {
                 plant: 1,
                 energy: 30,
                 facing: Direction::East,
+                parent: Some(Direction::West),
             },
         };
 
@@ -167,6 +177,7 @@ mod tests {
             energy,
             facing,
             ref genome,
+            parent,
         } = decoded.cells[5].occupant
         else {
             panic!("expected sprout at index 5");
@@ -175,6 +186,7 @@ mod tests {
         assert_eq!(energy, 100);
         assert_eq!(facing, Direction::North);
         assert_eq!(genome.bytes, vec![1, 2, 3]);
+        assert_eq!(parent, Some(Direction::South));
         assert_eq!(decoded.cells[5].organic, 12);
         assert!(!decoded.cells[5].sunlit);
 
