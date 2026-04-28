@@ -103,9 +103,13 @@ pub enum ServerMessage {
         world_chunks_y: u32,
         paused: bool,
         tick_hz: u32,
+        tick: u64,
     },
     ChunkSnapshot(Chunk),
-    ChunkBatch(Vec<Chunk>),
+    ChunkBatch {
+        tick: u64,
+        chunks: Vec<Chunk>,
+    },
 }
 
 #[cfg(test)]
@@ -209,6 +213,7 @@ mod tests {
             world_chunks_y: 16,
             paused: false,
             tick_hz: 10,
+            tick: 42,
         };
         let bytes = rmp_serde::to_vec(&msg).expect("encode");
         let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("decode");
@@ -218,11 +223,13 @@ mod tests {
                 world_chunks_y,
                 paused,
                 tick_hz,
+                tick,
             } => {
                 assert_eq!(world_chunks_x, 16);
                 assert_eq!(world_chunks_y, 16);
                 assert!(!paused);
                 assert_eq!(tick_hz, 10);
+                assert_eq!(tick, 42);
             }
             _ => panic!("expected Welcome"),
         }

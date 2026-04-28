@@ -55,13 +55,14 @@ async fn run_session(
     info!(remote = %conn.remote_address(), "connected");
 
     let welcome = request(&conn, &ClientMessage::Hello).await?;
-    let (world_chunks_x, world_chunks_y, paused, tick_hz) = match welcome {
+    let (world_chunks_x, world_chunks_y, paused, tick_hz, tick) = match welcome {
         ServerMessage::Welcome {
             world_chunks_x,
             world_chunks_y,
             paused,
             tick_hz,
-        } => (world_chunks_x, world_chunks_y, paused, tick_hz),
+            tick,
+        } => (world_chunks_x, world_chunks_y, paused, tick_hz, tick),
         other => bail!("unexpected first message: {other:?}"),
     };
     let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
@@ -69,13 +70,14 @@ async fn run_session(
         world_chunks_y,
         paused,
         tick_hz,
+        tick,
     }));
 
     let batch = request(&conn, &ClientMessage::Subscribe).await?;
     match batch {
-        ServerMessage::ChunkBatch(chunks) => {
-            info!(count = chunks.len(), "received initial chunk batch");
-            let _ = proxy.send_event(UserEvent::Chunks(chunks));
+        ServerMessage::ChunkBatch { tick, chunks } => {
+            info!(count = chunks.len(), tick, "received initial chunk batch");
+            let _ = proxy.send_event(UserEvent::Chunks { tick, chunks });
         }
         other => bail!("expected ChunkBatch, got {other:?}"),
     }
@@ -101,9 +103,9 @@ async fn run_session(
                 let buf = recv.read_to_end(8 * 1024 * 1024).await?;
                 let msg: ServerMessage = rmp_serde::from_slice(&buf)?;
                 match msg {
-                    ServerMessage::ChunkBatch(chunks) => {
-                        debug!(count = chunks.len(), "tick chunk batch");
-                        let _ = proxy.send_event(UserEvent::Chunks(chunks));
+                    ServerMessage::ChunkBatch { tick, chunks } => {
+                        debug!(count = chunks.len(), tick, "tick chunk batch");
+                        let _ = proxy.send_event(UserEvent::Chunks { tick, chunks });
                     }
                     other => warn!(?other, "unexpected push message"),
                 }

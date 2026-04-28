@@ -17,7 +17,7 @@ use crate::render::{LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Network(NetworkStatus),
-    Chunks(Vec<Chunk>),
+    Chunks { tick: u64, chunks: Vec<Chunk> },
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ pub enum NetworkStatus {
         world_chunks_y: u32,
         paused: bool,
         tick_hz: u32,
+        tick: u64,
     },
 }
 
@@ -73,6 +74,7 @@ pub struct App {
     layer_flags: u32,
     sim_paused: bool,
     sim_tick_hz: u32,
+    sim_tick: u64,
     centered_once: bool,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
@@ -104,6 +106,7 @@ impl App {
             layer_flags: LAYER_ORGANIC | LAYER_FG | LAYER_ENERGY,
             sim_paused: false,
             sim_tick_hz: 10,
+            sim_tick: 0,
             centered_once: false,
             dragging: false,
             last_cursor: None,
@@ -159,6 +162,7 @@ impl ApplicationHandler<UserEvent> for App {
                     world_chunks_y,
                     paused,
                     tick_hz,
+                    tick,
                 } = &status
                 {
                     if !self.centered_once {
@@ -171,16 +175,18 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.sim_paused = *paused;
                     self.sim_tick_hz = *tick_hz;
+                    self.sim_tick = *tick;
                 }
                 self.network = status;
             }
-            UserEvent::Chunks(chunks) => {
+            UserEvent::Chunks { tick, chunks } => {
                 if chunks.len() != self.chunks.len() {
-                    info!(count = chunks.len(), "world snapshot loaded");
+                    info!(count = chunks.len(), tick, "world snapshot loaded");
                 } else {
-                    debug!(count = chunks.len(), "world ticked");
+                    debug!(count = chunks.len(), tick, "world ticked");
                 }
                 self.chunks = chunks;
+                self.sim_tick = tick;
                 if let Some(state) = self.state.as_mut() {
                     state.upload_chunks(&self.chunks);
                 }
@@ -305,6 +311,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &mut self.layer_flags,
                     &mut self.sim_paused,
                     &mut self.sim_tick_hz,
+                    self.sim_tick,
                     self.last_cursor,
                     &mut self.context_menu,
                     &self.outgoing,

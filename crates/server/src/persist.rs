@@ -19,6 +19,8 @@ pub struct WorldSnapshot {
     pub chunks_x: u32,
     pub chunks_y: u32,
     pub next_plant_id: u32,
+    #[serde(default)]
+    pub current_tick: u64,
     pub chunks: Vec<Chunk>,
 }
 
@@ -48,6 +50,7 @@ pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
         chunks_x: state.chunks_x,
         chunks_y: state.chunks_y,
         next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
+        current_tick: state.current_tick.load(Ordering::Relaxed),
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
     };
     let raw = rmp_serde::to_vec(&snapshot)?;
@@ -80,6 +83,7 @@ pub fn load_or_build(
         chunks_x: world_width,
         chunks_y: world_height,
         next_plant_id: 1,
+        current_tick: 0,
         chunks,
     })
 }

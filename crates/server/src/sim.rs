@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -41,6 +41,7 @@ pub struct SimState {
     pub world: std::sync::Mutex<Vec<Chunk>>,
     pub tick_tx: broadcast::Sender<Arc<Vec<u8>>>,
     pub next_plant_id: AtomicU32,
+    pub current_tick: AtomicU64,
     pub control: std::sync::Mutex<SimControl>,
 }
 
@@ -92,8 +93,12 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
             mutate_world(&mut chunks, state.chunks_x, state.chunks_y);
             chunks.clone()
         };
+        let tick = state.current_tick.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let msg = ServerMessage::ChunkBatch(snapshot_chunks);
+        let msg = ServerMessage::ChunkBatch {
+            tick,
+            chunks: snapshot_chunks,
+        };
         match rmp_serde::to_vec(&msg) {
             Ok(bytes) => {
                 let _ = state.tick_tx.send(Arc::new(bytes));

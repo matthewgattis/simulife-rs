@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 use anyhow::Result;
 use protocol::{ClientMessage, ServerMessage};
@@ -127,11 +127,13 @@ async fn handle_stream(
                 world_chunks_y: state.chunks_y,
                 paused,
                 tick_hz,
+                tick: state.current_tick.load(Ordering::Relaxed),
             })
         }
         ClientMessage::Subscribe => {
             let chunks = state.world.lock().expect("sim lock poisoned").clone();
-            Some(ServerMessage::ChunkBatch(chunks))
+            let tick = state.current_tick.load(Ordering::Relaxed);
+            Some(ServerMessage::ChunkBatch { tick, chunks })
         }
         ClientMessage::SpawnSprout { .. }
         | ClientMessage::SetPaused(_)

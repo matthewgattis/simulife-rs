@@ -151,6 +151,7 @@ impl RenderState {
         layer_flags: &mut u32,
         sim_paused: &mut bool,
         sim_tick_hz: &mut u32,
+        sim_tick: u64,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
         outgoing: &UnboundedSender<ClientMessage>,
@@ -193,6 +194,7 @@ impl RenderState {
                 layer_flags,
                 sim_paused,
                 sim_tick_hz,
+                sim_tick,
                 outgoing,
             );
             draw_context_menu(ctx, context_menu, chunks, outgoing);
@@ -707,6 +709,7 @@ fn draw_ui(
     layer_flags: &mut u32,
     sim_paused: &mut bool,
     sim_tick_hz: &mut u32,
+    sim_tick: u64,
     outgoing: &UnboundedSender<ClientMessage>,
 ) {
     egui::Window::new("Status")
@@ -740,6 +743,7 @@ fn draw_ui(
             ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
             ui.separator();
             ui.label("Sim:");
+            ui.label(format!("Tick: {sim_tick}"));
             ui.horizontal(|ui| {
                 let label = if *sim_paused { "Resume" } else { "Pause" };
                 if ui.button(label).clicked() {

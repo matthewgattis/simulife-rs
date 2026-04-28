@@ -7,7 +7,10 @@ mod world;
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU32},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64},
+    },
     time::Duration,
 };
 
@@ -85,6 +88,7 @@ async fn main() -> Result<()> {
         world: std::sync::Mutex::new(initial.chunks),
         tick_tx,
         next_plant_id: AtomicU32::new(initial.next_plant_id),
+        current_tick: AtomicU64::new(initial.current_tick),
         control: std::sync::Mutex::new(SimControl {
             paused: false,
             tick_hz: args.tick_hz.max(1),
