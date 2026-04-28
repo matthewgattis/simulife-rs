@@ -149,6 +149,8 @@ impl RenderState {
         chunks: &[Chunk],
         camera: &Camera,
         layer_flags: &mut u32,
+        sim_paused: &mut bool,
+        sim_tick_hz: &mut u32,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
         outgoing: &UnboundedSender<ClientMessage>,
@@ -189,6 +191,9 @@ impl RenderState {
                 cursor_world,
                 hovered_cell,
                 layer_flags,
+                sim_paused,
+                sim_tick_hz,
+                outgoing,
             );
             draw_context_menu(ctx, context_menu, chunks, outgoing);
         });
@@ -698,6 +703,9 @@ fn draw_ui(
     cursor_world: Option<glam::Vec2>,
     hovered_cell: Option<(ChunkCoord, &Cell)>,
     layer_flags: &mut u32,
+    sim_paused: &mut bool,
+    sim_tick_hz: &mut u32,
+    outgoing: &UnboundedSender<ClientMessage>,
 ) {
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
@@ -716,6 +724,7 @@ fn draw_ui(
                 NetworkStatus::Connected {
                     world_chunks_x,
                     world_chunks_y,
+                    ..
                 } => {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
                     ui.label(format!("Server: {server_addr}"));
@@ -727,6 +736,29 @@ fn draw_ui(
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
             ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
+            ui.separator();
+            ui.label("Sim:");
+            ui.horizontal(|ui| {
+                let label = if *sim_paused { "Resume" } else { "Pause" };
+                if ui.button(label).clicked() {
+                    *sim_paused = !*sim_paused;
+                    let _ = outgoing.send(ClientMessage::SetPaused(*sim_paused));
+                }
+                if ui
+                    .add_enabled(*sim_paused, egui::Button::new("Step"))
+                    .clicked()
+                {
+                    let _ = outgoing.send(ClientMessage::Step);
+                }
+            });
+            let mut hz = *sim_tick_hz;
+            if ui
+                .add(egui::Slider::new(&mut hz, 1..=60).text("Hz"))
+                .changed()
+            {
+                *sim_tick_hz = hz;
+                let _ = outgoing.send(ClientMessage::SetTickHz(hz));
+            }
             ui.separator();
             ui.label("Layers:");
             let mut organic = (*layer_flags & LAYER_ORGANIC) != 0;

@@ -55,16 +55,20 @@ async fn run_session(
     info!(remote = %conn.remote_address(), "connected");
 
     let welcome = request(&conn, &ClientMessage::Hello).await?;
-    let (world_chunks_x, world_chunks_y) = match welcome {
+    let (world_chunks_x, world_chunks_y, paused, tick_hz) = match welcome {
         ServerMessage::Welcome {
             world_chunks_x,
             world_chunks_y,
-        } => (world_chunks_x, world_chunks_y),
+            paused,
+            tick_hz,
+        } => (world_chunks_x, world_chunks_y, paused, tick_hz),
         other => bail!("unexpected first message: {other:?}"),
     };
     let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
         world_chunks_x,
         world_chunks_y,
+        paused,
+        tick_hz,
     }));
 
     let batch = request(&conn, &ClientMessage::Subscribe).await?;

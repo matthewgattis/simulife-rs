@@ -76,6 +76,14 @@ struct SimState {
     world: std::sync::Mutex<Vec<Chunk>>,
     tick_tx: broadcast::Sender<Arc<Vec<u8>>>,
     next_plant_id: AtomicU32,
+    control: std::sync::Mutex<SimControl>,
+}
+
+#[derive(Debug)]
+struct SimControl {
+    paused: bool,
+    tick_hz: u32,
+    step_pending: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,6 +208,11 @@ async fn main() -> Result<()> {
         world: std::sync::Mutex::new(initial.chunks),
         tick_tx,
         next_plant_id: AtomicU32::new(initial.next_plant_id),
+        control: std::sync::Mutex::new(SimControl {
+            paused: false,
+            tick_hz: args.tick_hz.max(1),
+            step_pending: 0,
+        }),
     });
 
     info!(
@@ -228,11 +241,10 @@ async fn main() -> Result<()> {
     }
 
     let sim_state = Arc::clone(&state);
-    let tick_hz = args.tick_hz.max(1);
     tokio::spawn(async move {
-        run_sim_loop(sim_state, tick_hz).await;
+        run_sim_loop(sim_state).await;
     });
-    info!(tick_hz, "sim loop started");
+    info!(tick_hz = args.tick_hz, "sim loop started");
 
     let (server_config, cert_source) = make_server_config(&args)?;
     let endpoint = Endpoint::server(server_config, args.listen)?;
@@ -404,13 +416,37 @@ fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
     chunks
 }
 
-async fn run_sim_loop(state: Arc<SimState>, tick_hz: u32) {
-    let mut interval = tokio::time::interval(Duration::from_millis(1000 / tick_hz as u64));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut tick: u64 = 0;
+enum SimAction {
+    TickNow,
+    TickAfter(Duration),
+    Wait,
+}
 
+async fn run_sim_loop(state: Arc<SimState>) {
+    let mut tick: u64 = 0;
     loop {
-        interval.tick().await;
+        let action = {
+            let mut ctrl = state.control.lock().expect("control poisoned");
+            let dur = Duration::from_millis(1000 / ctrl.tick_hz.max(1) as u64);
+            if ctrl.step_pending > 0 {
+                ctrl.step_pending -= 1;
+                SimAction::TickNow
+            } else if !ctrl.paused {
+                SimAction::TickAfter(dur)
+            } else {
+                SimAction::Wait
+            }
+        };
+
+        match action {
+            SimAction::TickNow => {}
+            SimAction::TickAfter(dur) => tokio::time::sleep(dur).await,
+            SimAction::Wait => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        }
+
         tick = tick.wrapping_add(1);
 
         let snapshot_chunks = {
@@ -532,6 +568,22 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
         ClientMessage::SpawnSprout { x, y, facing } => {
             spawn_sprout(&state, x, y, facing);
         }
+        ClientMessage::SetPaused(paused) => {
+            let mut ctrl = state.control.lock().expect("control poisoned");
+            ctrl.paused = paused;
+            info!(paused, "sim pause state changed");
+        }
+        ClientMessage::Step => {
+            let mut ctrl = state.control.lock().expect("control poisoned");
+            ctrl.step_pending = ctrl.step_pending.saturating_add(1);
+            debug!(step_pending = ctrl.step_pending, "step requested");
+        }
+        ClientMessage::SetTickHz(hz) => {
+            let hz = hz.max(1);
+            let mut ctrl = state.control.lock().expect("control poisoned");
+            ctrl.tick_hz = hz;
+            info!(tick_hz = hz, "tick rate changed");
+        }
         other => warn!(?other, "unexpected message on client uni stream"),
     }
     Ok(())
@@ -591,16 +643,27 @@ async fn handle_stream(
     debug!(?msg, "received");
 
     let response = match msg {
-        ClientMessage::Hello => Some(ServerMessage::Welcome {
-            world_chunks_x: state.chunks_x,
-            world_chunks_y: state.chunks_y,
-        }),
+        ClientMessage::Hello => {
+            let (paused, tick_hz) = {
+                let ctrl = state.control.lock().expect("control poisoned");
+                (ctrl.paused, ctrl.tick_hz)
+            };
+            Some(ServerMessage::Welcome {
+                world_chunks_x: state.chunks_x,
+                world_chunks_y: state.chunks_y,
+                paused,
+                tick_hz,
+            })
+        }
         ClientMessage::Subscribe => {
             let chunks = state.world.lock().expect("sim lock poisoned").clone();
             Some(ServerMessage::ChunkBatch(chunks))
         }
-        ClientMessage::SpawnSprout { .. } => {
-            warn!("SpawnSprout arrived on bidi stream; expected on uni");
+        ClientMessage::SpawnSprout { .. }
+        | ClientMessage::SetPaused(_)
+        | ClientMessage::Step
+        | ClientMessage::SetTickHz(_) => {
+            warn!("control / spawn message arrived on bidi stream; expected on uni");
             None
         }
     };

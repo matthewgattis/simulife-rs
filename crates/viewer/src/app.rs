@@ -23,7 +23,12 @@ pub enum UserEvent {
 #[derive(Debug, Clone)]
 pub enum NetworkStatus {
     Connecting(Option<String>),
-    Connected { world_chunks_x: u32, world_chunks_y: u32 },
+    Connected {
+        world_chunks_x: u32,
+        world_chunks_y: u32,
+        paused: bool,
+        tick_hz: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +71,8 @@ pub struct App {
     chunks: Vec<Chunk>,
     camera: Camera,
     layer_flags: u32,
+    sim_paused: bool,
+    sim_tick_hz: u32,
     centered_once: bool,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
@@ -95,6 +102,8 @@ impl App {
                 cells_visible_y: 64.0,
             },
             layer_flags: LAYER_ORGANIC | LAYER_FG | LAYER_ENERGY,
+            sim_paused: false,
+            sim_tick_hz: 10,
             centered_once: false,
             dragging: false,
             last_cursor: None,
@@ -148,6 +157,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let NetworkStatus::Connected {
                     world_chunks_x,
                     world_chunks_y,
+                    paused,
+                    tick_hz,
                 } = &status
                 {
                     if !self.centered_once {
@@ -158,6 +169,8 @@ impl ApplicationHandler<UserEvent> for App {
                         self.camera.cells_visible_y = world_h * 1.1;
                         self.centered_once = true;
                     }
+                    self.sim_paused = *paused;
+                    self.sim_tick_hz = *tick_hz;
                 }
                 self.network = status;
             }
@@ -280,6 +293,8 @@ impl ApplicationHandler<UserEvent> for App {
                     &self.chunks,
                     &self.camera,
                     &mut self.layer_flags,
+                    &mut self.sim_paused,
+                    &mut self.sim_tick_hz,
                     self.last_cursor,
                     &mut self.context_menu,
                     &self.outgoing,

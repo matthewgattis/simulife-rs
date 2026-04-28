@@ -84,11 +84,19 @@ pub enum ClientMessage {
     Hello,
     Subscribe,
     SpawnSprout { x: i32, y: i32, facing: Direction },
+    SetPaused(bool),
+    Step,
+    SetTickHz(u32),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ServerMessage {
-    Welcome { world_chunks_x: u32, world_chunks_y: u32 },
+    Welcome {
+        world_chunks_x: u32,
+        world_chunks_y: u32,
+        paused: bool,
+        tick_hz: u32,
+    },
     ChunkSnapshot(Chunk),
     ChunkBatch(Vec<Chunk>),
 }
@@ -187,13 +195,22 @@ mod tests {
         let msg = ServerMessage::Welcome {
             world_chunks_x: 16,
             world_chunks_y: 16,
+            paused: false,
+            tick_hz: 10,
         };
         let bytes = rmp_serde::to_vec(&msg).expect("encode");
         let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("decode");
         match decoded {
-            ServerMessage::Welcome { world_chunks_x, world_chunks_y } => {
+            ServerMessage::Welcome {
+                world_chunks_x,
+                world_chunks_y,
+                paused,
+                tick_hz,
+            } => {
                 assert_eq!(world_chunks_x, 16);
                 assert_eq!(world_chunks_y, 16);
+                assert!(!paused);
+                assert_eq!(tick_hz, 10);
             }
             _ => panic!("expected Welcome"),
         }
