@@ -18,6 +18,8 @@ const LEAF_PHOTOSYNTHESIS: Energy = 5;
 const UPKEEP_DEFAULT: Energy = 1;
 const UPKEEP_SEED: Energy = 0;
 const UPKEEP_SPROUT: Energy = 3;
+const GROWTH_THRESHOLD: Energy = 50;
+const GROWTH_CHILD_ENERGY: Energy = 10;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -257,7 +259,40 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
         }
     }
 
-    // Phase 5: death — collect 0-energy occupants, then deposit organic over
+    // Phase 5: growth — sprouts above GROWTH_THRESHOLD differentiate into
+    // a stem and spawn new cells in front (sprout) + left/right (leaves).
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let info = match &chunks[chunk_idx].cells[cell_idx].occupant {
+                        Occupant::Sprout {
+                            plant,
+                            energy,
+                            facing,
+                            parent,
+                            ..
+                        } if *energy > GROWTH_THRESHOLD => {
+                            Some((*plant, *energy, *facing, *parent))
+                        }
+                        _ => None,
+                    };
+                    if let Some((plant, energy, facing, parent)) = info {
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        attempt_growth(
+                            chunks, chunks_x, max_x, max_y, wx, wy, plant, energy, facing,
+                            parent,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 6: death — collect 0-energy occupants, then deposit organic over
     // a 3x3 area and replace the cell with Empty.
     let mut dying: Vec<(i32, i32)> = Vec::new();
     for cy in 0..chunks_y {
@@ -455,5 +490,117 @@ fn upkeep_for(occ: &Occupant) -> Energy {
         Occupant::Seed { .. } => UPKEEP_SEED,
         Occupant::Sprout { .. } => UPKEEP_SPROUT,
         _ => UPKEEP_DEFAULT,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GrowthChild {
+    Sprout,
+    Leaf,
+}
+
+fn attempt_growth(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    max_x: i32,
+    max_y: i32,
+    wx: i32,
+    wy: i32,
+    plant: u32,
+    sprout_energy: Energy,
+    facing: Direction,
+    parent: Option<Direction>,
+) {
+    let plan = [
+        (facing, GrowthChild::Sprout),
+        (rotate_left(facing), GrowthChild::Leaf),
+        (rotate_right(facing), GrowthChild::Leaf),
+    ];
+
+    let mut connections = 0u8;
+    let mut children = 0u8;
+    let mut grew = false;
+
+    for (dir, kind) in plan {
+        let (dx, dy) = direction_to_delta(dir);
+        let nx = wx + dx;
+        let ny = wy + dy;
+        if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+            continue;
+        }
+        let target = match cell_at_mut(chunks, chunks_x, nx, ny) {
+            Some(c) if matches!(c.occupant, Occupant::Empty) => c,
+            _ => continue,
+        };
+        let opposite = opposite_dir(dir);
+        target.occupant = match kind {
+            GrowthChild::Sprout => Occupant::Sprout {
+                plant,
+                energy: GROWTH_CHILD_ENERGY,
+                facing: dir,
+                genome: Box::new(Genome { bytes: Vec::new() }),
+                parent: Some(opposite),
+            },
+            GrowthChild::Leaf => Occupant::Leaf {
+                plant,
+                energy: GROWTH_CHILD_ENERGY,
+                facing: dir,
+                parent: Some(opposite),
+            },
+        };
+        connections |= dir_to_bitmask(dir);
+        if matches!(kind, GrowthChild::Sprout) {
+            children |= dir_to_bitmask(dir);
+        }
+        grew = true;
+    }
+
+    if grew {
+        let new_energy = sprout_energy.saturating_sub(GROWTH_THRESHOLD);
+        if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
+            self_cell.occupant = Occupant::Stem {
+                plant,
+                energy: new_energy,
+                connections,
+                parent,
+                children,
+            };
+        }
+    }
+}
+
+fn rotate_left(d: Direction) -> Direction {
+    match d {
+        Direction::North => Direction::West,
+        Direction::West => Direction::South,
+        Direction::South => Direction::East,
+        Direction::East => Direction::North,
+    }
+}
+
+fn rotate_right(d: Direction) -> Direction {
+    match d {
+        Direction::North => Direction::East,
+        Direction::East => Direction::South,
+        Direction::South => Direction::West,
+        Direction::West => Direction::North,
+    }
+}
+
+fn opposite_dir(d: Direction) -> Direction {
+    match d {
+        Direction::North => Direction::South,
+        Direction::East => Direction::West,
+        Direction::South => Direction::North,
+        Direction::West => Direction::East,
+    }
+}
+
+fn dir_to_bitmask(d: Direction) -> u8 {
+    match d {
+        Direction::North => STEM_CONNECT_NORTH,
+        Direction::East => STEM_CONNECT_EAST,
+        Direction::South => STEM_CONNECT_SOUTH,
+        Direction::West => STEM_CONNECT_WEST,
     }
 }
