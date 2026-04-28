@@ -265,17 +265,27 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
+                        logical_key,
                         state: ElementState::Pressed,
                         ..
                     },
                 ..
-            } => {
-                if self.context_menu.is_some() {
-                    self.context_menu = None;
+            } => match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    if self.context_menu.is_some() {
+                        self.context_menu = None;
+                        state.window().request_redraw();
+                    }
+                }
+                Key::Named(NamedKey::Space) => {
+                    self.sim_paused = !self.sim_paused;
+                    let _ = self
+                        .outgoing
+                        .send(ClientMessage::SetPaused(self.sim_paused));
                     state.window().request_redraw();
                 }
-            }
+                _ => {}
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
