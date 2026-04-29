@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use protocol::{CHUNK_EDGE, Chunk, ClientMessage};
+use protocol::{CHUNK_EDGE, ClientMessage, WireChunk};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 use winit::{
@@ -21,7 +21,7 @@ use crate::render::{LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Network(NetworkStatus),
-    Chunks { tick: u64, chunks: Vec<Chunk> },
+    Chunks { tick: u64, chunks: Vec<WireChunk> },
     Shutdown,
 }
 
@@ -82,7 +82,7 @@ impl Camera {
 pub struct App {
     state: Option<RenderState>,
     network: NetworkStatus,
-    chunks: Vec<Chunk>,
+    chunks: Vec<WireChunk>,
     camera: Camera,
     layer_flags: u32,
     sim_paused: bool,

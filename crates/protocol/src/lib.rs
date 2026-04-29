@@ -139,6 +139,161 @@ pub struct Chunk {
     pub cells: Vec<Cell>,
 }
 
+/// Lightweight occupant for the live wire feed. Same shape as `Occupant`
+/// minus the genome, which dominates msgpack work for sprouts/seeds. The
+/// viewer doesn't need genomes to render, so we strip them at emit time
+/// and surface them via a separate request when the user inspects a cell.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum WireOccupant {
+    Empty,
+    Leaf {
+        plant: PlantId,
+        energy: Energy,
+        facing: Direction,
+        parent: Option<Direction>,
+    },
+    Root {
+        plant: PlantId,
+        energy: Energy,
+        parent: Option<Direction>,
+    },
+    Stem {
+        plant: PlantId,
+        energy: Energy,
+        connections: u8,
+        parent: Option<Direction>,
+        children: u8,
+    },
+    Antenna {
+        plant: PlantId,
+        energy: Energy,
+        parent: Option<Direction>,
+    },
+    Sprout {
+        plant: PlantId,
+        energy: Energy,
+        facing: Direction,
+        parent: Option<Direction>,
+        current_gene: u8,
+    },
+    Seed {
+        plant: PlantId,
+        energy: Energy,
+        facing: Direction,
+        parent: Option<Direction>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WireCell {
+    pub organic: u16,
+    pub soil_energy: u16,
+    pub sunlit: bool,
+    pub occupant: WireOccupant,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WireChunk {
+    pub coord: ChunkCoord,
+    pub cells: Vec<WireCell>,
+}
+
+impl From<&Occupant> for WireOccupant {
+    fn from(o: &Occupant) -> Self {
+        match o {
+            Occupant::Empty => WireOccupant::Empty,
+            Occupant::Leaf {
+                plant,
+                energy,
+                facing,
+                parent,
+            } => WireOccupant::Leaf {
+                plant: *plant,
+                energy: *energy,
+                facing: *facing,
+                parent: *parent,
+            },
+            Occupant::Root {
+                plant,
+                energy,
+                parent,
+            } => WireOccupant::Root {
+                plant: *plant,
+                energy: *energy,
+                parent: *parent,
+            },
+            Occupant::Stem {
+                plant,
+                energy,
+                connections,
+                parent,
+                children,
+            } => WireOccupant::Stem {
+                plant: *plant,
+                energy: *energy,
+                connections: *connections,
+                parent: *parent,
+                children: *children,
+            },
+            Occupant::Antenna {
+                plant,
+                energy,
+                parent,
+            } => WireOccupant::Antenna {
+                plant: *plant,
+                energy: *energy,
+                parent: *parent,
+            },
+            Occupant::Sprout {
+                plant,
+                energy,
+                facing,
+                parent,
+                current_gene,
+                ..
+            } => WireOccupant::Sprout {
+                plant: *plant,
+                energy: *energy,
+                facing: *facing,
+                parent: *parent,
+                current_gene: *current_gene,
+            },
+            Occupant::Seed {
+                plant,
+                energy,
+                facing,
+                parent,
+                ..
+            } => WireOccupant::Seed {
+                plant: *plant,
+                energy: *energy,
+                facing: *facing,
+                parent: *parent,
+            },
+        }
+    }
+}
+
+impl From<&Cell> for WireCell {
+    fn from(c: &Cell) -> Self {
+        WireCell {
+            organic: c.organic,
+            soil_energy: c.soil_energy,
+            sunlit: c.sunlit,
+            occupant: WireOccupant::from(&c.occupant),
+        }
+    }
+}
+
+impl From<&Chunk> for WireChunk {
+    fn from(c: &Chunk) -> Self {
+        WireChunk {
+            coord: c.coord,
+            cells: c.cells.iter().map(WireCell::from).collect(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientMessage {
     Hello,
@@ -160,10 +315,9 @@ pub enum ServerMessage {
         tick: u64,
         seed: u64,
     },
-    ChunkSnapshot(Chunk),
     ChunkBatch {
         tick: u64,
-        chunks: Vec<Chunk>,
+        chunks: Vec<WireChunk>,
     },
 }
 
@@ -483,10 +637,19 @@ mod tests {
         assert_eq!(gene.next, 0);
     }
 
+    fn empty_wire_cell(sunlit: bool) -> WireCell {
+        WireCell {
+            organic: 0,
+            soil_energy: 0,
+            sunlit,
+            occupant: WireOccupant::Empty,
+        }
+    }
+
     #[test]
     fn chunk_batch_roundtrip() {
-        let cells = vec![empty_cell(true); CHUNK_AREA];
-        let chunk = Chunk {
+        let cells = vec![empty_wire_cell(true); CHUNK_AREA];
+        let chunk = WireChunk {
             coord: ChunkCoord { x: 0, y: 0 },
             cells,
         };
@@ -509,8 +672,8 @@ mod tests {
     fn server_message_zstd_roundtrips_and_compresses() {
         // Build a non-trivial payload: a full chunk of empty cells, which
         // should compress strongly.
-        let cells = vec![empty_cell(true); CHUNK_AREA];
-        let chunk = Chunk {
+        let cells = vec![empty_wire_cell(true); CHUNK_AREA];
+        let chunk = WireChunk {
             coord: ChunkCoord { x: 0, y: 0 },
             cells,
         };

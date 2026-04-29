@@ -169,7 +169,6 @@ async fn run_session(
                             },
                         ));
                     }
-                    other => warn!(?other, "unexpected push message"),
                 }
             }
         }

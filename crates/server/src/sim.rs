@@ -111,14 +111,17 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
         let tick = state.current_tick.load(Ordering::Relaxed) + 1;
         let _tick_span = tracing::info_span!("tick", tick).entered();
 
-        let snapshot_chunks = {
+        let snapshot_chunks: Vec<protocol::WireChunk> = {
             let mut chunks = state.world.lock().expect("sim lock poisoned");
             let mut rng = state.rng.lock().expect("rng lock poisoned");
             let _mutate = tracing::info_span!("mutate_world").entered();
             mutate_world(&mut chunks, state.chunks_x, state.chunks_y, &mut *rng);
             drop(_mutate);
-            let _clone = tracing::info_span!("clone_snapshot").entered();
-            chunks.clone()
+            // Build the wire view directly from the locked world. Avoids
+            // cloning the full Chunks (with their Box<Genome>s) just to
+            // serialize a stripped version.
+            let _wire = tracing::info_span!("to_wire_chunks").entered();
+            chunks.iter().map(protocol::WireChunk::from).collect()
         };
         state.current_tick.store(tick, Ordering::Relaxed);
 
@@ -180,9 +183,11 @@ pub fn regenerate_world(state: &SimState, seed: u64) {
     if let Ok(bytes) = protocol::encode_server_message(&welcome) {
         let _ = state.tick_tx.send(Arc::new(bytes));
     }
+    let wire_chunks: Vec<protocol::WireChunk> =
+        new_chunks.iter().map(protocol::WireChunk::from).collect();
     let batch = ServerMessage::ChunkBatch {
         tick: 0,
-        chunks: new_chunks,
+        chunks: wire_chunks,
     };
     if let Ok(bytes) = protocol::encode_server_message(&batch) {
         let _ = state.tick_tx.send(Arc::new(bytes));

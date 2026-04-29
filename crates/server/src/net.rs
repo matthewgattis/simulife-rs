@@ -135,7 +135,13 @@ async fn handle_stream(
             })
         }
         ClientMessage::Subscribe => {
-            let chunks = state.world.lock().expect("sim lock poisoned").clone();
+            let chunks: Vec<protocol::WireChunk> = state
+                .world
+                .lock()
+                .expect("sim lock poisoned")
+                .iter()
+                .map(protocol::WireChunk::from)
+                .collect();
             let tick = state.current_tick.load(Ordering::Relaxed);
             Some(ServerMessage::ChunkBatch { tick, chunks })
         }

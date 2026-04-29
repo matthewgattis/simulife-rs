@@ -2,8 +2,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use protocol::{
-    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant,
-    STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
+    CHUNK_AREA, CHUNK_EDGE, ChunkCoord, ClientMessage, Direction, STEM_CONNECT_EAST,
+    STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, WireCell, WireChunk, WireOccupant,
 };
 use rand::Rng;
 use tokio::sync::mpsc::UnboundedSender;
@@ -138,7 +138,7 @@ impl RenderState {
         self.msaa_view = make_msaa_view(&self.device, &self.config);
     }
 
-    pub fn upload_chunks(&mut self, chunks: &[Chunk]) {
+    pub fn upload_chunks(&mut self, chunks: &[WireChunk]) {
         self.chunk_renderer
             .upload_chunks(&self.device, &self.queue, chunks);
     }
@@ -147,7 +147,7 @@ impl RenderState {
         &mut self,
         network: &NetworkStatus,
         server_addr: SocketAddr,
-        chunks: &[Chunk],
+        chunks: &[WireChunk],
         camera: &Camera,
         layer_flags: &mut u32,
         sim_paused: &mut bool,
@@ -533,7 +533,7 @@ impl ChunkRenderer {
         queue.write_buffer(&self.world_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    fn upload_chunks(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, chunks: &[Chunk]) {
+    fn upload_chunks(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, chunks: &[WireChunk]) {
         if chunks.is_empty() {
             self.chunk_count = 0;
             return;
@@ -569,7 +569,7 @@ impl ChunkRenderer {
                 let wx = cx * edge + lx;
                 let wy = cy * edge + ly;
                 let mut gc = to_gpu_cell(cell);
-                if let Occupant::Stem { connections, .. } = &cell.occupant {
+                if let WireOccupant::Stem { connections, .. } = &cell.occupant {
                     gc.connections = effective_stem_connections(
                         *connections,
                         chunks,
@@ -656,10 +656,10 @@ fn make_bind_group(
     })
 }
 
-fn to_gpu_cell(cell: &Cell) -> GpuCell {
+fn to_gpu_cell(cell: &WireCell) -> GpuCell {
     let (kind, plant, energy, facing, connections) = match &cell.occupant {
-        Occupant::Empty => (GPU_KIND_EMPTY, 0, 0, 0, 0),
-        Occupant::Leaf {
+        WireOccupant::Empty => (GPU_KIND_EMPTY, 0, 0, 0, 0),
+        WireOccupant::Leaf {
             plant,
             energy,
             facing,
@@ -671,10 +671,10 @@ fn to_gpu_cell(cell: &Cell) -> GpuCell {
             facing_to_u32(*facing),
             0,
         ),
-        Occupant::Root { plant, energy, .. } => {
+        WireOccupant::Root { plant, energy, .. } => {
             (GPU_KIND_ROOT, *plant, u32::from(*energy), 0, 0)
         }
-        Occupant::Stem {
+        WireOccupant::Stem {
             plant,
             energy,
             connections,
@@ -686,10 +686,10 @@ fn to_gpu_cell(cell: &Cell) -> GpuCell {
             0,
             u32::from(*connections),
         ),
-        Occupant::Antenna { plant, energy, .. } => {
+        WireOccupant::Antenna { plant, energy, .. } => {
             (GPU_KIND_ANTENNA, *plant, u32::from(*energy), 0, 0)
         }
-        Occupant::Sprout {
+        WireOccupant::Sprout {
             plant,
             energy,
             facing,
@@ -701,7 +701,7 @@ fn to_gpu_cell(cell: &Cell) -> GpuCell {
             facing_to_u32(*facing),
             0,
         ),
-        Occupant::Seed {
+        WireOccupant::Seed {
             plant,
             energy,
             facing,
@@ -737,7 +737,7 @@ fn facing_to_u32(d: Direction) -> u32 {
 
 fn effective_stem_connections(
     raw: u8,
-    chunks: &[Chunk],
+    chunks: &[WireChunk],
     lookup: &std::collections::HashMap<(i32, i32), usize>,
     wx: i32,
     wy: i32,
@@ -759,7 +759,7 @@ fn effective_stem_connections(
 }
 
 fn neighbor_present(
-    chunks: &[Chunk],
+    chunks: &[WireChunk],
     lookup: &std::collections::HashMap<(i32, i32), usize>,
     wx: i32,
     wy: i32,
@@ -772,7 +772,7 @@ fn neighbor_present(
     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
     if let Some(&chunk_idx) = lookup.get(&(cx, cy)) {
         if let Some(cell) = chunks[chunk_idx].cells.get(cell_idx) {
-            return !matches!(cell.occupant, Occupant::Empty);
+            return !matches!(cell.occupant, WireOccupant::Empty);
         }
     }
     false
@@ -784,7 +784,7 @@ fn draw_ui(
     server_addr: SocketAddr,
     chunk_count: usize,
     cursor_world: Option<glam::Vec2>,
-    hovered_cell: Option<(ChunkCoord, &Cell)>,
+    hovered_cell: Option<(ChunkCoord, &WireCell)>,
     layer_flags: &mut u32,
     sim_paused: &mut bool,
     sim_tick_hz: &mut u32,
@@ -891,7 +891,7 @@ fn draw_ui(
 fn draw_context_menu(
     ctx: &egui::Context,
     context_menu: &mut Option<ContextMenu>,
-    chunks: &[Chunk],
+    chunks: &[WireChunk],
     outgoing: &UnboundedSender<ClientMessage>,
 ) {
     let Some(menu) = *context_menu else {
@@ -1001,17 +1001,17 @@ fn parse_seed(s: &str) -> Option<u64> {
     }
 }
 
-fn cell_details_ui(ui: &mut egui::Ui, cell: &Cell) {
+fn cell_details_ui(ui: &mut egui::Ui, cell: &WireCell) {
     ui.label(format!("organic: {}", cell.organic));
     ui.label(format!("soil_energy: {}", cell.soil_energy));
     ui.label(format!("sunlit: {}", cell.sunlit));
     ui.label(format!("occupant: {}", occupant_label(&cell.occupant)));
 }
 
-fn occupant_label(occ: &Occupant) -> String {
+fn occupant_label(occ: &WireOccupant) -> String {
     match occ {
-        Occupant::Empty => "empty".to_string(),
-        Occupant::Leaf {
+        WireOccupant::Empty => "empty".to_string(),
+        WireOccupant::Leaf {
             plant,
             energy,
             facing,
@@ -1020,7 +1020,7 @@ fn occupant_label(occ: &Occupant) -> String {
             "leaf (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
             parent_label(*parent)
         ),
-        Occupant::Root {
+        WireOccupant::Root {
             plant,
             energy,
             parent,
@@ -1028,7 +1028,7 @@ fn occupant_label(occ: &Occupant) -> String {
             "root (plant {plant}, energy {energy}, parent {})",
             parent_label(*parent)
         ),
-        Occupant::Stem {
+        WireOccupant::Stem {
             plant,
             energy,
             connections,
@@ -1040,7 +1040,7 @@ fn occupant_label(occ: &Occupant) -> String {
             parent_label(*parent),
             connections_label(*children)
         ),
-        Occupant::Antenna {
+        WireOccupant::Antenna {
             plant,
             energy,
             parent,
@@ -1048,7 +1048,7 @@ fn occupant_label(occ: &Occupant) -> String {
             "antenna (plant {plant}, energy {energy}, parent {})",
             parent_label(*parent)
         ),
-        Occupant::Sprout {
+        WireOccupant::Sprout {
             plant,
             energy,
             facing,
@@ -1060,7 +1060,7 @@ fn occupant_label(occ: &Occupant) -> String {
             parent_label(*parent),
             current_gene
         ),
-        Occupant::Seed {
+        WireOccupant::Seed {
             plant,
             energy,
             facing,
@@ -1101,7 +1101,7 @@ fn connections_label(c: u8) -> String {
     }
 }
 
-fn find_cell(chunks: &[Chunk], x: i32, y: i32) -> Option<(ChunkCoord, &Cell)> {
+fn find_cell(chunks: &[WireChunk], x: i32, y: i32) -> Option<(ChunkCoord, &WireCell)> {
     let edge = CHUNK_EDGE as i32;
     let cx = x.div_euclid(edge);
     let cy = y.div_euclid(edge);
@@ -1115,24 +1115,24 @@ fn find_cell(chunks: &[Chunk], x: i32, y: i32) -> Option<(ChunkCoord, &Cell)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{CHUNK_AREA, Cell, ChunkCoord, Direction, Genome, Occupant};
+    use protocol::{CHUNK_AREA, ChunkCoord, Direction};
 
-    fn empty_chunk(cx: i32, cy: i32) -> Chunk {
+    fn empty_chunk(cx: i32, cy: i32) -> WireChunk {
         let cells = (0..CHUNK_AREA)
-            .map(|_| Cell {
+            .map(|_| WireCell {
                 organic: 0,
                 soil_energy: 0,
                 sunlit: false,
-                occupant: Occupant::Empty,
+                occupant: WireOccupant::Empty,
             })
             .collect();
-        Chunk {
+        WireChunk {
             coord: ChunkCoord { x: cx, y: cy },
             cells,
         }
     }
 
-    fn lookup_for(chunks: &[Chunk]) -> std::collections::HashMap<(i32, i32), usize> {
+    fn lookup_for(chunks: &[WireChunk]) -> std::collections::HashMap<(i32, i32), usize> {
         chunks
             .iter()
             .enumerate()
@@ -1173,9 +1173,9 @@ mod tests {
 
     #[test]
     fn occupant_label_includes_kind_for_each_variant() {
-        assert_eq!(occupant_label(&Occupant::Empty), "empty");
+        assert_eq!(occupant_label(&WireOccupant::Empty), "empty");
 
-        let leaf = Occupant::Leaf {
+        let leaf = WireOccupant::Leaf {
             plant: 1,
             energy: 50,
             facing: Direction::North,
@@ -1183,7 +1183,7 @@ mod tests {
         };
         assert!(occupant_label(&leaf).starts_with("leaf"));
 
-        let stem = Occupant::Stem {
+        let stem = WireOccupant::Stem {
             plant: 1,
             energy: 0,
             connections: STEM_CONNECT_NORTH,
@@ -1195,11 +1195,10 @@ mod tests {
         assert!(s.contains("conn N"));
         assert!(s.contains("kids S"));
 
-        let sprout = Occupant::Sprout {
+        let sprout = WireOccupant::Sprout {
             plant: 1,
             energy: 0,
             facing: Direction::North,
-            genome: Box::new(Genome::default_vine()),
             parent: None,
             current_gene: 7,
         };
@@ -1226,7 +1225,7 @@ mod tests {
     #[test]
     fn neighbor_present_distinguishes_empty_from_occupied() {
         let mut chunks = vec![empty_chunk(0, 0)];
-        chunks[0].cells[1].occupant = Occupant::Leaf {
+        chunks[0].cells[1].occupant = WireOccupant::Leaf {
             plant: 1,
             energy: 0,
             facing: Direction::North,
@@ -1261,7 +1260,7 @@ mod tests {
     fn effective_stem_connections_masks_out_empty_neighbors() {
         let mut chunks = vec![empty_chunk(0, 0)];
         // Place a leaf to the North of (5, 5) — i.e. at (5, 4).
-        chunks[0].cells[4 * (CHUNK_EDGE as usize) + 5].occupant = Occupant::Leaf {
+        chunks[0].cells[4 * (CHUNK_EDGE as usize) + 5].occupant = WireOccupant::Leaf {
             plant: 1,
             energy: 0,
             facing: Direction::North,
