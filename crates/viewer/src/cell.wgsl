@@ -87,10 +87,10 @@ fn soil_color(cell: Cell, show_organic: bool, show_energy: bool) -> vec3<f32> {
     let blue = vec3<f32>(0.4, 0.6, 1.0);
     var color = vec3<f32>(1.0, 1.0, 1.0);
     if (show_organic) {
-        color = mix(color, brown, f32(cell.organic) / 255.0);
+        color = mix(color, brown, f32(cell.organic) / 400.0);
     }
     if (show_energy) {
-        color = mix(color, blue, f32(cell.soil_energy) / 255.0);
+        color = mix(color, blue, f32(cell.soil_energy) / 1000.0);
     }
     return color * select(0.8, 1.0, cell.sunlit != 0u);
 }

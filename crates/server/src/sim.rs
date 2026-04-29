@@ -18,10 +18,10 @@ use rand_chacha::ChaCha12Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-const LEAF_PHOTOSYNTHESIS: Energy = 5;
-const UPKEEP_DEFAULT: Energy = 1;
+const LEAF_PHOTOSYNTHESIS: Energy = 10;
+const UPKEEP_DEFAULT: Energy = 2;
 const UPKEEP_SEED: Energy = 1;
-const UPKEEP_SPROUT: Energy = 3;
+const UPKEEP_SPROUT: Energy = 4;
 
 /// Soil energy "rest level". Each tick every cell's soil_energy drifts by
 /// SOIL_ENERGY_REGULATION toward this value.
@@ -37,12 +37,12 @@ const SEED_DROPOFF_THRESHOLD: Energy = 100;
 /// When a cell's soil organic exceeds this, the soil is toxic. Every
 /// occupant except a Root dies. Picked above the 0..=255 range build_world
 /// seeds organic with so a freshly-built world has no poisoned cells.
-const SOIL_ORGANIC_POISON: u16 = 300;
+const SOIL_ORGANIC_POISON: u16 = 400;
 
 /// When a cell's soil_energy exceeds this, every occupant except an
 /// Antenna dies. Above the 100 rest level so soil regulation alone can't
 /// trigger it; only sustained death-deposits push it here.
-const SOIL_ENERGY_POISON: u16 = 200;
+const SOIL_ENERGY_POISON: u16 = 1000;
 
 /// Per-slot spawn cost. Sprout drains the sum of these for whatever it
 /// produces in a generation. Each new cell starts with its slot's cost as
@@ -54,17 +54,17 @@ const COST_ANTENNA: Energy = 5;
 const COST_SEED: Energy = 30;
 
 /// Per-field probability of mutating a single field at any copy site.
-const MUTATION_RATE: f32 = 0.02;
+const MUTATION_RATE: f32 = 0.01;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
-    [0, 1, 0],
     [1, 2, 1],
-    [0, 1, 0],
+    [2, 4, 2],
+    [1, 2, 1],
 ];
 const ANTENNA_PULL_KERNEL: [[u16; 3]; 3] = [
-    [0, 1, 0],
     [1, 2, 1],
-    [0, 1, 0],
+    [2, 4, 2],
+    [1, 2, 1],
 ];
 const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [
     [1, 2, 1],
@@ -2055,10 +2055,10 @@ mod tests {
     fn phase_photosynthesis_credits_sunlit_leaves() {
         // Leaf (sunlit, e=10) → sprout sink (e=0). One tick should funnel
         // photo+pre-existing energy into the sprout.
-        //   photo: leaf 10→15
-        //   upkeep: leaf 15→14, sprout 0→0
-        //   push: leaf surplus 13 → sprout
-        //   final: leaf 1, sprout 13
+        //   photo:  leaf 10→20  (LEAF_PHOTOSYNTHESIS = 10)
+        //   upkeep: leaf 20→18, sprout 0→0  (UPKEEP_DEFAULT=2, SPROUT=4)
+        //   push:   leaf surplus 16 → sprout
+        //   final:  leaf 2, sprout 16
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let edge = CHUNK_EDGE as i32;
@@ -2095,11 +2095,11 @@ mod tests {
         let _ = edge;
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
-            Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
             ref other => panic!("leaf gone: {other:?}"),
         }
         match &cell_at(&chunks, chunks_x, 10, 11).occupant {
-            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 13),
+            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 16),
             other => panic!("sprout gone: {other:?}"),
         }
     }
@@ -2107,7 +2107,7 @@ mod tests {
     #[test]
     fn phase_soil_pulls_organic_around_root() {
         // Root → stem → sprout chain. One tick should subtract per the
-        // ROOT_PULL_KERNEL ([[0,1,0],[1,2,1],[0,1,0]]) from the soil cells
+        // ROOT_PULL_KERNEL ([[1,2,1],[2,4,2],[1,2,1]]) from the soil cells
         // around the root.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
@@ -2153,16 +2153,16 @@ mod tests {
 
         mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
-        // Center weight 2.
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).organic, 98);
-        // Cardinals weight 1.
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).organic, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).organic, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).organic, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).organic, 99);
-        // Corners weight 0 → untouched.
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).organic, 100);
-        assert_eq!(cell_at(&chunks, chunks_x, 11, 11).organic, 100);
+        // Center weight 4.
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).organic, 96);
+        // Cardinals weight 2.
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).organic, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).organic, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).organic, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).organic, 98);
+        // Corners weight 1.
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).organic, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 11).organic, 99);
     }
 
     #[test]
@@ -2212,21 +2212,22 @@ mod tests {
 
         mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).soil_energy, 98);
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).soil_energy, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).soil_energy, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).soil_energy, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).soil_energy, 99);
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).soil_energy, 100);
+        // Full 3x3 kernel (sum 16): center 4, cardinals 2, corners 1.
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).soil_energy, 96);
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).soil_energy, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).soil_energy, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).soil_energy, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).soil_energy, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).soil_energy, 99);
     }
 
     #[test]
     fn phase_upkeep_decreases_total_system_energy() {
         // Leaf (not sunlit) → sprout sink. No photo, no soil.
         // Pre: leaf=4, sprout=10. Total 14.
-        // upkeep: leaf -1, sprout -3. Total 10.
-        // push: leaf surplus 2 → sprout. Total still 10.
-        // Post: leaf=1, sprout=9. Total 10.
+        // upkeep: leaf -2, sprout -4. leaf=2, sprout=6. Total 8.
+        // push: leaf cur=2, buffer=2 → no push.
+        // Post: leaf=2, sprout=6. Total 8.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         place(
@@ -2259,11 +2260,11 @@ mod tests {
         mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
-            Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
             ref other => panic!("leaf gone: {other:?}"),
         }
         match &cell_at(&chunks, chunks_x, 10, 11).occupant {
-            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 9),
+            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 6),
             other => panic!("sprout gone: {other:?}"),
         }
     }
@@ -2317,9 +2318,9 @@ mod tests {
     #[test]
     fn phase_push_moves_energy_from_leaf_to_parent_stem() {
         // Leaf (e=10, not sunlit) → stem (children=S → sprout).
-        // upkeep: leaf 10→9, stem 0→0 (sat), sprout 0→0 (sat)
-        // push: leaf surplus 8 → stem; stem cur=0 ≤ buffer → no push
-        // post: leaf=1, stem=8, sprout=0
+        // upkeep: leaf 10→8, stem 0→0 (sat), sprout 0→0 (sat)
+        // push:   leaf surplus 6 → stem; stem cur=0 ≤ buffer → no push
+        // post:   leaf=2, stem=6, sprout=0
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         place(
@@ -2365,11 +2366,11 @@ mod tests {
         mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
-            Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
             ref other => panic!("leaf gone: {other:?}"),
         }
         match &cell_at(&chunks, chunks_x, 10, 11).occupant {
-            Occupant::Stem { energy, .. } => assert_eq!(*energy, 8),
+            Occupant::Stem { energy, .. } => assert_eq!(*energy, 6),
             other => panic!("stem gone: {other:?}"),
         }
     }

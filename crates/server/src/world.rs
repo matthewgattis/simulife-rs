@@ -12,6 +12,18 @@ const SUNLIT_MARGIN_FRAC: f32 = 0.10;
 /// die or stall in the first few ticks, so dense packing is fine.
 const SPROUT_GRID_SPACING: i32 = 6;
 
+/// Thickness in cells of the toxic-organic border ringing the world.
+const TOXIC_BORDER_THICKNESS: u32 = 6;
+
+/// Organic value seeded into the toxic-border cells. Above
+/// SOIL_ORGANIC_POISON, so any non-Root that ventures in dies. Acts as
+/// a hard wall that plants can't expand across.
+const TOXIC_BORDER_ORGANIC: u16 = 1000;
+
+/// Organic seeded everywhere else. Below the poison threshold; just
+/// some baseline soil chemistry.
+const DEFAULT_ORGANIC: u16 = 40;
+
 pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
     let mut chunks = Vec::with_capacity((chunks_x * chunks_y) as usize);
     let total_w = chunks_x * CHUNK_EDGE as u32;
@@ -30,8 +42,17 @@ pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
                         && world_x < total_w - margin_x
                         && world_y >= margin_y
                         && world_y < total_h - margin_y;
+                    let in_toxic_border = world_x < TOXIC_BORDER_THICKNESS
+                        || world_y < TOXIC_BORDER_THICKNESS
+                        || world_x >= total_w - TOXIC_BORDER_THICKNESS
+                        || world_y >= total_h - TOXIC_BORDER_THICKNESS;
+                    let organic = if in_toxic_border {
+                        TOXIC_BORDER_ORGANIC
+                    } else {
+                        DEFAULT_ORGANIC
+                    };
                     Cell {
-                        organic: ((world_x ^ world_y) & 0xff) as u16,
+                        organic,
                         soil_energy: 100,
                         sunlit,
                         occupant: Occupant::Empty,
@@ -157,19 +178,47 @@ mod tests {
 
     #[test]
     fn build_world_initializes_per_cell_fields() {
-        let chunks = build_world(2, 1);
-        // Soil energy is constant 100 everywhere.
+        // Use a world big enough that the interior isn't entirely covered
+        // by the toxic border (which is TOXIC_BORDER_THICKNESS cells thick
+        // on each side).
+        let chunks = build_world(2, 2);
         for chunk in &chunks {
             for cell in &chunk.cells {
                 assert_eq!(cell.soil_energy, 100);
                 assert!(matches!(cell.occupant, Occupant::Empty));
             }
         }
-        // Spot-check organic formula. (Sunlit is checked in its own test.)
-        let c = cell_at_test(&chunks, 2, 0, 0);
-        assert_eq!(c.organic, 0);
-        let c = cell_at_test(&chunks, 2, 5, 7);
-        assert_eq!(c.organic, ((5u32 ^ 7) & 0xff) as u16);
+        // Edge cell → in toxic border.
+        assert_eq!(
+            cell_at_test(&chunks, 2, 0, 0).organic,
+            TOXIC_BORDER_ORGANIC
+        );
+        // Interior cell → default soil organic.
+        let total = 2 * CHUNK_EDGE as i32;
+        assert_eq!(
+            cell_at_test(&chunks, 2, total / 2, total / 2).organic,
+            DEFAULT_ORGANIC
+        );
+    }
+
+    #[test]
+    fn build_world_toxic_border_rings_the_edges() {
+        let chunks = build_world(2, 2);
+        let total = 2 * CHUNK_EDGE as i32;
+        let t = TOXIC_BORDER_THICKNESS as i32;
+        // Each side: cells within `t` of that edge are toxic.
+        assert_eq!(cell_at_test(&chunks, 2, 0, total / 2).organic, TOXIC_BORDER_ORGANIC);
+        assert_eq!(cell_at_test(&chunks, 2, total - 1, total / 2).organic, TOXIC_BORDER_ORGANIC);
+        assert_eq!(cell_at_test(&chunks, 2, total / 2, 0).organic, TOXIC_BORDER_ORGANIC);
+        assert_eq!(cell_at_test(&chunks, 2, total / 2, total - 1).organic, TOXIC_BORDER_ORGANIC);
+        // Just inside the border on each side → default.
+        assert_eq!(cell_at_test(&chunks, 2, t, total / 2).organic, DEFAULT_ORGANIC);
+        assert_eq!(cell_at_test(&chunks, 2, total - 1 - t, total / 2).organic, DEFAULT_ORGANIC);
+        // Just outside (last toxic cell) → toxic.
+        assert_eq!(
+            cell_at_test(&chunks, 2, t - 1, total / 2).organic,
+            TOXIC_BORDER_ORGANIC
+        );
     }
 
     #[test]
