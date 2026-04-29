@@ -158,6 +158,7 @@ impl RenderState {
         regen_dialog: &mut Option<RegenDialog>,
         outgoing: &UnboundedSender<ClientMessage>,
     ) {
+        let _render_span = tracing::info_span!("render_frame").entered();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {

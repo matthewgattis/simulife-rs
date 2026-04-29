@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::{NetworkStatus, UserEvent};
@@ -110,13 +110,19 @@ async fn run_session(
                     }
                 };
                 let read_start = if tick_metrics { Some(Instant::now()) } else { None };
-                let buf = recv.read_to_end(8 * 1024 * 1024).await?;
+                let buf = recv
+                    .read_to_end(8 * 1024 * 1024)
+                    .instrument(tracing::info_span!("read"))
+                    .await?;
                 let read_us = read_start
                     .map(|t| t.elapsed().as_micros() as u64)
                     .unwrap_or(0);
                 let bytes = buf.len();
                 let decode_start = if tick_metrics { Some(Instant::now()) } else { None };
-                let msg = protocol::decode_server_message(&buf)?;
+                let msg = {
+                    let _decode_span = tracing::info_span!("decode", bytes).entered();
+                    protocol::decode_server_message(&buf)?
+                };
                 let decode_us = decode_start
                     .map(|t| t.elapsed().as_micros() as u64)
                     .unwrap_or(0);

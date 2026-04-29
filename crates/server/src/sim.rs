@@ -108,20 +108,29 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
             }
         }
 
+        let tick = state.current_tick.load(Ordering::Relaxed) + 1;
+        let _tick_span = tracing::info_span!("tick", tick).entered();
+
         let snapshot_chunks = {
             let mut chunks = state.world.lock().expect("sim lock poisoned");
             let mut rng = state.rng.lock().expect("rng lock poisoned");
+            let _mutate = tracing::info_span!("mutate_world").entered();
             mutate_world(&mut chunks, state.chunks_x, state.chunks_y, &mut *rng);
+            drop(_mutate);
+            let _clone = tracing::info_span!("clone_snapshot").entered();
             chunks.clone()
         };
-        let tick = state.current_tick.fetch_add(1, Ordering::Relaxed) + 1;
+        state.current_tick.store(tick, Ordering::Relaxed);
 
         let msg = ServerMessage::ChunkBatch {
             tick,
             chunks: snapshot_chunks,
         };
+        let encode = tracing::info_span!("encode_msg").entered();
         match protocol::encode_server_message(&msg) {
             Ok(bytes) => {
+                drop(encode);
+                let _ = tracing::info_span!("broadcast", bytes = bytes.len()).entered();
                 let _ = state.tick_tx.send(Arc::new(bytes));
             }
             Err(e) => error!("serialize tick failed: {e:#}"),

@@ -22,7 +22,8 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::sim::{SimControl, SimState};
 
@@ -72,12 +73,27 @@ struct Args {
     /// Loaded snapshots already include their seed and override this flag.
     #[arg(long)]
     seed: Option<u64>,
+
+    /// If set, write a Chrome-trace JSON profile to this path. Open with
+    /// `chrome://tracing` or https://ui.perfetto.dev.
+    #[arg(long)]
+    trace_chrome: Option<PathBuf>,
+
+    /// Start with the simulation running (skip the default paused state).
+    /// Useful for unattended profiling runs.
+    #[arg(long)]
+    start_running: bool,
+
+    /// Optional graceful exit after N seconds. Lets profiling runs flush
+    /// trace data without manual intervention.
+    #[arg(long)]
+    profile_duration_secs: Option<u64>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
     let args = Args::parse();
+    let _trace_guard = init_tracing(args.trace_chrome.as_deref());
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -118,7 +134,7 @@ async fn main() -> Result<()> {
         next_plant_id: AtomicU32::new(initial.next_plant_id),
         current_tick: AtomicU64::new(initial.current_tick),
         control: std::sync::Mutex::new(SimControl {
-            paused: true,
+            paused: !args.start_running,
             tick_hz: args.tick_hz.max(1),
             step_pending: 0,
         }),
@@ -165,10 +181,19 @@ async fn main() -> Result<()> {
     info!(?cert_source, "tls cert ready");
 
     let serve_state = Arc::clone(&state);
+    let profile_timeout = async {
+        match args.profile_duration_secs {
+            Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
         _ = net::serve(serve_state, endpoint) => {},
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, shutting down");
+        }
+        _ = profile_timeout => {
+            info!(secs = args.profile_duration_secs, "profile duration elapsed");
         }
     }
 
@@ -181,8 +206,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(trace_chrome: Option<&std::path::Path>) -> Option<FlushGuard> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,quinn=warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let fmt_layer = tracing_subscriber::fmt::layer();
+    match trace_chrome {
+        Some(path) => {
+            let (chrome_layer, guard) = ChromeLayerBuilder::new()
+                .file(path)
+                .include_args(true)
+                .build();
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .with(chrome_layer)
+                .init();
+            info!(path = %path.display(), "chrome trace recording");
+            Some(guard)
+        }
+        None => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .init();
+            None
+        }
+    }
 }

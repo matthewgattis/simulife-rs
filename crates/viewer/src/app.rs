@@ -18,6 +18,7 @@ use crate::render::{LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
 pub enum UserEvent {
     Network(NetworkStatus),
     Chunks { tick: u64, chunks: Vec<Chunk> },
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -168,8 +169,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::Shutdown => {
+                event_loop.exit();
+                return;
+            }
             UserEvent::Network(status) => {
                 info!(?status, "network status");
                 if let NetworkStatus::Connected {
@@ -196,6 +201,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.network = status;
             }
             UserEvent::Chunks { tick, chunks } => {
+                let _apply_span = tracing::info_span!("tick_apply", tick).entered();
                 let dispatch_start = if self.tick_metrics {
                     Some(Instant::now())
                 } else {
@@ -213,6 +219,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .unwrap_or(0);
                 self.sim_tick = tick;
                 let upload_us = if let Some(state) = self.state.as_mut() {
+                    let _upload_span = tracing::info_span!("upload_chunks").entered();
                     let t = self.tick_metrics.then(Instant::now);
                     state.upload_chunks(&self.chunks);
                     t.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0)
