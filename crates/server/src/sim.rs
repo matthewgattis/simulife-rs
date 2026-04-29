@@ -1509,4 +1509,427 @@ mod tests {
         let copied = mutate_genome(&g);
         assert_eq!(copied, g);
     }
+
+    // ---------- phase tests via mutate_world ----------
+    //
+    // Strategy: build a tiny, complete world where the phase under test has
+    // an observable, deterministic effect. Energy numbers were hand-traced
+    // through all 7 phases so the post-tick assertions are exact.
+
+    fn fill_organic(chunks: &mut [Chunk], v: u16) {
+        for chunk in chunks.iter_mut() {
+            for cell in chunk.cells.iter_mut() {
+                cell.organic = v;
+            }
+        }
+    }
+
+    fn fill_soil_energy(chunks: &mut [Chunk], v: u16) {
+        for chunk in chunks.iter_mut() {
+            for cell in chunk.cells.iter_mut() {
+                cell.soil_energy = v;
+            }
+        }
+    }
+
+    #[test]
+    fn phase_photosynthesis_credits_sunlit_leaves() {
+        // Leaf (sunlit, e=10) → sprout sink (e=0). One tick should funnel
+        // photo+pre-existing energy into the sprout.
+        //   photo: leaf 10→15
+        //   upkeep: leaf 15→14, sprout 0→0
+        //   push: leaf surplus 13 → sprout
+        //   final: leaf 1, sprout 13
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let edge = CHUNK_EDGE as i32;
+        let leaf_idx = 10 * (CHUNK_EDGE as usize) + 10;
+        chunks[0].cells[leaf_idx].sunlit = true;
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 10,
+                facing: Direction::North,
+                parent: Some(Direction::South),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            11,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 0,
+                facing: Direction::South,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::North),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+        let _ = edge;
+
+        match cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
+            ref other => panic!("leaf gone: {other:?}"),
+        }
+        match &cell_at(&chunks, chunks_x, 10, 11).occupant {
+            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 13),
+            other => panic!("sprout gone: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_soil_pulls_organic_around_root() {
+        // Root → stem → sprout chain. One tick should subtract per the
+        // ROOT_PULL_KERNEL ([[0,1,0],[1,2,1],[0,1,0]]) from the soil cells
+        // around the root.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        fill_organic(&mut chunks, 100);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Root {
+                plant: 1,
+                energy: 0,
+                parent: Some(Direction::North),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Stem {
+                plant: 1,
+                energy: 50,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: None,
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            8,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 0,
+                facing: Direction::North,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::South),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        // Center weight 2.
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).organic, 98);
+        // Cardinals weight 1.
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).organic, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).organic, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).organic, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).organic, 99);
+        // Corners weight 0 → untouched.
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).organic, 100);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 11).organic, 100);
+    }
+
+    #[test]
+    fn phase_soil_pulls_energy_around_antenna() {
+        // Same kernel, but for soil_energy via antenna.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        fill_soil_energy(&mut chunks, 100);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Antenna {
+                plant: 1,
+                energy: 0,
+                parent: Some(Direction::North),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Stem {
+                plant: 1,
+                energy: 50,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: None,
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            8,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 0,
+                facing: Direction::North,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::South),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).soil_energy, 98);
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).soil_energy, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).soil_energy, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).soil_energy, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).soil_energy, 99);
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).soil_energy, 100);
+    }
+
+    #[test]
+    fn phase_upkeep_decreases_total_system_energy() {
+        // Leaf (not sunlit) → sprout sink. No photo, no soil.
+        // Pre: leaf=4, sprout=10. Total 14.
+        // upkeep: leaf -1, sprout -3. Total 10.
+        // push: leaf surplus 2 → sprout. Total still 10.
+        // Post: leaf=1, sprout=9. Total 10.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 4,
+                facing: Direction::North,
+                parent: Some(Direction::South),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            11,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 10,
+                facing: Direction::South,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::North),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        match cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
+            ref other => panic!("leaf gone: {other:?}"),
+        }
+        match &cell_at(&chunks, chunks_x, 10, 11).occupant {
+            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 9),
+            other => panic!("sprout gone: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_prune_clears_invalid_child_bits() {
+        // Stem with children = N | S.
+        //   N points at Empty → invalid, drops.
+        //   S points at sprout → valid, keeps.
+        // After tick: stem.children == S only. Stem still alive (has child).
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Stem {
+                plant: 1,
+                energy: 50,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: None,
+                children: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            11,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 0,
+                facing: Direction::West, // grows W/S/N — corners of single sprout
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::North),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        match &cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Stem { children, .. } => {
+                assert_eq!(*children, STEM_CONNECT_SOUTH, "N child should be pruned");
+            }
+            other => panic!("expected stem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_push_moves_energy_from_leaf_to_parent_stem() {
+        // Leaf (e=10, not sunlit) → stem (children=S → sprout).
+        // upkeep: leaf 10→9, stem 0→0 (sat), sprout 0→0 (sat)
+        // push: leaf surplus 8 → stem; stem cur=0 ≤ buffer → no push
+        // post: leaf=1, stem=8, sprout=0
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 10,
+                facing: Direction::North,
+                parent: Some(Direction::South),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            11,
+            Occupant::Stem {
+                plant: 1,
+                energy: 0,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: Some(Direction::North),
+                children: STEM_CONNECT_SOUTH,
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            12,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 0,
+                facing: Direction::South,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::North),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        match cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
+            ref other => panic!("leaf gone: {other:?}"),
+        }
+        match &cell_at(&chunks, chunks_x, 10, 11).occupant {
+            Occupant::Stem { energy, .. } => assert_eq!(*energy, 8),
+            other => panic!("stem gone: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_death_orphan_leaf_dies_and_deposits_organic() {
+        // Lone leaf with parent=None has no push target. Phase 7 turns it
+        // into Empty and deposits organic per DEATH_DEPOSIT_KERNEL.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: None,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Empty
+        ));
+        // DEATH_DEPOSIT_KERNEL center weight = 4.
+        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 4);
+        // Cardinals weight 2.
+        assert!(cell_at(&chunks, chunks_x, 9, 10).organic >= 2);
+        assert!(cell_at(&chunks, chunks_x, 11, 10).organic >= 2);
+        // Corners weight 1.
+        assert!(cell_at(&chunks, chunks_x, 9, 9).organic >= 1);
+    }
+
+    #[test]
+    fn phase_death_zero_energy_cell_clears() {
+        // Stem with energy=0 and parent (still has push target so doesn't
+        // orphan-die). After upkeep the energy stays at 0 and Phase 7
+        // catches it via the energy_dead path.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Stem {
+                plant: 1,
+                energy: 0,
+                connections: STEM_CONNECT_SOUTH,
+                parent: Some(Direction::South),
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        // Sprout to keep stem from being orphan-dead via children.
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Sprout {
+                plant: 1,
+                energy: 0,
+                facing: Direction::North,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::South),
+                current_gene: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1);
+
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Empty
+        ));
+    }
 }
