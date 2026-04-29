@@ -101,7 +101,7 @@ async fn run_session(
                     }
                 };
                 let buf = recv.read_to_end(8 * 1024 * 1024).await?;
-                let msg: ServerMessage = rmp_serde::from_slice(&buf)?;
+                let msg = protocol::decode_server_message(&buf)?;
                 match msg {
                     ServerMessage::ChunkBatch { tick, chunks } => {
                         debug!(count = chunks.len(), tick, "tick chunk batch");
@@ -119,7 +119,7 @@ async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<Server
     send.write_all(&rmp_serde::to_vec(msg)?).await?;
     send.finish()?;
     let buf = recv.read_to_end(8 * 1024 * 1024).await?;
-    Ok(rmp_serde::from_slice(&buf)?)
+    Ok(protocol::decode_server_message(&buf)?)
 }
 
 async fn send_command(conn: &quinn::Connection, msg: &ClientMessage) -> Result<()> {

@@ -144,7 +144,7 @@ async fn handle_stream(
         }
     };
     if let Some(response) = response {
-        let bytes = rmp_serde::to_vec(&response)?;
+        let bytes = protocol::encode_server_message(&response)?;
         send.write_all(&bytes).await?;
     }
     send.finish()?;

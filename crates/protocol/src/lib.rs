@@ -165,6 +165,24 @@ pub enum ServerMessage {
     },
 }
 
+/// zstd compression level for ServerMessage payloads on the wire. Level 1
+/// is ~500 MB/s with ratios in the 5–20× range on the mostly-empty chunk
+/// data we send.
+const SERVER_MSG_ZSTD_LEVEL: i32 = 1;
+
+/// Encode a `ServerMessage` for the wire: msgpack, then zstd. Symmetric
+/// with [`decode_server_message`].
+pub fn encode_server_message(msg: &ServerMessage) -> std::io::Result<Vec<u8>> {
+    let raw = rmp_serde::to_vec(msg).map_err(std::io::Error::other)?;
+    zstd::encode_all(&raw[..], SERVER_MSG_ZSTD_LEVEL)
+}
+
+/// Decode a `ServerMessage` from the wire: zstd, then msgpack.
+pub fn decode_server_message(buf: &[u8]) -> std::io::Result<ServerMessage> {
+    let raw = zstd::decode_all(buf)?;
+    rmp_serde::from_slice(&raw).map_err(std::io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +487,49 @@ mod tests {
             }
             _ => panic!("expected ChunkBatch"),
         }
+    }
+
+    #[test]
+    fn server_message_zstd_roundtrips_and_compresses() {
+        // Build a non-trivial payload: a full chunk of empty cells, which
+        // should compress strongly.
+        let cells = vec![empty_cell(true); CHUNK_AREA];
+        let chunk = Chunk {
+            coord: ChunkCoord { x: 0, y: 0 },
+            cells,
+        };
+        let msg = ServerMessage::ChunkBatch {
+            tick: 7,
+            chunks: vec![chunk],
+        };
+
+        let raw = rmp_serde::to_vec(&msg).expect("raw msgpack");
+        let wire = encode_server_message(&msg).expect("encode");
+
+        // Compression should actually shrink the payload meaningfully.
+        assert!(
+            wire.len() < raw.len() / 2,
+            "expected ≥2× compression, got {} → {}",
+            raw.len(),
+            wire.len()
+        );
+
+        let decoded = decode_server_message(&wire).expect("decode");
+        match decoded {
+            ServerMessage::ChunkBatch { tick, chunks } => {
+                assert_eq!(tick, 7);
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].cells.len(), CHUNK_AREA);
+            }
+            _ => panic!("expected ChunkBatch"),
+        }
+    }
+
+    #[test]
+    fn server_message_decode_rejects_garbage() {
+        // Empty buffer can't even be a zstd frame.
+        assert!(decode_server_message(&[]).is_err());
+        // Random bytes that aren't a valid zstd frame.
+        assert!(decode_server_message(&[0, 1, 2, 3, 4, 5]).is_err());
     }
 }

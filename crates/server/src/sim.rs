@@ -112,7 +112,7 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
             tick,
             chunks: snapshot_chunks,
         };
-        match rmp_serde::to_vec(&msg) {
+        match protocol::encode_server_message(&msg) {
             Ok(bytes) => {
                 let _ = state.tick_tx.send(Arc::new(bytes));
             }

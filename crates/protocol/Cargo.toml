@@ -5,6 +5,5 @@ version.workspace = true
 
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
 rmp-serde.workspace = true
+zstd.workspace = true
