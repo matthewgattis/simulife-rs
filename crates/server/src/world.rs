@@ -7,8 +7,10 @@ use rand::Rng;
 /// off. 0.10 → central 80% × 80% lit, dark frame around.
 const SUNLIT_MARGIN_FRAC: f32 = 0.10;
 
-/// Spacing between initial sprouts in `place_random_sprout_grid`.
-const SPROUT_GRID_SPACING: i32 = 32;
+/// Spacing between initial sprouts in `place_random_sprout_grid`. Tight
+/// enough to seed thousands of competing lineages — most random genomes
+/// die or stall in the first few ticks, so dense packing is fine.
+const SPROUT_GRID_SPACING: i32 = 6;
 
 pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
     let mut chunks = Vec::with_capacity((chunks_x * chunks_y) as usize);
