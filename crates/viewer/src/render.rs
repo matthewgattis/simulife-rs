@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use protocol::{
@@ -157,15 +157,15 @@ impl RenderState {
         context_menu: &mut Option<ContextMenu>,
         regen_dialog: &mut Option<RegenDialog>,
         outgoing: &UnboundedSender<ClientMessage>,
-    ) {
+    ) -> Duration {
         let _render_span = tracing::info_span!("render_frame").entered();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return Duration::ZERO;
             }
-            Err(_) => return,
+            Err(_) => return Duration::ZERO,
         };
         let view = frame
             .texture
@@ -266,9 +266,17 @@ impl RenderState {
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
 
+        let repaint_delay = egui_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|vp| vp.repaint_delay)
+            .unwrap_or(Duration::MAX);
+
         for id in &egui_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+
+        repaint_delay
     }
 }
 

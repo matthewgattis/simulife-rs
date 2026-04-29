@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use protocol::{CHUNK_EDGE, Chunk, ClientMessage};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -6,7 +10,7 @@ use tracing::{debug, info};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoopProxy},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
@@ -138,6 +142,11 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Reactive mode: idle blocks the event loop. Redraws happen only
+        // when egui asks (via repaint_delay after each render) or when we
+        // explicitly request_redraw on a real signal (tick, input).
+        event_loop.set_control_flow(ControlFlow::Wait);
+
         if self.state.is_some() {
             return;
         }
@@ -249,7 +258,17 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
 
-        let response = state.handle_window_event(&event);
+        // Don't feed RedrawRequested to egui — it isn't an input event and
+        // some integrations return repaint=true for it, which creates a
+        // tight redraw loop in reactive mode.
+        let response = if matches!(event, WindowEvent::RedrawRequested) {
+            egui_winit::EventResponse {
+                consumed: false,
+                repaint: false,
+            }
+        } else {
+            state.handle_window_event(&event)
+        };
         if response.repaint {
             state.window().request_redraw();
         }
@@ -345,7 +364,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window().request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.render(
+                let repaint_delay = state.render(
                     &self.network,
                     self.server_addr,
                     &self.chunks,
@@ -359,6 +378,18 @@ impl ApplicationHandler<UserEvent> for App {
                     &mut self.regen_dialog,
                     &self.outgoing,
                 );
+                // egui tells us when it next wants a frame (animation,
+                // hover effects, etc). Schedule a wake-up if finite;
+                // otherwise stay in Wait until a real event arrives.
+                if repaint_delay == Duration::ZERO {
+                    state.window().request_redraw();
+                } else if repaint_delay < Duration::MAX {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        Instant::now() + repaint_delay,
+                    ));
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
             }
             _ => {}
         }
