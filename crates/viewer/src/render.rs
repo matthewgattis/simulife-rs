@@ -847,7 +847,11 @@ fn draw_ui(
             });
             let mut hz = *sim_tick_hz;
             if ui
-                .add(egui::Slider::new(&mut hz, 1..=60).text("Hz"))
+                .add(
+                    egui::Slider::new(&mut hz, 1..=1000)
+                        .text("Hz")
+                        .logarithmic(true),
+                )
                 .changed()
             {
                 // Server is authoritative — send a request; the slider
