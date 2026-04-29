@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 
 const LEAF_PHOTOSYNTHESIS: Energy = 5;
 const UPKEEP_DEFAULT: Energy = 1;
-const UPKEEP_SEED: Energy = 0;
+const UPKEEP_SEED: Energy = 1;
 const UPKEEP_SPROUT: Energy = 3;
 
 /// Per-slot spawn cost. Sprout drains the sum of these for whatever it
@@ -515,7 +515,10 @@ fn push_targets(occ: &Occupant) -> Vec<Direction> {
 
 fn is_valid_child(occ: &Occupant) -> bool {
     match occ {
-        Occupant::Sprout { .. } => true,
+        // Seeds and sprouts are terminal sinks — both legitimately receive
+        // pushed energy. Stems with at least one valid child also count;
+        // stems with no children are dead-ends and get pruned.
+        Occupant::Sprout { .. } | Occupant::Seed { .. } => true,
         Occupant::Stem { children, .. } => *children != 0,
         _ => false,
     }
@@ -885,7 +888,9 @@ fn attempt_growth(
         if let Some(target) = cell_at_mut(chunks, chunks_x, nx, ny) {
             target.occupant = occ;
             connections |= dir_to_bitmask(*dir);
-            if matches!(slot, SlotProduct::Sprout) {
+            // Both sprouts and seeds need energy from the parent stem to
+            // function, so include them in the children mask.
+            if matches!(slot, SlotProduct::Sprout | SlotProduct::Seed) {
                 children |= dir_to_bitmask(*dir);
             }
             grew = true;
@@ -1331,7 +1336,15 @@ mod tests {
             facing: Direction::North,
             parent: None,
         };
+        let seed = Occupant::Seed {
+            plant: 1,
+            energy: 10,
+            facing: Direction::North,
+            genome: Box::new(Genome::default_vine()),
+            parent: None,
+        };
         assert!(is_valid_child(&sprout));
+        assert!(is_valid_child(&seed), "seeds receive energy like sprouts");
         assert!(is_valid_child(&stem_with_kids));
         assert!(!is_valid_child(&stem_no_kids));
         assert!(!is_valid_child(&leaf));
