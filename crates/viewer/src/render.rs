@@ -18,6 +18,10 @@ const MSAA_SAMPLES: u32 = 4;
 pub const LAYER_ORGANIC: u32 = 1 << 0;
 pub const LAYER_FG: u32 = 1 << 1;
 pub const LAYER_ENERGY: u32 = 1 << 2;
+/// When set, occupant rendering uses a per-clan palette instead of the
+/// per-cell-type colors. Lets you see which lineage each cell descended
+/// from regardless of which box it currently lives in.
+pub const LAYER_CLAN: u32 = 1 << 3;
 
 pub struct RenderState {
     window: Arc<Window>,
@@ -312,6 +316,8 @@ struct GpuCell {
     energy: u32,
     facing: u32,
     connections: u32,
+    clan: u32,
+    _pad: [u32; 3],
 }
 
 const GPU_KIND_EMPTY: u32 = 0;
@@ -657,58 +663,80 @@ fn make_bind_group(
 }
 
 fn to_gpu_cell(cell: &WireCell) -> GpuCell {
-    let (kind, plant, energy, facing, connections) = match &cell.occupant {
-        WireOccupant::Empty => (GPU_KIND_EMPTY, 0, 0, 0, 0),
+    let (kind, plant, clan, energy, facing, connections) = match &cell.occupant {
+        WireOccupant::Empty => (GPU_KIND_EMPTY, 0, 0, 0, 0, 0),
         WireOccupant::Leaf {
             plant,
+            clan,
             energy,
             facing,
             ..
         } => (
             GPU_KIND_LEAF,
             *plant,
+            u32::from(*clan),
             u32::from(*energy),
             facing_to_u32(*facing),
             0,
         ),
-        WireOccupant::Root { plant, energy, .. } => {
-            (GPU_KIND_ROOT, *plant, u32::from(*energy), 0, 0)
-        }
+        WireOccupant::Root {
+            plant, clan, energy, ..
+        } => (
+            GPU_KIND_ROOT,
+            *plant,
+            u32::from(*clan),
+            u32::from(*energy),
+            0,
+            0,
+        ),
         WireOccupant::Stem {
             plant,
+            clan,
             energy,
             connections,
             ..
         } => (
             GPU_KIND_STEM,
             *plant,
+            u32::from(*clan),
             u32::from(*energy),
             0,
             u32::from(*connections),
         ),
-        WireOccupant::Antenna { plant, energy, .. } => {
-            (GPU_KIND_ANTENNA, *plant, u32::from(*energy), 0, 0)
-        }
+        WireOccupant::Antenna {
+            plant, clan, energy, ..
+        } => (
+            GPU_KIND_ANTENNA,
+            *plant,
+            u32::from(*clan),
+            u32::from(*energy),
+            0,
+            0,
+        ),
         WireOccupant::Sprout {
             plant,
+            clan,
             energy,
             facing,
             ..
         } => (
             GPU_KIND_SPROUT,
             *plant,
+            u32::from(*clan),
             u32::from(*energy),
             facing_to_u32(*facing),
             0,
         ),
         WireOccupant::Seed {
             plant,
+            clan,
             energy,
             facing,
             ..
         } => (
             GPU_KIND_SEED,
             *plant,
+            u32::from(*clan),
             u32::from(*energy),
             facing_to_u32(*facing),
             0,
@@ -723,6 +751,8 @@ fn to_gpu_cell(cell: &WireCell) -> GpuCell {
         energy,
         facing,
         connections,
+        clan,
+        _pad: [0; 3],
     }
 }
 
@@ -864,6 +894,7 @@ fn draw_ui(
             let mut organic = (*layer_flags & LAYER_ORGANIC) != 0;
             let mut energy = (*layer_flags & LAYER_ENERGY) != 0;
             let mut fg = (*layer_flags & LAYER_FG) != 0;
+            let mut clan = (*layer_flags & LAYER_CLAN) != 0;
             if ui.checkbox(&mut organic, "Organic").changed() {
                 *layer_flags = (*layer_flags & !LAYER_ORGANIC)
                     | (if organic { LAYER_ORGANIC } else { 0 });
@@ -874,6 +905,10 @@ fn draw_ui(
             }
             if ui.checkbox(&mut fg, "Occupants").changed() {
                 *layer_flags = (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
+            }
+            if ui.checkbox(&mut clan, "Clan colors").changed() {
+                *layer_flags = (*layer_flags & !LAYER_CLAN)
+                    | (if clan { LAYER_CLAN } else { 0 });
             }
             ui.separator();
             match cursor_world {
@@ -1018,61 +1053,67 @@ fn occupant_label(occ: &WireOccupant) -> String {
         WireOccupant::Empty => "empty".to_string(),
         WireOccupant::Leaf {
             plant,
+            clan,
             energy,
             facing,
             parent,
         } => format!(
-            "leaf (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
+            "leaf (plant {plant}, clan {clan}, energy {energy}, facing {facing:?}, parent {})",
             parent_label(*parent)
         ),
         WireOccupant::Root {
             plant,
+            clan,
             energy,
             parent,
         } => format!(
-            "root (plant {plant}, energy {energy}, parent {})",
+            "root (plant {plant}, clan {clan}, energy {energy}, parent {})",
             parent_label(*parent)
         ),
         WireOccupant::Stem {
             plant,
+            clan,
             energy,
             connections,
             parent,
             children,
         } => format!(
-            "stem (plant {plant}, energy {energy}, conn {}, parent {}, kids {})",
+            "stem (plant {plant}, clan {clan}, energy {energy}, conn {}, parent {}, kids {})",
             connections_label(*connections),
             parent_label(*parent),
             connections_label(*children)
         ),
         WireOccupant::Antenna {
             plant,
+            clan,
             energy,
             parent,
         } => format!(
-            "antenna (plant {plant}, energy {energy}, parent {})",
+            "antenna (plant {plant}, clan {clan}, energy {energy}, parent {})",
             parent_label(*parent)
         ),
         WireOccupant::Sprout {
             plant,
+            clan,
             energy,
             facing,
             parent,
             current_gene,
             ..
         } => format!(
-            "sprout (plant {plant}, energy {energy}, facing {facing:?}, parent {}, gene {})",
+            "sprout (plant {plant}, clan {clan}, energy {energy}, facing {facing:?}, parent {}, gene {})",
             parent_label(*parent),
             current_gene
         ),
         WireOccupant::Seed {
             plant,
+            clan,
             energy,
             facing,
             parent,
             ..
         } => format!(
-            "seed (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
+            "seed (plant {plant}, clan {clan}, energy {energy}, facing {facing:?}, parent {})",
             parent_label(*parent)
         ),
     }
@@ -1182,6 +1223,7 @@ mod tests {
 
         let leaf = WireOccupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 50,
             facing: Direction::North,
             parent: Some(Direction::South),
@@ -1190,6 +1232,7 @@ mod tests {
 
         let stem = WireOccupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 0,
             connections: STEM_CONNECT_NORTH,
             parent: None,
@@ -1202,6 +1245,7 @@ mod tests {
 
         let sprout = WireOccupant::Sprout {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: None,
@@ -1232,6 +1276,7 @@ mod tests {
         let mut chunks = vec![empty_chunk(0, 0)];
         chunks[0].cells[1].occupant = WireOccupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: None,
@@ -1267,6 +1312,7 @@ mod tests {
         // Place a leaf to the North of (5, 5) — i.e. at (5, 4).
         chunks[0].cells[4 * (CHUNK_EDGE as usize) + 5].occupant = WireOccupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: None,

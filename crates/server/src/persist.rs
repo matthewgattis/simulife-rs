@@ -177,6 +177,7 @@ mod tests {
         chunks[0].cells[0].organic = 123;
         chunks[0].cells[5].occupant = Occupant::Sprout {
             plant: 7,
+            clan: 0,
             energy: 250,
             facing: Direction::East,
             genome: Box::new(Genome::default_vine()),

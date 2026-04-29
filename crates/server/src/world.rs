@@ -99,6 +99,8 @@ pub fn place_random_sprout_grid(
 ) -> u32 {
     let total_w = chunks_x as i32 * CHUNK_EDGE as i32;
     let total_h = chunks_y as i32 * CHUNK_EDGE as i32;
+    let box_w = total_w / BOXES_PER_DIMENSION as i32;
+    let box_h = total_h / BOXES_PER_DIMENSION as i32;
     let mut count = 0u32;
     let mut y = SPROUT_GRID_SPACING;
     while y < total_h - SPROUT_GRID_SPACING {
@@ -115,6 +117,11 @@ pub fn place_random_sprout_grid(
                     };
                     let genome =
                         crate::sim::mutate_genome(&Genome::default_vine(), 1.0, rng);
+                    // Clan: which 2D box this sprout starts in. Encoded
+                    // row-major: clan = box_y * BOXES_PER_DIMENSION + box_x.
+                    let bx = (x / box_w) as u32;
+                    let by = (y / box_h) as u32;
+                    let clan = (by * BOXES_PER_DIMENSION + bx) as protocol::ClanId;
                     place_at(
                         chunks,
                         chunks_x,
@@ -122,6 +129,7 @@ pub fn place_random_sprout_grid(
                         y,
                         Occupant::Sprout {
                             plant: count,
+                            clan,
                             energy: 100,
                             facing,
                             genome: Box::new(genome),
@@ -324,6 +332,7 @@ mod tests {
             0,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::North,
                 parent: None,
@@ -350,6 +359,7 @@ mod tests {
             0,
             Occupant::Leaf {
                 plant: 7,
+                clan: 0,
                 energy: 0,
                 facing: Direction::East,
                 parent: None,

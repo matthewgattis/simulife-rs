@@ -18,6 +18,10 @@ struct Cell {
     energy: u32,
     facing: u32,
     connections: u32,
+    clan: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -61,6 +65,7 @@ const STEM_W: u32 = 8u;
 const LAYER_ORGANIC: u32 = 1u;
 const LAYER_FG: u32 = 2u;
 const LAYER_ENERGY: u32 = 4u;
+const LAYER_CLAN: u32 = 8u;
 
 const CLEAR_COLOR: vec3<f32> = vec3<f32>(0.05, 0.07, 0.10);
 const OUTLINE_COLOR: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
@@ -103,6 +108,22 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 1.00, 1.00); }
     if (cell.kind == KIND_SEED) { return vec3<f32>(0.80, 0.70, 0.35); }
     return vec3<f32>(0.0);
+}
+
+// Distinct palette for clans 0..3 (top-left, top-right, bottom-left,
+// bottom-right). Beyond 4 clans we just hash the id into HSL hue space.
+fn clan_color(clan: u32) -> vec3<f32> {
+    if (clan == 0u) { return vec3<f32>(0.95, 0.30, 0.30); } // red
+    if (clan == 1u) { return vec3<f32>(0.95, 0.80, 0.20); } // amber
+    if (clan == 2u) { return vec3<f32>(0.30, 0.85, 0.45); } // green
+    if (clan == 3u) { return vec3<f32>(0.45, 0.55, 0.95); } // blue
+    let h = f32(clan) * 0.6180339;
+    let frac = h - floor(h);
+    return vec3<f32>(
+        0.5 + 0.5 * cos(6.2831853 * (frac + 0.0)),
+        0.5 + 0.5 * cos(6.2831853 * (frac + 0.33)),
+        0.5 + 0.5 * cos(6.2831853 * (frac + 0.66)),
+    );
 }
 
 // Returns (signed_distance, aa_width). Negative d = inside the shape.
@@ -160,6 +181,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let show_organic = (world.layer_flags & LAYER_ORGANIC) != 0u;
     let show_energy = (world.layer_flags & LAYER_ENERGY) != 0u;
     let show_fg = (world.layer_flags & LAYER_FG) != 0u;
+    let show_clan = (world.layer_flags & LAYER_CLAN) != 0u;
 
     var color = soil_color(cell, show_organic, show_energy);
 
@@ -172,7 +194,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let outline_w = aa_w * 0.5 * outline_fade;
         let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
         let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
-        let fg = occupant_color(cell);
+        let fg = select(occupant_color(cell), clan_color(cell.clan), show_clan);
         color = mix(color, OUTLINE_COLOR, alpha_outer);
         color = mix(color, fg, alpha_inner);
     }

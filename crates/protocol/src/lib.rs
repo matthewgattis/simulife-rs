@@ -82,22 +82,32 @@ impl Genome {
     }
 }
 
+/// Inherited "clan" identifier — set on initial sprouts based on which
+/// box they were placed in, propagates through every descendant
+/// (growth, eating, germination). Lets the viewer color cells by where
+/// the lineage originally came from, even after it has invaded another
+/// box.
+pub type ClanId = u8;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Occupant {
     Empty,
     Leaf {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         facing: Direction,
         parent: Option<Direction>,
     },
     Root {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         parent: Option<Direction>,
     },
     Stem {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         connections: u8,
         parent: Option<Direction>,
@@ -105,11 +115,13 @@ pub enum Occupant {
     },
     Antenna {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         parent: Option<Direction>,
     },
     Sprout {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         facing: Direction,
         genome: Box<Genome>,
@@ -118,6 +130,7 @@ pub enum Occupant {
     },
     Seed {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         facing: Direction,
         genome: Box<Genome>,
@@ -148,17 +161,20 @@ pub enum WireOccupant {
     Empty,
     Leaf {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         facing: Direction,
         parent: Option<Direction>,
     },
     Root {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         parent: Option<Direction>,
     },
     Stem {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         connections: u8,
         parent: Option<Direction>,
@@ -166,11 +182,13 @@ pub enum WireOccupant {
     },
     Antenna {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         parent: Option<Direction>,
     },
     Sprout {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         facing: Direction,
         parent: Option<Direction>,
@@ -178,6 +196,7 @@ pub enum WireOccupant {
     },
     Seed {
         plant: PlantId,
+        clan: ClanId,
         energy: Energy,
         facing: Direction,
         parent: Option<Direction>,
@@ -204,32 +223,38 @@ impl From<&Occupant> for WireOccupant {
             Occupant::Empty => WireOccupant::Empty,
             Occupant::Leaf {
                 plant,
+                clan,
                 energy,
                 facing,
                 parent,
             } => WireOccupant::Leaf {
                 plant: *plant,
+                clan: *clan,
                 energy: *energy,
                 facing: *facing,
                 parent: *parent,
             },
             Occupant::Root {
                 plant,
+                clan,
                 energy,
                 parent,
             } => WireOccupant::Root {
                 plant: *plant,
+                clan: *clan,
                 energy: *energy,
                 parent: *parent,
             },
             Occupant::Stem {
                 plant,
+                clan,
                 energy,
                 connections,
                 parent,
                 children,
             } => WireOccupant::Stem {
                 plant: *plant,
+                clan: *clan,
                 energy: *energy,
                 connections: *connections,
                 parent: *parent,
@@ -237,15 +262,18 @@ impl From<&Occupant> for WireOccupant {
             },
             Occupant::Antenna {
                 plant,
+                clan,
                 energy,
                 parent,
             } => WireOccupant::Antenna {
                 plant: *plant,
+                clan: *clan,
                 energy: *energy,
                 parent: *parent,
             },
             Occupant::Sprout {
                 plant,
+                clan,
                 energy,
                 facing,
                 parent,
@@ -253,6 +281,7 @@ impl From<&Occupant> for WireOccupant {
                 ..
             } => WireOccupant::Sprout {
                 plant: *plant,
+                clan: *clan,
                 energy: *energy,
                 facing: *facing,
                 parent: *parent,
@@ -260,12 +289,14 @@ impl From<&Occupant> for WireOccupant {
             },
             Occupant::Seed {
                 plant,
+                clan,
                 energy,
                 facing,
                 parent,
                 ..
             } => WireOccupant::Seed {
                 plant: *plant,
+                clan: *clan,
                 energy: *energy,
                 facing: *facing,
                 parent: *parent,
@@ -370,6 +401,7 @@ mod tests {
             sunlit: false,
             occupant: Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 100,
                 facing: Direction::North,
                 genome: Box::new(Genome::default_vine()),
@@ -383,6 +415,7 @@ mod tests {
             sunlit: true,
             occupant: Occupant::Seed {
                 plant: 1,
+                clan: 0,
                 energy: 5,
                 facing: Direction::West,
                 genome: Box::new(Genome::default_vine()),
@@ -395,6 +428,7 @@ mod tests {
             sunlit: true,
             occupant: Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 30,
                 facing: Direction::East,
                 parent: Some(Direction::West),
@@ -414,6 +448,7 @@ mod tests {
 
         let Occupant::Sprout {
             plant,
+            clan: _,
             energy,
             facing,
             ref genome,
@@ -522,6 +557,7 @@ mod tests {
 
         let leaf = roundtrip_occupant(Occupant::Leaf {
             plant: 9,
+            clan: 0,
             energy: 100,
             facing: Direction::East,
             parent: Some(Direction::West),
@@ -542,6 +578,7 @@ mod tests {
 
         let root = roundtrip_occupant(Occupant::Root {
             plant: 1,
+            clan: 0,
             energy: 50,
             parent: None,
         });
@@ -549,6 +586,7 @@ mod tests {
 
         let antenna = roundtrip_occupant(Occupant::Antenna {
             plant: 2,
+            clan: 0,
             energy: 7,
             parent: Some(Direction::North),
         });
@@ -562,6 +600,7 @@ mod tests {
 
         let stem = roundtrip_occupant(Occupant::Stem {
             plant: 3,
+            clan: 0,
             energy: 0,
             connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
             parent: Some(Direction::South),
@@ -581,6 +620,7 @@ mod tests {
 
         let sprout = roundtrip_occupant(Occupant::Sprout {
             plant: 4,
+            clan: 0,
             energy: 25,
             facing: Direction::South,
             genome: Box::new(Genome::default_vine()),
@@ -601,6 +641,7 @@ mod tests {
 
         let seed = roundtrip_occupant(Occupant::Seed {
             plant: 5,
+            clan: 0,
             energy: 30,
             facing: Direction::West,
             genome: Box::new(Genome::default_vine()),

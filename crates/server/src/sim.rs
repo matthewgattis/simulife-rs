@@ -9,7 +9,7 @@ use std::{
 use rand::SeedableRng;
 
 use protocol::{
-    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, Direction, Energy, Gene, Genome, Occupant,
+    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ClanId, Direction, Energy, Gene, Genome, Occupant,
     STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
     ServerMessage, SlotProduct,
 };
@@ -231,9 +231,13 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
 
     let plant = state.next_plant_id.fetch_add(1, Ordering::Relaxed);
+    // Manually-spawned sprouts default to clan 0; they don't inherit from
+    // any lineage (yet). If we ever want clan to reflect spawn position,
+    // we can compute it from (x, y) the same way world::place_random does.
     let mut chunks = state.world.lock().expect("sim lock poisoned");
     chunks[chunk_idx].cells[cell_idx].occupant = Occupant::Sprout {
         plant,
+        clan: 0,
         energy: 100,
         facing,
         genome: Box::new(Genome::default_vine()),
@@ -536,22 +540,25 @@ fn mutate_world(
         }
     }
     for (sx, sy, parent_clear) in germinations {
-        let (plant, energy, facing, genome) = match cell_at_mut(chunks, chunks_x, sx, sy) {
-            Some(cell) => match &cell.occupant {
-                Occupant::Seed {
-                    plant,
-                    energy,
-                    facing,
-                    genome,
-                    ..
-                } => (*plant, *energy, *facing, genome.clone()),
-                _ => continue,
-            },
-            None => continue,
-        };
+        let (plant, clan, energy, facing, genome) =
+            match cell_at_mut(chunks, chunks_x, sx, sy) {
+                Some(cell) => match &cell.occupant {
+                    Occupant::Seed {
+                        plant,
+                        clan,
+                        energy,
+                        facing,
+                        genome,
+                        ..
+                    } => (*plant, *clan, *energy, *facing, genome.clone()),
+                    _ => continue,
+                },
+                None => continue,
+            };
         if let Some(seed_cell) = cell_at_mut(chunks, chunks_x, sx, sy) {
             seed_cell.occupant = Occupant::Sprout {
                 plant,
+                clan,
                 energy,
                 facing,
                 genome,
@@ -579,6 +586,7 @@ fn mutate_world(
                     let info = match &chunks[chunk_idx].cells[cell_idx].occupant {
                         Occupant::Sprout {
                             plant,
+                            clan,
                             energy,
                             facing,
                             parent,
@@ -586,6 +594,7 @@ fn mutate_world(
                             genome,
                         } => Some((
                             *plant,
+                            *clan,
                             *energy,
                             *facing,
                             *parent,
@@ -594,7 +603,9 @@ fn mutate_world(
                         )),
                         _ => None,
                     };
-                    if let Some((plant, energy, facing, parent, current_gene, genome)) = info {
+                    if let Some((plant, clan, energy, facing, parent, current_gene, genome)) =
+                        info
+                    {
                         let wx = cx as i32 * edge + lx as i32;
                         let wy = cy as i32 * edge + ly as i32;
                         attempt_growth(
@@ -605,6 +616,7 @@ fn mutate_world(
                             wx,
                             wy,
                             plant,
+                            clan,
                             energy,
                             facing,
                             parent,
@@ -985,6 +997,7 @@ fn slot_cost(slot: SlotProduct) -> Energy {
 fn make_slot_occupant(
     slot: SlotProduct,
     plant: u32,
+    clan: ClanId,
     facing: Direction,
     parent: Direction,
     parent_genome: &Genome,
@@ -997,22 +1010,26 @@ fn make_slot_occupant(
         SlotProduct::Nothing => return None,
         SlotProduct::Leaf => Occupant::Leaf {
             plant,
+            clan,
             energy: COST_LEAF,
             facing,
             parent: parent_back,
         },
         SlotProduct::Root => Occupant::Root {
             plant,
+            clan,
             energy: COST_ROOT,
             parent: parent_back,
         },
         SlotProduct::Antenna => Occupant::Antenna {
             plant,
+            clan,
             energy: COST_ANTENNA,
             parent: parent_back,
         },
         SlotProduct::Seed => Occupant::Seed {
             plant,
+            clan,
             energy: COST_SEED,
             facing,
             genome: Box::new(mutate_genome(parent_genome, MUTATION_RATE, rng)),
@@ -1020,6 +1037,7 @@ fn make_slot_occupant(
         },
         SlotProduct::Sprout => Occupant::Sprout {
             plant,
+            clan,
             energy: COST_SPROUT,
             facing,
             genome: Box::new(mutate_genome(parent_genome, MUTATION_RATE, rng)),
@@ -1037,6 +1055,7 @@ fn attempt_growth(
     wx: i32,
     wy: i32,
     plant: u32,
+    clan: ClanId,
     sprout_energy: Energy,
     facing: Direction,
     parent: Option<Direction>,
@@ -1126,7 +1145,7 @@ fn attempt_growth(
         if !viable[i] {
             continue;
         }
-        let Some(occ) = make_slot_occupant(*slot, plant, *dir, *dir, genome, next_gene, rng)
+        let Some(occ) = make_slot_occupant(*slot, plant, clan, *dir, *dir, genome, next_gene, rng)
         else {
             continue;
         };
@@ -1156,6 +1175,7 @@ fn attempt_growth(
         if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             self_cell.occupant = Occupant::Stem {
                 plant,
+                clan,
                 energy: new_energy,
                 connections,
                 parent,
@@ -1313,6 +1333,7 @@ mod tests {
         let genome = Genome::default_vine();
         let occ = Occupant::Sprout {
             plant: 1,
+            clan: 0,
             energy,
             facing: Direction::North,
             genome: Box::new(genome.clone()),
@@ -1338,6 +1359,7 @@ mod tests {
             10,
             10,
             1,
+            0,
             100,
             Direction::North,
             None,
@@ -1385,6 +1407,7 @@ mod tests {
             10,
             0,
             1,
+            0,
             100,
             Direction::North,
             None,
@@ -1418,6 +1441,7 @@ mod tests {
         // would just get eaten and turn into food.)
         let blocker = || Occupant::Stem {
             plant: 99,
+            clan: 0,
             energy: 50,
             connections: 0,
             parent: None,
@@ -1438,6 +1462,7 @@ mod tests {
             10,
             10,
             1,
+            0,
             100,
             Direction::North,
             None,
@@ -1463,6 +1488,7 @@ mod tests {
         // Foreign leaves on all three growth targets — edible, not blocking.
         let foreign_leaf = || Occupant::Leaf {
             plant: 99,
+            clan: 0,
             energy: 50,
             facing: Direction::North,
             parent: None,
@@ -1482,6 +1508,7 @@ mod tests {
             10,
             10,
             1,
+            0,
             30,
             Direction::North,
             None,
@@ -1525,6 +1552,7 @@ mod tests {
             9,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 facing: Direction::North,
                 parent: None,
@@ -1542,6 +1570,7 @@ mod tests {
             10,
             10,
             1,
+            0,
             100,
             Direction::North,
             None,
@@ -1586,6 +1615,7 @@ mod tests {
             10,
             10,
             1,
+            0,
             5,
             Direction::North,
             None,
@@ -1710,6 +1740,7 @@ mod tests {
     fn is_valid_child_only_for_sinks() {
         let sprout = Occupant::Sprout {
             plant: 1,
+            clan: 0,
             energy: 10,
             facing: Direction::North,
             genome: Box::new(Genome::default_vine()),
@@ -1718,6 +1749,7 @@ mod tests {
         };
         let stem_with_kids = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 10,
             connections: STEM_CONNECT_NORTH,
             parent: None,
@@ -1725,6 +1757,7 @@ mod tests {
         };
         let stem_no_kids = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 10,
             connections: 0,
             parent: None,
@@ -1732,12 +1765,14 @@ mod tests {
         };
         let leaf = Occupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 10,
             facing: Direction::North,
             parent: None,
         };
         let seed = Occupant::Seed {
             plant: 1,
+            clan: 0,
             energy: 10,
             facing: Direction::North,
             genome: Box::new(Genome::default_vine()),
@@ -1755,6 +1790,7 @@ mod tests {
     fn push_targets_match_role() {
         let leaf = Occupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: Some(Direction::South),
@@ -1763,6 +1799,7 @@ mod tests {
 
         let leaf_orphan = Occupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: None,
@@ -1771,6 +1808,7 @@ mod tests {
 
         let stem_kids = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 0,
             connections: 0,
             parent: Some(Direction::South),
@@ -1783,6 +1821,7 @@ mod tests {
 
         let stem_no_kids = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 0,
             connections: 0,
             parent: Some(Direction::South),
@@ -1792,6 +1831,7 @@ mod tests {
 
         let sprout = Occupant::Sprout {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             genome: Box::new(Genome::default_vine()),
@@ -1812,6 +1852,7 @@ mod tests {
         // Stem with children=0 and parent=None → orphan.
         let stem_orphan = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 0,
             connections: 0,
             parent: None,
@@ -1824,6 +1865,7 @@ mod tests {
         // Stem with children present → not orphan.
         let stem_kid = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 0,
             connections: 0,
             parent: None,
@@ -1836,6 +1878,7 @@ mod tests {
         // Leaf whose parent direction points at an Empty cell → orphan.
         let leaf = Occupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: Some(Direction::South),
@@ -1852,6 +1895,7 @@ mod tests {
             6,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 connections: 0,
                 parent: None,
@@ -1865,6 +1909,7 @@ mod tests {
         // Leaf at top edge with parent=North → OOB, orphan.
         let leaf_top = Occupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::South,
             parent: Some(Direction::North),
@@ -1898,6 +1943,7 @@ mod tests {
         let leaf = make_slot_occupant(
             SlotProduct::Leaf,
             7,
+            0,
             Direction::East,
             Direction::East,
             &parent_genome,
@@ -1908,6 +1954,7 @@ mod tests {
         match leaf {
             Occupant::Leaf {
                 plant,
+                clan: _,
                 facing,
                 parent,
                 energy,
@@ -1923,6 +1970,7 @@ mod tests {
         let nothing = make_slot_occupant(
             SlotProduct::Nothing,
             1,
+            0,
             Direction::North,
             Direction::North,
             &parent_genome,
@@ -1934,6 +1982,7 @@ mod tests {
         let sprout = make_slot_occupant(
             SlotProduct::Sprout,
             5,
+            0,
             Direction::North,
             Direction::North,
             &parent_genome,
@@ -1958,6 +2007,7 @@ mod tests {
     fn occupant_energy_get_set_round_trip() {
         let mut occ = Occupant::Stem {
             plant: 1,
+            clan: 0,
             energy: 50,
             connections: 0,
             parent: None,
@@ -1975,12 +2025,14 @@ mod tests {
     fn upkeep_for_each_occupant() {
         let leaf = Occupant::Leaf {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             parent: None,
         };
         let sprout = Occupant::Sprout {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             genome: Box::new(Genome::default_vine()),
@@ -1989,6 +2041,7 @@ mod tests {
         };
         let seed = Occupant::Seed {
             plant: 1,
+            clan: 0,
             energy: 0,
             facing: Direction::North,
             genome: Box::new(Genome::default_vine()),
@@ -2059,6 +2112,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 10,
                 facing: Direction::North,
                 parent: Some(Direction::South),
@@ -2071,6 +2125,7 @@ mod tests {
             11,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::South,
                 genome: Box::new(Genome::default_vine()),
@@ -2107,6 +2162,7 @@ mod tests {
             10,
             Occupant::Root {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 parent: Some(Direction::North),
             },
@@ -2118,6 +2174,7 @@ mod tests {
             9,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: None,
@@ -2131,6 +2188,7 @@ mod tests {
             8,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::North,
                 genome: Box::new(Genome::default_vine()),
@@ -2166,6 +2224,7 @@ mod tests {
             10,
             Occupant::Antenna {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 parent: Some(Direction::North),
             },
@@ -2177,6 +2236,7 @@ mod tests {
             9,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: None,
@@ -2190,6 +2250,7 @@ mod tests {
             8,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::North,
                 genome: Box::new(Genome::default_vine()),
@@ -2225,6 +2286,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 4,
                 facing: Direction::North,
                 parent: Some(Direction::South),
@@ -2237,6 +2299,7 @@ mod tests {
             11,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 10,
                 facing: Direction::South,
                 genome: Box::new(Genome::default_vine()),
@@ -2272,6 +2335,7 @@ mod tests {
             10,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: None,
@@ -2285,6 +2349,7 @@ mod tests {
             11,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::West, // grows W/S/N — corners of single sprout
                 genome: Box::new(Genome::default_vine()),
@@ -2318,6 +2383,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 10,
                 facing: Direction::North,
                 parent: Some(Direction::South),
@@ -2330,6 +2396,7 @@ mod tests {
             11,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: Some(Direction::North),
@@ -2343,6 +2410,7 @@ mod tests {
             12,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::South,
                 genome: Box::new(Genome::default_vine()),
@@ -2376,6 +2444,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 facing: Direction::North,
                 parent: None,
@@ -2411,6 +2480,7 @@ mod tests {
             10,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 connections: STEM_CONNECT_SOUTH,
                 parent: Some(Direction::South),
@@ -2425,6 +2495,7 @@ mod tests {
             9,
             Occupant::Sprout {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 facing: Direction::North,
                 genome: Box::new(Genome::default_vine()),
@@ -2484,6 +2555,7 @@ mod tests {
             12,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 connections: STEM_CONNECT_NORTH,
                 parent: None,
@@ -2497,6 +2569,7 @@ mod tests {
             11,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: Some(Direction::South),
@@ -2510,6 +2583,7 @@ mod tests {
             10,
             Occupant::Seed {
                 plant: 1,
+                clan: 0,
                 energy: seed_energy,
                 facing: Direction::North,
                 genome: Box::new(Genome::default_vine()),
@@ -2586,6 +2660,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 facing: Direction::North,
                 parent: None,
@@ -2632,6 +2707,7 @@ mod tests {
             10,
             Occupant::Root {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 parent: Some(Direction::East),
             },
@@ -2643,6 +2719,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 facing: Direction::North,
                 parent: Some(Direction::West),
@@ -2679,6 +2756,7 @@ mod tests {
             10,
             Occupant::Antenna {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 parent: Some(Direction::East),
             },
@@ -2690,6 +2768,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 facing: Direction::North,
                 parent: Some(Direction::West),
@@ -2728,6 +2807,7 @@ mod tests {
             10,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 100,
                 connections: STEM_CONNECT_NORTH,
                 parent: None,
@@ -2742,6 +2822,7 @@ mod tests {
             9,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 100,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: Some(Direction::South),
@@ -2757,6 +2838,7 @@ mod tests {
             8,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 100,
                 connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
                 parent: Some(Direction::South),
@@ -2799,6 +2881,7 @@ mod tests {
             10,
             Occupant::Leaf {
                 plant: 1,
+                clan: 0,
                 energy: 50,
                 facing: Direction::North,
                 parent: Some(Direction::South),
@@ -2812,6 +2895,7 @@ mod tests {
             11,
             Occupant::Stem {
                 plant: 1,
+                clan: 0,
                 energy: 0,
                 connections: 0,
                 parent: None,
@@ -2852,6 +2936,7 @@ mod tests {
             10,
             Occupant::Seed {
                 plant: 7,
+                clan: 0,
                 energy: 25, // far below SEED_DROPOFF_THRESHOLD
                 facing: Direction::East,
                 genome: Box::new(Genome::default_vine()),
