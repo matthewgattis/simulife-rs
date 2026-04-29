@@ -451,46 +451,98 @@ fn mutate_world(
         }
     }
 
-    // Phase 5.5: seed dropoff. After push, any seed at or above the
-    // threshold disconnects from its parent stem — clearing the stem's
-    // children-bit pointing at it and zeroing the seed's own parent. The
-    // seed then lives off accumulated energy until starvation.
-    let mut dropoffs: Vec<(i32, i32, i32, i32, u8)> = Vec::new();
+    // Phase 5.5: seed germination. A Seed becomes a Sprout in place (and
+    // tries to grow this same tick in phase 6) if either:
+    //   - its parent died (cell at parent_dir is Empty or OOB), OR
+    //   - it has accumulated SEED_DROPOFF_THRESHOLD energy.
+    // In the threshold case the parent stem is still alive — clear its
+    // children-bit pointing at the now-departing seed.
+    let mut germinations: Vec<(i32, i32, Option<(i32, i32, u8)>)> = Vec::new();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
                 for lx in 0..(CHUNK_EDGE as usize) {
                     let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
                     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    if let Occupant::Seed {
-                        energy,
-                        parent: Some(parent_dir),
-                        ..
-                    } = &chunks[chunk_idx].cells[cell_idx].occupant
-                    {
-                        if *energy >= SEED_DROPOFF_THRESHOLD {
-                            let wx = cx as i32 * edge + lx as i32;
-                            let wy = cy as i32 * edge + ly as i32;
-                            let (dx, dy) = direction_to_delta(*parent_dir);
-                            let parent_x = wx + dx;
-                            let parent_y = wy + dy;
-                            let parent_bit = dir_to_bitmask(opposite_dir(*parent_dir));
-                            dropoffs.push((wx, wy, parent_x, parent_y, parent_bit));
+                    let (energy, parent_dir) =
+                        match &chunks[chunk_idx].cells[cell_idx].occupant {
+                            Occupant::Seed {
+                                energy, parent, ..
+                            } => (*energy, *parent),
+                            _ => continue,
+                        };
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+
+                    let parent_dead = match parent_dir {
+                        Some(dir) => {
+                            let (dx, dy) = direction_to_delta(dir);
+                            let nx = wx + dx;
+                            let ny = wy + dy;
+                            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                                true
+                            } else {
+                                let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                                    + (nx / edge) as usize;
+                                let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                                    + (nx % edge) as usize;
+                                matches!(
+                                    chunks[n_chunk_idx].cells[n_cell_idx].occupant,
+                                    Occupant::Empty
+                                )
+                            }
                         }
+                        None => false,
+                    };
+
+                    let at_threshold = energy >= SEED_DROPOFF_THRESHOLD;
+
+                    if parent_dead || at_threshold {
+                        // Only the threshold case needs to clear the parent
+                        // stem's bit — if the parent is dead it's already gone.
+                        let parent_clear = if at_threshold && !parent_dead {
+                            parent_dir.map(|dir| {
+                                let (dx, dy) = direction_to_delta(dir);
+                                (wx + dx, wy + dy, dir_to_bitmask(opposite_dir(dir)))
+                            })
+                        } else {
+                            None
+                        };
+                        germinations.push((wx, wy, parent_clear));
                     }
                 }
             }
         }
     }
-    for (sx, sy, px, py, bit) in dropoffs {
+    for (sx, sy, parent_clear) in germinations {
+        let (plant, energy, facing, genome) = match cell_at_mut(chunks, chunks_x, sx, sy) {
+            Some(cell) => match &cell.occupant {
+                Occupant::Seed {
+                    plant,
+                    energy,
+                    facing,
+                    genome,
+                    ..
+                } => (*plant, *energy, *facing, genome.clone()),
+                _ => continue,
+            },
+            None => continue,
+        };
         if let Some(seed_cell) = cell_at_mut(chunks, chunks_x, sx, sy) {
-            if let Occupant::Seed { parent, .. } = &mut seed_cell.occupant {
-                *parent = None;
-            }
+            seed_cell.occupant = Occupant::Sprout {
+                plant,
+                energy,
+                facing,
+                genome,
+                parent: None,
+                current_gene: 0,
+            };
         }
-        if let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py) {
-            if let Occupant::Stem { children, .. } = &mut parent_cell.occupant {
-                *children &= !bit;
+        if let Some((px, py, bit)) = parent_clear {
+            if let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py) {
+                if let Occupant::Stem { children, .. } = &mut parent_cell.occupant {
+                    *children &= !bit;
+                }
             }
         }
     }
@@ -2360,17 +2412,24 @@ mod tests {
     }
 
     #[test]
-    fn phase_seed_dropoff_disconnects_at_threshold() {
+    fn phase_seed_germinates_at_threshold() {
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         place_seed_dropoff_fixture(&mut chunks, SEED_DROPOFF_THRESHOLD);
 
         mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
-        match &cell_at(&chunks, chunks_x, 10, 10).occupant {
-            Occupant::Seed { parent, .. } => assert_eq!(*parent, None),
-            other => panic!("expected seed, got {other:?}"),
-        }
+        // Cell where the seed was is no longer a Seed — it germinated into
+        // a Sprout, which then ran phase 6 growth in the same tick. With
+        // ~150 energy and clear surroundings, the default vine grows
+        // successfully so the cell ends up as a Stem (with a new Sprout
+        // in front + side leaves).
+        let occ = &cell_at(&chunks, chunks_x, 10, 10).occupant;
+        assert!(
+            !matches!(occ, Occupant::Seed { .. }),
+            "expected germinated cell (not Seed), got {occ:?}"
+        );
+        // Parent stem's children-bit pointing at the (former) seed cleared.
         match &cell_at(&chunks, chunks_x, 10, 11).occupant {
             Occupant::Stem { children, .. } => {
                 assert_eq!(
@@ -2384,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_seed_dropoff_keeps_below_threshold_connected() {
+    fn phase_seed_below_threshold_with_alive_parent_stays_seed() {
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         // Low enough that even after upkeep + push from the trunk chain,
@@ -2402,6 +2461,47 @@ mod tests {
                 assert_eq!(*children & STEM_CONNECT_NORTH, STEM_CONNECT_NORTH);
             }
             other => panic!("expected stem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_seed_germinates_when_parent_dies() {
+        // Seed with parent direction pointing at an empty cell. Should
+        // germinate even though energy is well below threshold.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Seed {
+                plant: 7,
+                energy: 25, // far below SEED_DROPOFF_THRESHOLD
+                facing: Direction::East,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::South),
+            },
+        );
+        // (10, 11) is left Empty — simulating a parent stem that died last
+        // tick (decomposed into Empty by phase 7).
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        match &cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Sprout {
+                plant,
+                facing,
+                parent,
+                current_gene,
+                ..
+            } => {
+                assert_eq!(*plant, 7, "plant id preserved");
+                assert_eq!(*facing, Direction::East, "facing preserved");
+                assert_eq!(*parent, None);
+                assert_eq!(*current_gene, 0);
+            }
+            other => panic!("expected sprout, got {other:?}"),
         }
     }
 }
