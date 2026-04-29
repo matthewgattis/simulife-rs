@@ -364,8 +364,8 @@ fn mutate_world(
                             }
                             let dir = bit_to_dir(bit);
                             let (dx, dy) = direction_to_delta(dir);
-                            let nx = wrap_coord(wx + dx, max_x);
-                            let ny = wrap_coord(wy + dy, max_y);
+                            let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+                            let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
                             let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
                                 + (nx / edge) as usize;
                             let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
@@ -449,8 +449,8 @@ fn mutate_world(
                     deltas[linear_idx(chunks_x, wx, wy)] -= total_pushed as i32;
                     for dir in targets {
                         let (dx, dy) = direction_to_delta(dir);
-                        let nx = wrap_coord(wx + dx, max_x);
-                        let ny = wrap_coord(wy + dy, max_y);
+                        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+                        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
                         deltas[linear_idx(chunks_x, nx, ny)] += per_target as i32;
                     }
                 }
@@ -506,16 +506,25 @@ fn mutate_world(
                     let parent_dead = match parent_dir {
                         Some(dir) => {
                             let (dx, dy) = direction_to_delta(dir);
-                            let nx = wrap_coord(wx + dx, max_x);
-                            let ny = wrap_coord(wy + dy, max_y);
-                            let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
-                                + (nx / edge) as usize;
-                            let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
-                                + (nx % edge) as usize;
-                            matches!(
-                                chunks[n_chunk_idx].cells[n_cell_idx].occupant,
-                                Occupant::Empty
-                            )
+                            // OOB → parent gone, treat as dead.
+                            match (
+                                in_bounds(wx + dx, max_x),
+                                in_bounds(wy + dy, max_y),
+                            ) {
+                                (Some(nx), Some(ny)) => {
+                                    let n_chunk_idx = (ny / edge) as usize
+                                        * chunks_x as usize
+                                        + (nx / edge) as usize;
+                                    let n_cell_idx = (ny % edge) as usize
+                                        * (CHUNK_EDGE as usize)
+                                        + (nx % edge) as usize;
+                                    matches!(
+                                        chunks[n_chunk_idx].cells[n_cell_idx].occupant,
+                                        Occupant::Empty
+                                    )
+                                }
+                                _ => true,
+                            }
                         }
                         None => false,
                     };
@@ -685,8 +694,8 @@ fn mutate_world(
             Direction::West,
         ] {
             let (dx, dy) = direction_to_delta(d);
-            let nx = wrap_coord(wx + dx, max_x);
-            let ny = wrap_coord(wy + dy, max_y);
+            let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+            let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
             let opp = opposite_dir(d);
             if let Some(neighbor) = cell_at_mut(chunks, chunks_x, nx, ny) {
                 match &mut neighbor.occupant {
@@ -792,8 +801,9 @@ fn cell_has_no_push_target(
     };
     let edge = CHUNK_EDGE as i32;
     let (dx, dy) = direction_to_delta(parent_dir);
-    let nx = wrap_coord(wx + dx, max_x);
-    let ny = wrap_coord(wy + dy, max_y);
+    // Parent direction off the world edge → no parent → orphan.
+    let Some(nx) = in_bounds(wx + dx, max_x) else { return true; };
+    let Some(ny) = in_bounds(wy + dy, max_y) else { return true; };
     let n_chunk_idx = (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
     let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize) + (nx % edge) as usize;
     matches!(
@@ -847,11 +857,12 @@ fn linear_idx(chunks_x: u32, wx: i32, wy: i32) -> usize {
     chunk_idx * CHUNK_AREA + ly * (CHUNK_EDGE as usize) + lx
 }
 
-/// Wrap a world coordinate around the torus. The world has no edges —
-/// going off one side comes out the other. Toxic borders (from
-/// `world::build_world`) are what actually isolate regions.
-fn wrap_coord(c: i32, max: i32) -> i32 {
-    c.rem_euclid(max)
+/// Bounds-check a world coordinate. The world has hard edges — going
+/// off one side returns None and the caller skips that neighbor access.
+/// Toxic borders (from `world::build_world`) are still the main way
+/// regions stay isolated, but the world edge is also a wall.
+fn in_bounds(c: i32, max: i32) -> Option<i32> {
+    if c < 0 || c >= max { None } else { Some(c) }
 }
 
 fn apply_soil_pull(
@@ -874,8 +885,8 @@ fn apply_soil_pull(
             if want == 0 {
                 continue;
             }
-            let nx = wrap_coord(wx + dx, max_x);
-            let ny = wrap_coord(wy + dy, max_y);
+            let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+            let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
             if let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) {
                 let avail = match field {
                     SoilField::Organic => cell.organic,
@@ -925,8 +936,8 @@ fn deposit_kernel(
             if weight == 0 {
                 continue;
             }
-            let nx = wrap_coord(wx + dx, max_x);
-            let ny = wrap_coord(wy + dy, max_y);
+            let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+            let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
             if let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) {
                 cell.organic = cell.organic.saturating_add(weight);
                 let energy_share = (per_unit * weight as u32).min(u16::MAX as u32) as u16;
@@ -1086,8 +1097,8 @@ fn attempt_growth(
             continue;
         }
         let (dx, dy) = direction_to_delta(*dir);
-        let nx = wrap_coord(wx + dx, max_x);
-        let ny = wrap_coord(wy + dy, max_y);
+        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
         let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) else {
             continue;
         };
@@ -1150,8 +1161,8 @@ fn attempt_growth(
             continue;
         };
         let (dx, dy) = direction_to_delta(*dir);
-        let nx = wrap_coord(wx + dx, max_x);
-        let ny = wrap_coord(wy + dy, max_y);
+        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
         if let Some(target) = cell_at_mut(chunks, chunks_x, nx, ny) {
             target.occupant = occ;
             connections |= dir_to_bitmask(*dir);
@@ -1387,12 +1398,11 @@ mod tests {
     }
 
     #[test]
-    fn growth_at_world_edge_wraps_for_front_target() {
-        // World wrap: a sprout at y=0 facing North targets (10, -1) which
-        // wraps to (10, max-1). If that cell is empty, the front sprout is
-        // placed there. (Toxic borders from build_world are what isolate
-        // regions in production; in this test we use a bare empty_world
-        // so wrap is the only effect.)
+    fn growth_at_world_edge_skips_oob_front() {
+        // World has hard edges (no wrap). A sprout at y=0 facing North
+        // has its front target at (10, -1) — out of bounds → skipped.
+        // Sides are still in-bounds and grow leaves; the cell becomes a
+        // children-less stem.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
@@ -1416,11 +1426,11 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Front-front-of-(10,0) wraps to (10, max-1) → new sprout placed.
-        assert!(matches!(
-            cell_at(&chunks, chunks_x, 10, max - 1).occupant,
-            Occupant::Sprout { .. }
-        ));
+        // Center cell: stem with no children (front was OOB).
+        match &cell_at(&chunks, chunks_x, 10, 0).occupant {
+            Occupant::Stem { children, .. } => assert_eq!(*children, 0),
+            other => panic!("expected children-less stem, got {other:?}"),
+        }
         // Sides grew leaves as usual.
         assert!(matches!(
             cell_at(&chunks, chunks_x, 9, 0).occupant,

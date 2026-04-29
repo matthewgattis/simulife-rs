@@ -25,7 +25,7 @@ pub enum Direction {
     West,
 }
 
-pub const GENOME_LEN: usize = 16;
+pub const GENOME_LEN: usize = 32;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotProduct {

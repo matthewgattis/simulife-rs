@@ -13,7 +13,7 @@ const SUNLIT_MARGIN_FRAC: f32 = 0.10;
 const SPROUT_GRID_SPACING: i32 = 6;
 
 /// Thickness in cells of the toxic-organic border ringing each box.
-const TOXIC_BORDER_THICKNESS: u32 = 4;
+const TOXIC_BORDER_THICKNESS: u32 = 2;
 
 /// Organic value seeded into the toxic-border cells. Above
 /// SOIL_ORGANIC_POISON, so any non-Root that ventures in dies. Acts as
