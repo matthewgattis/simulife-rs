@@ -45,12 +45,13 @@ struct Args {
     #[arg(long, requires = "cert_path")]
     key_path: Option<PathBuf>,
 
-    /// World size in chunks (X axis).
-    #[arg(long, default_value_t = 12)]
+    /// World size in chunks (X axis). Default 24 = 2 boxes wide × 12
+    /// chunks per box (each box matches the original single-box size).
+    #[arg(long, default_value_t = 24)]
     world_width: u32,
 
-    /// World size in chunks (Y axis).
-    #[arg(long, default_value_t = 12)]
+    /// World size in chunks (Y axis). Default 24 = 2 boxes tall × 12.
+    #[arg(long, default_value_t = 24)]
     world_height: u32,
 
     /// Simulation tick rate in Hz.
