@@ -121,3 +121,194 @@ fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
     s.push(suffix);
     PathBuf::from(s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::{SimControl, SimState};
+    use protocol::{CHUNK_AREA, Cell, ChunkCoord, Direction, Genome, Occupant};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    fn unique_tmp(name: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ca_persist_{}_{}_{}", name, pid, n))
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(with_extension_suffix(path, "tmp"));
+        let _ = std::fs::remove_file(with_extension_suffix(path, "bak"));
+    }
+
+    fn empty_chunk(cx: i32, cy: i32) -> Chunk {
+        let cells = (0..CHUNK_AREA)
+            .map(|_| Cell {
+                organic: 0,
+                soil_energy: 0,
+                sunlit: false,
+                occupant: Occupant::Empty,
+            })
+            .collect();
+        Chunk {
+            coord: ChunkCoord { x: cx, y: cy },
+            cells,
+        }
+    }
+
+    fn make_snapshot() -> WorldSnapshot {
+        let mut chunks = vec![empty_chunk(0, 0)];
+        chunks[0].cells[0].organic = 123;
+        chunks[0].cells[5].occupant = Occupant::Sprout {
+            plant: 7,
+            energy: 250,
+            facing: Direction::East,
+            genome: Box::new(Genome::default_vine()),
+            parent: Some(Direction::West),
+            current_gene: 4,
+        };
+        WorldSnapshot {
+            chunks_x: 1,
+            chunks_y: 1,
+            next_plant_id: 42,
+            current_tick: 99,
+            chunks,
+        }
+    }
+
+    fn build_state(snap: &WorldSnapshot) -> SimState {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        SimState {
+            chunks_x: snap.chunks_x,
+            chunks_y: snap.chunks_y,
+            world: Mutex::new(snap.chunks.clone()),
+            tick_tx: tx,
+            next_plant_id: AtomicU32::new(snap.next_plant_id),
+            current_tick: AtomicU64::new(snap.current_tick),
+            control: Mutex::new(SimControl {
+                paused: true,
+                tick_hz: 10,
+                step_pending: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_save_and_load() {
+        let path = unique_tmp("roundtrip");
+        cleanup(&path);
+
+        let snap = make_snapshot();
+        let state = build_state(&snap);
+        save_world(&path, &state).expect("save");
+
+        let loaded = load_world(&path).expect("load");
+        assert_eq!(loaded.chunks_x, snap.chunks_x);
+        assert_eq!(loaded.chunks_y, snap.chunks_y);
+        assert_eq!(loaded.next_plant_id, snap.next_plant_id);
+        assert_eq!(loaded.current_tick, snap.current_tick);
+        assert_eq!(loaded.chunks.len(), 1);
+        assert_eq!(loaded.chunks[0].cells[0].organic, 123);
+        match &loaded.chunks[0].cells[5].occupant {
+            Occupant::Sprout {
+                plant,
+                energy,
+                current_gene,
+                genome,
+                ..
+            } => {
+                assert_eq!(*plant, 7);
+                assert_eq!(*energy, 250);
+                assert_eq!(*current_gene, 4);
+                assert_eq!(genome.genes.len(), protocol::GENOME_LEN);
+            }
+            other => panic!("expected sprout, got {other:?}"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_writes_zstd_magic_header() {
+        let path = unique_tmp("magic");
+        cleanup(&path);
+
+        let snap = make_snapshot();
+        let state = build_state(&snap);
+        save_world(&path, &state).expect("save");
+
+        let raw = std::fs::read(&path).expect("read");
+        assert_eq!(&raw[..4], &ZSTD_MAGIC, "save output should be zstd-framed");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_rotates_existing_world_into_bak() {
+        let path = unique_tmp("rotate");
+        cleanup(&path);
+
+        let snap = make_snapshot();
+        let state = build_state(&snap);
+        save_world(&path, &state).expect("first save");
+        // Mutate tick to make the second save distinguishable.
+        state.current_tick.store(101, Ordering::Relaxed);
+        save_world(&path, &state).expect("second save");
+
+        let bak = with_extension_suffix(&path, "bak");
+        assert!(bak.exists(), "expected backup at {bak:?}");
+        let live = load_world(&path).expect("load live");
+        assert_eq!(live.current_tick, 101);
+        let backup = load_world(&bak).expect("load bak");
+        assert_eq!(backup.current_tick, 99);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_handles_uncompressed_msgpack() {
+        let path = unique_tmp("uncompressed");
+        cleanup(&path);
+
+        let snap = make_snapshot();
+        let raw = rmp_serde::to_vec(&snap).expect("encode");
+        std::fs::write(&path, &raw).expect("write");
+        let loaded = load_world(&path).expect("load");
+        assert_eq!(loaded.chunks_x, snap.chunks_x);
+        assert_eq!(loaded.next_plant_id, snap.next_plant_id);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_or_build_returns_default_when_path_missing() {
+        // No path provided → build from defaults.
+        let snap = load_or_build(None, 2, 2).expect("build default");
+        assert_eq!(snap.chunks_x, 2);
+        assert_eq!(snap.chunks_y, 2);
+        assert_eq!(snap.next_plant_id, 1);
+        assert_eq!(snap.current_tick, 0);
+
+        // Path that doesn't exist → also build, not error.
+        let nowhere = unique_tmp("doesnotexist");
+        cleanup(&nowhere);
+        let snap = load_or_build(Some(&nowhere), 1, 1).expect("missing path");
+        assert_eq!(snap.chunks_x, 1);
+        assert_eq!(snap.next_plant_id, 1);
+    }
+
+    #[test]
+    fn with_extension_suffix_appends_dot_and_label() {
+        let p = Path::new("/tmp/world.bin");
+        assert_eq!(
+            with_extension_suffix(p, "tmp"),
+            PathBuf::from("/tmp/world.bin.tmp")
+        );
+        assert_eq!(
+            with_extension_suffix(p, "bak"),
+            PathBuf::from("/tmp/world.bin.bak")
+        );
+    }
+}
