@@ -16,3 +16,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 zstd.workspace = true
+rand.workspace = true

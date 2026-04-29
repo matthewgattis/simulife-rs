@@ -25,9 +25,61 @@ pub enum Direction {
     West,
 }
 
+pub const GENOME_LEN: usize = 16;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotProduct {
+    Nothing,
+    Leaf,
+    Root,
+    Antenna,
+    Seed,
+    Sprout,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gene {
+    pub front: SlotProduct,
+    pub left: SlotProduct,
+    pub right: SlotProduct,
+    /// Next-gene index. Out-of-range values are taken modulo `GENOME_LEN` so
+    /// the gene graph is always traversable.
+    pub next: u8,
+}
+
+impl Default for Gene {
+    fn default() -> Self {
+        Self {
+            front: SlotProduct::Nothing,
+            left: SlotProduct::Nothing,
+            right: SlotProduct::Nothing,
+            next: 0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Genome {
-    pub bytes: Vec<u8>,
+    pub genes: Vec<Gene>,
+}
+
+impl Genome {
+    /// Default starter: gene 0 is the "vine" (front sprout, left/right leaves,
+    /// next loops back to 0); remaining genes are dormant Nothing-slots that
+    /// also point at gene 0. Mutation activates the dormant genes over time.
+    pub fn default_vine() -> Self {
+        let mut genes = Vec::with_capacity(GENOME_LEN);
+        genes.push(Gene {
+            front: SlotProduct::Sprout,
+            left: SlotProduct::Leaf,
+            right: SlotProduct::Leaf,
+            next: 0,
+        });
+        while genes.len() < GENOME_LEN {
+            genes.push(Gene::default());
+        }
+        Self { genes }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -62,6 +114,7 @@ pub enum Occupant {
         facing: Direction,
         genome: Box<Genome>,
         parent: Option<Direction>,
+        current_gene: u8,
     },
     Seed {
         plant: PlantId,
@@ -137,8 +190,9 @@ mod tests {
                 plant: 1,
                 energy: 100,
                 facing: Direction::North,
-                genome: Box::new(Genome { bytes: vec![1, 2, 3] }),
+                genome: Box::new(Genome::default_vine()),
                 parent: Some(Direction::South),
+                current_gene: 3,
             },
         };
         cells[42] = Cell {
@@ -149,7 +203,7 @@ mod tests {
                 plant: 1,
                 energy: 5,
                 facing: Direction::West,
-                genome: Box::new(Genome { bytes: vec![1, 2, 3] }),
+                genome: Box::new(Genome::default_vine()),
                 parent: None,
             },
         };
@@ -182,6 +236,7 @@ mod tests {
             facing,
             ref genome,
             parent,
+            current_gene,
         } = decoded.cells[5].occupant
         else {
             panic!("expected sprout at index 5");
@@ -189,8 +244,9 @@ mod tests {
         assert_eq!(plant, 1);
         assert_eq!(energy, 100);
         assert_eq!(facing, Direction::North);
-        assert_eq!(genome.bytes, vec![1, 2, 3]);
+        assert_eq!(genome.genes.len(), GENOME_LEN);
         assert_eq!(parent, Some(Direction::South));
+        assert_eq!(current_gene, 3);
         assert_eq!(decoded.cells[5].organic, 12);
         assert!(!decoded.cells[5].sunlit);
 

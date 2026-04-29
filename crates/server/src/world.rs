@@ -36,7 +36,7 @@ pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
 pub fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
     let plant = 1u32;
     let energy = 200u16;
-    let bare_genome = || Box::new(Genome { bytes: Vec::new() });
+    let default_genome = || Box::new(Genome::default_vine());
 
     // Inert showcase row (parent: None, children: 0). Existing cells are
     // visually distinct but disconnected from any plant tree.
@@ -122,8 +122,9 @@ pub fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant,
                 energy,
                 facing: Direction::North,
-                genome: bare_genome(),
+                genome: default_genome(),
                 parent: None,
+                current_gene: 0,
             },
         ),
         (
@@ -133,7 +134,7 @@ pub fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant,
                 energy,
                 facing: Direction::East,
-                genome: bare_genome(),
+                genome: default_genome(),
                 parent: None,
             },
         ),
@@ -166,8 +167,9 @@ pub fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
                 plant: plant2,
                 energy: 100,
                 facing: Direction::North,
-                genome: bare_genome(),
+                genome: default_genome(),
                 parent: Some(Direction::South),
+                current_gene: 0,
             },
         ),
         (

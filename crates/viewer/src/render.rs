@@ -962,10 +962,12 @@ fn occupant_label(occ: &Occupant) -> String {
             energy,
             facing,
             parent,
+            current_gene,
             ..
         } => format!(
-            "sprout (plant {plant}, energy {energy}, facing {facing:?}, parent {})",
-            parent_label(*parent)
+            "sprout (plant {plant}, energy {energy}, facing {facing:?}, parent {}, gene {})",
+            parent_label(*parent),
+            current_gene
         ),
         Occupant::Seed {
             plant,

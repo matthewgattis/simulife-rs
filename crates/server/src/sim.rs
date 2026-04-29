@@ -7,10 +7,11 @@ use std::{
 };
 
 use protocol::{
-    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, Direction, Energy, Genome, Occupant,
+    CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, Direction, Energy, Gene, Genome, Occupant,
     STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
-    ServerMessage,
+    ServerMessage, SlotProduct,
 };
+use rand::Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -18,8 +19,18 @@ const LEAF_PHOTOSYNTHESIS: Energy = 5;
 const UPKEEP_DEFAULT: Energy = 1;
 const UPKEEP_SEED: Energy = 0;
 const UPKEEP_SPROUT: Energy = 3;
-const GROWTH_THRESHOLD: Energy = 50;
-const GROWTH_CHILD_ENERGY: Energy = 10;
+
+/// Per-slot spawn cost. Sprout drains the sum of these for whatever it
+/// produces in a generation. Each new cell starts with its slot's cost as
+/// its initial energy.
+const COST_SPROUT: Energy = 20;
+const COST_LEAF: Energy = 5;
+const COST_ROOT: Energy = 5;
+const COST_ANTENNA: Energy = 5;
+const COST_SEED: Energy = 30;
+
+/// Per-field probability of mutating a single field at any copy site.
+const MUTATION_RATE: f32 = 0.02;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -131,8 +142,9 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
         plant,
         energy: 100,
         facing,
-        genome: Box::new(Genome { bytes: Vec::new() }),
+        genome: Box::new(Genome::default_vine()),
         parent: None,
+        current_gene: 0,
     };
     info!(x, y, plant, ?facing, "sprout spawned");
 }
@@ -333,8 +345,8 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
         }
     }
 
-    // Phase 5: growth — sprouts above GROWTH_THRESHOLD differentiate into
-    // a stem and spawn new cells in front (sprout) + left/right (leaves).
+    // Phase 5: growth — sprouts execute their current gene if energy covers
+    // the slot costs and all desired targets are Empty.
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
@@ -347,18 +359,34 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
                             energy,
                             facing,
                             parent,
-                            ..
-                        } if *energy > GROWTH_THRESHOLD => {
-                            Some((*plant, *energy, *facing, *parent))
-                        }
+                            current_gene,
+                            genome,
+                        } => Some((
+                            *plant,
+                            *energy,
+                            *facing,
+                            *parent,
+                            *current_gene,
+                            genome.clone(),
+                        )),
                         _ => None,
                     };
-                    if let Some((plant, energy, facing, parent)) = info {
+                    if let Some((plant, energy, facing, parent, current_gene, genome)) = info {
                         let wx = cx as i32 * edge + lx as i32;
                         let wy = cy as i32 * edge + ly as i32;
                         attempt_growth(
-                            chunks, chunks_x, max_x, max_y, wx, wy, plant, energy, facing,
+                            chunks,
+                            chunks_x,
+                            max_x,
+                            max_y,
+                            wx,
+                            wy,
+                            plant,
+                            energy,
+                            facing,
                             parent,
+                            current_gene,
+                            &genome,
                         );
                     }
                 }
@@ -643,10 +671,61 @@ fn upkeep_for(occ: &Occupant) -> Energy {
     }
 }
 
-#[derive(Clone, Copy)]
-enum GrowthChild {
-    Sprout,
-    Leaf,
+fn slot_cost(slot: SlotProduct) -> Energy {
+    match slot {
+        SlotProduct::Nothing => 0,
+        SlotProduct::Leaf => COST_LEAF,
+        SlotProduct::Root => COST_ROOT,
+        SlotProduct::Antenna => COST_ANTENNA,
+        SlotProduct::Seed => COST_SEED,
+        SlotProduct::Sprout => COST_SPROUT,
+    }
+}
+
+fn make_slot_occupant(
+    slot: SlotProduct,
+    plant: u32,
+    facing: Direction,
+    parent: Direction,
+    parent_genome: &Genome,
+    next_gene: u8,
+) -> Option<Occupant> {
+    let parent_back = Some(opposite_dir(parent));
+    let _ = parent;
+    Some(match slot {
+        SlotProduct::Nothing => return None,
+        SlotProduct::Leaf => Occupant::Leaf {
+            plant,
+            energy: COST_LEAF,
+            facing,
+            parent: parent_back,
+        },
+        SlotProduct::Root => Occupant::Root {
+            plant,
+            energy: COST_ROOT,
+            parent: parent_back,
+        },
+        SlotProduct::Antenna => Occupant::Antenna {
+            plant,
+            energy: COST_ANTENNA,
+            parent: parent_back,
+        },
+        SlotProduct::Seed => Occupant::Seed {
+            plant,
+            energy: COST_SEED,
+            facing,
+            genome: Box::new(mutate_genome(parent_genome)),
+            parent: parent_back,
+        },
+        SlotProduct::Sprout => Occupant::Sprout {
+            plant,
+            energy: COST_SPROUT,
+            facing,
+            genome: Box::new(mutate_genome(parent_genome)),
+            parent: parent_back,
+            current_gene: next_gene,
+        },
+    })
 }
 
 fn attempt_growth(
@@ -660,58 +739,80 @@ fn attempt_growth(
     sprout_energy: Energy,
     facing: Direction,
     parent: Option<Direction>,
+    current_gene: u8,
+    genome: &Genome,
 ) {
+    if genome.genes.is_empty() {
+        return;
+    }
+    let gene = genome.genes[(current_gene as usize) % genome.genes.len()];
+    let next_gene = (gene.next as usize % genome.genes.len()) as u8;
+
     let plan = [
-        (facing, GrowthChild::Sprout),
-        (rotate_left(facing), GrowthChild::Leaf),
-        (rotate_right(facing), GrowthChild::Leaf),
+        (facing, gene.front),
+        (rotate_left(facing), gene.left),
+        (rotate_right(facing), gene.right),
     ];
 
-    let mut connections = 0u8;
-    let mut children = 0u8;
-    let mut grew = false;
+    // Cost = sum of slot costs.
+    let mut total_cost: Energy = 0;
+    for (_dir, slot) in plan {
+        total_cost = total_cost.saturating_add(slot_cost(slot));
+    }
+    if sprout_energy <= total_cost {
+        return; // not enough energy yet
+    }
 
-    for (dir, kind) in plan {
+    // Check all desired targets are Empty.
+    for (dir, slot) in plan {
+        if matches!(slot, SlotProduct::Nothing) {
+            continue;
+        }
         let (dx, dy) = direction_to_delta(dir);
         let nx = wx + dx;
         let ny = wy + dy;
         if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+            return; // any blocker aborts the whole growth
+        }
+        let neighbor = match cell_at_mut(chunks, chunks_x, nx, ny) {
+            Some(c) => c,
+            None => return,
+        };
+        if !matches!(neighbor.occupant, Occupant::Empty) {
+            return;
+        }
+    }
+
+    // All clear — spawn cells. Track which directions become children
+    // (sprouts only) and visual connections (every spawned slot).
+    let mut connections = 0u8;
+    let mut children = 0u8;
+    let mut grew = false;
+
+    for (dir, slot) in plan {
+        let Some(occ) = make_slot_occupant(slot, plant, dir, dir, genome, next_gene) else {
             continue;
-        }
-        let target = match cell_at_mut(chunks, chunks_x, nx, ny) {
-            Some(c) if matches!(c.occupant, Occupant::Empty) => c,
-            _ => continue,
         };
-        let opposite = opposite_dir(dir);
-        target.occupant = match kind {
-            GrowthChild::Sprout => Occupant::Sprout {
-                plant,
-                energy: GROWTH_CHILD_ENERGY,
-                facing: dir,
-                genome: Box::new(Genome { bytes: Vec::new() }),
-                parent: Some(opposite),
-            },
-            GrowthChild::Leaf => Occupant::Leaf {
-                plant,
-                energy: GROWTH_CHILD_ENERGY,
-                facing: dir,
-                parent: Some(opposite),
-            },
-        };
-        connections |= dir_to_bitmask(dir);
-        if matches!(kind, GrowthChild::Sprout) {
-            children |= dir_to_bitmask(dir);
+        let (dx, dy) = direction_to_delta(dir);
+        let nx = wx + dx;
+        let ny = wy + dy;
+        if let Some(target) = cell_at_mut(chunks, chunks_x, nx, ny) {
+            target.occupant = occ;
+            connections |= dir_to_bitmask(dir);
+            if matches!(slot, SlotProduct::Sprout) {
+                children |= dir_to_bitmask(dir);
+            }
+            grew = true;
         }
-        grew = true;
     }
 
     if grew {
-        // Visually connect back to the parent stem too, so the new stem reads
-        // as part of the existing trunk rather than a disconnected hub.
+        // Visually connect back to the parent stem so the new stem reads as
+        // part of the existing trunk.
         if let Some(parent_dir) = parent {
             connections |= dir_to_bitmask(parent_dir);
         }
-        let new_energy = sprout_energy.saturating_sub(GROWTH_THRESHOLD);
+        let new_energy = sprout_energy.saturating_sub(total_cost);
         if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             self_cell.occupant = Occupant::Stem {
                 plant,
@@ -721,6 +822,42 @@ fn attempt_growth(
                 children,
             };
         }
+    }
+}
+
+/// Per-field mutation pass over a genome. Each gene's slots and `next` each
+/// roll independently against `MUTATION_RATE`. Called at every copy site:
+/// sprout-produces-sub-sprouts, sprout-produces-seed, seed-germinates.
+pub fn mutate_genome(g: &Genome) -> Genome {
+    let mut rng = rand::thread_rng();
+    let len = g.genes.len();
+    let mut new_genes: Vec<Gene> = g.genes.clone();
+    for gene in new_genes.iter_mut() {
+        if rng.r#gen::<f32>() < MUTATION_RATE {
+            gene.front = random_slot(&mut rng);
+        }
+        if rng.r#gen::<f32>() < MUTATION_RATE {
+            gene.left = random_slot(&mut rng);
+        }
+        if rng.r#gen::<f32>() < MUTATION_RATE {
+            gene.right = random_slot(&mut rng);
+        }
+        if rng.r#gen::<f32>() < MUTATION_RATE {
+            // Always wraps via modulo at read time, but keep it tidy.
+            gene.next = (rng.r#gen::<usize>() % len.max(1)) as u8;
+        }
+    }
+    Genome { genes: new_genes }
+}
+
+fn random_slot(rng: &mut impl Rng) -> SlotProduct {
+    match rng.gen_range(0u8..6) {
+        0 => SlotProduct::Nothing,
+        1 => SlotProduct::Leaf,
+        2 => SlotProduct::Root,
+        3 => SlotProduct::Antenna,
+        4 => SlotProduct::Seed,
+        _ => SlotProduct::Sprout,
     }
 }
 
