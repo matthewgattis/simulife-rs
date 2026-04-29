@@ -5,12 +5,13 @@ use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, ClientMessage, Direction, Occupant,
     STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
 };
+use rand::Rng;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 use wgpu::util::DeviceExt;
 use winit::{event::WindowEvent, window::Window};
 
-use crate::app::{Camera, ContextMenu, NetworkStatus};
+use crate::app::{Camera, ContextMenu, NetworkStatus, RegenDialog};
 
 const MSAA_SAMPLES: u32 = 4;
 
@@ -154,6 +155,7 @@ impl RenderState {
         sim_tick: u64,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
+        regen_dialog: &mut Option<RegenDialog>,
         outgoing: &UnboundedSender<ClientMessage>,
     ) {
         let frame = match self.surface.get_current_texture() {
@@ -195,9 +197,11 @@ impl RenderState {
                 sim_paused,
                 sim_tick_hz,
                 sim_tick,
+                regen_dialog,
                 outgoing,
             );
             draw_context_menu(ctx, context_menu, chunks, outgoing);
+            draw_regen_dialog(ctx, regen_dialog, outgoing);
         });
 
         self.chunk_renderer.upload_world(&self.queue, *layer_flags);
@@ -776,6 +780,7 @@ fn draw_ui(
     sim_paused: &mut bool,
     sim_tick_hz: &mut u32,
     sim_tick: u64,
+    regen_dialog: &mut Option<RegenDialog>,
     outgoing: &UnboundedSender<ClientMessage>,
 ) {
     egui::Window::new("Status")
@@ -803,7 +808,14 @@ fn draw_ui(
                     ui.label(format!(
                         "World: {world_chunks_x} × {world_chunks_y} chunks"
                     ));
-                    ui.label(format!("Seed: {seed:#018x}"));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Seed: {seed:#018x}"));
+                        if ui.button("Regenerate...").clicked() {
+                            *regen_dialog = Some(RegenDialog {
+                                seed_text: format!("{seed:#018x}"),
+                            });
+                        }
+                    });
                 }
             }
             ui.separator();
@@ -910,6 +922,74 @@ fn draw_context_menu(
                 }
             });
         });
+}
+
+fn draw_regen_dialog(
+    ctx: &egui::Context,
+    regen_dialog: &mut Option<RegenDialog>,
+    outgoing: &UnboundedSender<ClientMessage>,
+) {
+    let Some(dialog) = regen_dialog.as_mut() else {
+        return;
+    };
+    let parsed = parse_seed(&dialog.seed_text);
+    let mut close = false;
+    let mut submit = false;
+    let mut randomize = false;
+
+    egui::Window::new("Regenerate world")
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label("Enter a u64 seed (decimal or 0x-hex):");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut dialog.seed_text)
+                        .desired_width(220.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.button("🎲 Random").clicked() {
+                    randomize = true;
+                }
+            });
+            if parsed.is_none() {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Cannot parse as u64.");
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(parsed.is_some(), egui::Button::new("Generate"))
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if randomize {
+        dialog.seed_text = format!("{:#018x}", rand::thread_rng().r#gen::<u64>());
+    } else if submit {
+        if let Some(seed) = parsed {
+            let _ = outgoing.send(ClientMessage::RegenerateWorld { seed });
+            close = true;
+        }
+    }
+    if close {
+        *regen_dialog = None;
+    }
+}
+
+fn parse_seed(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
 }
 
 fn cell_details_ui(ui: &mut egui::Ui, cell: &Cell) {
@@ -1151,6 +1231,21 @@ mod tests {
         assert!(!neighbor_present(&chunks, &lookup, 0, 0));
         // Outside any known chunk → false.
         assert!(!neighbor_present(&chunks, &lookup, -1, -1));
+    }
+
+    #[test]
+    fn parse_seed_accepts_decimal_and_hex() {
+        assert_eq!(parse_seed("0"), Some(0));
+        assert_eq!(parse_seed("42"), Some(42));
+        assert_eq!(parse_seed("  42  "), Some(42));
+        assert_eq!(parse_seed("0x10"), Some(16));
+        assert_eq!(parse_seed("0X10"), Some(16));
+        assert_eq!(parse_seed("0xDEADBEEF"), Some(0xDEADBEEF));
+        assert_eq!(parse_seed("0xFFFF_FFFF_FFFF_FFFF"), None); // underscores not stripped
+        assert_eq!(parse_seed("0xffffffffffffffff"), Some(u64::MAX));
+        assert_eq!(parse_seed(""), None);
+        assert_eq!(parse_seed("not a number"), None);
+        assert_eq!(parse_seed("0xZZZ"), None);
     }
 
     #[test]

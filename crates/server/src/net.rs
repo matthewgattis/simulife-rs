@@ -84,6 +84,9 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
             ctrl.tick_hz = hz;
             info!(tick_hz = hz, "tick rate changed");
         }
+        ClientMessage::RegenerateWorld { seed } => {
+            sim::regenerate_world(&state, seed);
+        }
         other => warn!(?other, "unexpected message on client uni stream"),
     }
     Ok(())
@@ -128,7 +131,7 @@ async fn handle_stream(
                 paused,
                 tick_hz,
                 tick: state.current_tick.load(Ordering::Relaxed),
-                seed: state.seed,
+                seed: state.seed.load(Ordering::Relaxed),
             })
         }
         ClientMessage::Subscribe => {
@@ -139,7 +142,8 @@ async fn handle_stream(
         ClientMessage::SpawnSprout { .. }
         | ClientMessage::SetPaused(_)
         | ClientMessage::Step
-        | ClientMessage::SetTickHz(_) => {
+        | ClientMessage::SetTickHz(_)
+        | ClientMessage::RegenerateWorld { .. } => {
             warn!("control / spawn message arrived on bidi stream; expected on uni");
             None
         }

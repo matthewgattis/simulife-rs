@@ -147,6 +147,7 @@ pub enum ClientMessage {
     SetPaused(bool),
     Step,
     SetTickHz(u32),
+    RegenerateWorld { seed: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -333,6 +334,9 @@ mod tests {
         assert_client_msg_roundtrips(ClientMessage::SetPaused(false));
         assert_client_msg_roundtrips(ClientMessage::Step);
         assert_client_msg_roundtrips(ClientMessage::SetTickHz(60));
+        assert_client_msg_roundtrips(ClientMessage::RegenerateWorld {
+            seed: 0xDEAD_BEEF_CAFE_BABE,
+        });
     }
 
     fn roundtrip_occupant(occ: Occupant) -> Occupant {

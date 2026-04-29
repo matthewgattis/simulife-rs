@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
             tick_hz: args.tick_hz.max(1),
             step_pending: 0,
         }),
-        seed,
+        seed: AtomicU64::new(seed),
         rng: std::sync::Mutex::new(rng),
     });
 

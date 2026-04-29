@@ -46,6 +46,13 @@ pub struct ContextMenu {
     pub screen_pos: glam::Vec2,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegenDialog {
+    /// The seed text the user is editing. Accepts decimal or `0x`-prefixed
+    /// hex; parsing happens at submit time.
+    pub seed_text: String,
+}
+
 impl Camera {
     pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
         let cells_y = self.cells_visible_y.max(1.0);
@@ -80,6 +87,7 @@ pub struct App {
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
     context_menu: Option<ContextMenu>,
+    regen_dialog: Option<RegenDialog>,
     server_addr: SocketAddr,
     outgoing: UnboundedSender<ClientMessage>,
     pending_outgoing_rx: Option<UnboundedReceiver<ClientMessage>>,
@@ -112,6 +120,7 @@ impl App {
             dragging: false,
             last_cursor: None,
             context_menu: None,
+            regen_dialog: None,
             server_addr,
             outgoing: outgoing_tx,
             pending_outgoing_rx: Some(outgoing_rx),
@@ -316,6 +325,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sim_tick,
                     self.last_cursor,
                     &mut self.context_menu,
+                    &mut self.regen_dialog,
                     &self.outgoing,
                 );
             }

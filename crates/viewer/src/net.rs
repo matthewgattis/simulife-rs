@@ -109,6 +109,28 @@ async fn run_session(
                         debug!(count = chunks.len(), tick, "tick chunk batch");
                         let _ = proxy.send_event(UserEvent::Chunks { tick, chunks });
                     }
+                    ServerMessage::Welcome {
+                        world_chunks_x,
+                        world_chunks_y,
+                        paused,
+                        tick_hz,
+                        tick,
+                        seed,
+                    } => {
+                        // Server pushes a fresh Welcome after a regenerate
+                        // so connected viewers refresh seed/tick state.
+                        debug!(seed, tick, "world regenerated");
+                        let _ = proxy.send_event(UserEvent::Network(
+                            NetworkStatus::Connected {
+                                world_chunks_x,
+                                world_chunks_y,
+                                paused,
+                                tick_hz,
+                                tick,
+                                seed,
+                            },
+                        ));
+                    }
                     other => warn!(?other, "unexpected push message"),
                 }
             }

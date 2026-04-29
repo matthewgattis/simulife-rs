@@ -61,7 +61,7 @@ pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
         next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
         current_tick: state.current_tick.load(Ordering::Relaxed),
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
-        seed: Some(state.seed),
+        seed: Some(state.seed.load(Ordering::Relaxed)),
         rng: Some(state.rng.lock().expect("rng lock poisoned").clone()),
     };
     let raw = rmp_serde::to_vec(&snapshot)?;
@@ -210,7 +210,7 @@ mod tests {
                 tick_hz: 10,
                 step_pending: 0,
             }),
-            seed,
+            seed: AtomicU64::new(seed),
             rng: Mutex::new(
                 snap.rng
                     .clone()

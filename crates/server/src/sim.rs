@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use rand::SeedableRng;
+
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, Direction, Energy, Gene, Genome, Occupant,
     STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
@@ -57,9 +59,9 @@ pub struct SimState {
     pub next_plant_id: AtomicU32,
     pub current_tick: AtomicU64,
     pub control: std::sync::Mutex<SimControl>,
-    /// Seed used to initialize `rng`. Stable identifier for the run; useful
-    /// for reproducing simulations and surfacing in the viewer.
-    pub seed: u64,
+    /// Current seed. AtomicU64 so `regenerate_world` can update it without
+    /// taking a write lock on SimState — readers (e.g., Welcome) just load.
+    pub seed: AtomicU64,
     pub rng: std::sync::Mutex<ChaCha12Rng>,
 }
 
@@ -124,6 +126,51 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
             }
             Err(e) => error!("serialize tick failed: {e:#}"),
         }
+    }
+}
+
+/// Wipe the world, reseed the RNG, reset tick + plant id, and broadcast a
+/// fresh Welcome + ChunkBatch so connected viewers refresh in place. Holds
+/// the world + rng mutexes for the swap; safe to call between sim ticks.
+pub fn regenerate_world(state: &SimState, seed: u64) {
+    let chunks_x = state.chunks_x;
+    let chunks_y = state.chunks_y;
+
+    let mut new_chunks = crate::world::build_world(chunks_x, chunks_y);
+    crate::world::place_showcase(&mut new_chunks, chunks_x);
+
+    {
+        let mut world = state.world.lock().expect("sim lock poisoned");
+        let mut rng = state.rng.lock().expect("rng lock poisoned");
+        *world = new_chunks.clone();
+        *rng = ChaCha12Rng::seed_from_u64(seed);
+    }
+    state.seed.store(seed, Ordering::Relaxed);
+    state.next_plant_id.store(1, Ordering::Relaxed);
+    state.current_tick.store(0, Ordering::Relaxed);
+    info!(seed, "world regenerated");
+
+    let (paused, tick_hz) = {
+        let ctrl = state.control.lock().expect("control poisoned");
+        (ctrl.paused, ctrl.tick_hz)
+    };
+    let welcome = ServerMessage::Welcome {
+        world_chunks_x: chunks_x,
+        world_chunks_y: chunks_y,
+        paused,
+        tick_hz,
+        tick: 0,
+        seed,
+    };
+    if let Ok(bytes) = protocol::encode_server_message(&welcome) {
+        let _ = state.tick_tx.send(Arc::new(bytes));
+    }
+    let batch = ServerMessage::ChunkBatch {
+        tick: 0,
+        chunks: new_chunks,
+    };
+    if let Ok(bytes) = protocol::encode_server_message(&batch) {
+        let _ = state.tick_tx.send(Arc::new(bytes));
     }
 }
 
