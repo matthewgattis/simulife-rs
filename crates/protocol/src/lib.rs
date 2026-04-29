@@ -175,13 +175,21 @@ const SERVER_MSG_ZSTD_LEVEL: i32 = 1;
 /// Encode a `ServerMessage` for the wire: msgpack, then zstd. Symmetric
 /// with [`decode_server_message`].
 pub fn encode_server_message(msg: &ServerMessage) -> std::io::Result<Vec<u8>> {
-    let raw = rmp_serde::to_vec(msg).map_err(std::io::Error::other)?;
+    let raw = {
+        let _span = tracing::info_span!("encode_msgpack").entered();
+        rmp_serde::to_vec(msg).map_err(std::io::Error::other)?
+    };
+    let _span = tracing::info_span!("encode_zstd", raw_bytes = raw.len()).entered();
     zstd::encode_all(&raw[..], SERVER_MSG_ZSTD_LEVEL)
 }
 
 /// Decode a `ServerMessage` from the wire: zstd, then msgpack.
 pub fn decode_server_message(buf: &[u8]) -> std::io::Result<ServerMessage> {
-    let raw = zstd::decode_all(buf)?;
+    let raw = {
+        let _span = tracing::info_span!("decode_zstd", wire_bytes = buf.len()).entered();
+        zstd::decode_all(buf)?
+    };
+    let _span = tracing::info_span!("decode_msgpack", raw_bytes = raw.len()).entered();
     rmp_serde::from_slice(&raw).map_err(std::io::Error::other)
 }
 
