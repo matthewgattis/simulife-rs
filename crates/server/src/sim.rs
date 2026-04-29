@@ -754,65 +754,81 @@ fn attempt_growth(
         (rotate_right(facing), gene.right),
     ];
 
-    // Cost = sum of slot costs.
-    let mut total_cost: Energy = 0;
-    for (_dir, slot) in plan {
-        total_cost = total_cost.saturating_add(slot_cost(slot));
-    }
-    if sprout_energy <= total_cost {
-        return; // not enough energy yet
-    }
-
-    // Check all desired targets are Empty.
-    for (dir, slot) in plan {
+    // Walk the plan and figure out which slots are *actually* growable: the
+    // slot has to be a real product (not Nothing) AND its target cell has to
+    // be in-bounds AND Empty.
+    let mut viable: [bool; 3] = [false; 3];
+    for (i, (dir, slot)) in plan.iter().enumerate() {
         if matches!(slot, SlotProduct::Nothing) {
             continue;
         }
-        let (dx, dy) = direction_to_delta(dir);
+        let (dx, dy) = direction_to_delta(*dir);
         let nx = wx + dx;
         let ny = wy + dy;
         if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
-            return; // any blocker aborts the whole growth
+            continue;
         }
-        let neighbor = match cell_at_mut(chunks, chunks_x, nx, ny) {
-            Some(c) => c,
-            None => return,
-        };
-        if !matches!(neighbor.occupant, Occupant::Empty) {
-            return;
+        let cleared = matches!(
+            cell_at_mut(chunks, chunks_x, nx, ny).map(|c| &c.occupant),
+            Some(Occupant::Empty)
+        );
+        if cleared {
+            viable[i] = true;
         }
     }
 
-    // All clear — spawn cells. Track which directions become children
-    // (sprouts only) and visual connections (every spawned slot).
+    // No slot can produce anything — sprout has nowhere to grow. Die in
+    // place: deposit organic and become Empty. Keeps trapped sprouts (e.g.
+    // pinned at the world edge with all sides blocked) from accumulating
+    // energy forever.
+    if !viable.iter().any(|v| *v) {
+        deposit_kernel(chunks, chunks_x, wx, wy, max_x, max_y, &DEATH_DEPOSIT_KERNEL);
+        if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
+            self_cell.occupant = Occupant::Empty;
+        }
+        return;
+    }
+
+    // Cost = sum over the slots that will actually spawn.
+    let effective_cost: Energy = plan
+        .iter()
+        .zip(viable.iter())
+        .filter(|(_, v)| **v)
+        .map(|((_, slot), _)| slot_cost(*slot))
+        .sum();
+    if sprout_energy <= effective_cost {
+        return; // wait for more energy
+    }
+
     let mut connections = 0u8;
     let mut children = 0u8;
     let mut grew = false;
 
-    for (dir, slot) in plan {
-        let Some(occ) = make_slot_occupant(slot, plant, dir, dir, genome, next_gene) else {
+    for (i, (dir, slot)) in plan.iter().enumerate() {
+        if !viable[i] {
+            continue;
+        }
+        let Some(occ) = make_slot_occupant(*slot, plant, *dir, *dir, genome, next_gene) else {
             continue;
         };
-        let (dx, dy) = direction_to_delta(dir);
+        let (dx, dy) = direction_to_delta(*dir);
         let nx = wx + dx;
         let ny = wy + dy;
         if let Some(target) = cell_at_mut(chunks, chunks_x, nx, ny) {
             target.occupant = occ;
-            connections |= dir_to_bitmask(dir);
+            connections |= dir_to_bitmask(*dir);
             if matches!(slot, SlotProduct::Sprout) {
-                children |= dir_to_bitmask(dir);
+                children |= dir_to_bitmask(*dir);
             }
             grew = true;
         }
     }
 
     if grew {
-        // Visually connect back to the parent stem so the new stem reads as
-        // part of the existing trunk.
         if let Some(parent_dir) = parent {
             connections |= dir_to_bitmask(parent_dir);
         }
-        let new_energy = sprout_energy.saturating_sub(total_cost);
+        let new_energy = sprout_energy.saturating_sub(effective_cost);
         if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             self_cell.occupant = Occupant::Stem {
                 plant,
