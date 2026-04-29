@@ -321,3 +321,66 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Camera;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn pixel_to_world_at_window_center_returns_camera_center() {
+        let cam = Camera {
+            center: glam::vec2(50.0, 30.0),
+            cells_visible_y: 64.0,
+        };
+        let win = glam::vec2(800.0, 600.0);
+        let world = cam.pixel_to_world(win * 0.5, win);
+        assert!(approx_eq(world.x, 50.0));
+        assert!(approx_eq(world.y, 30.0));
+    }
+
+    #[test]
+    fn pixel_to_world_translates_with_pixel_offset() {
+        // 64 cells visible across 600 pixels of height → ~9.375 px/cell.
+        // A pixel offset of (window_size / 2) along Y = +300 px puts us
+        // +32 cells from center.
+        let cam = Camera {
+            center: glam::vec2(0.0, 0.0),
+            cells_visible_y: 64.0,
+        };
+        let win = glam::vec2(800.0, 600.0);
+        let world = cam.pixel_to_world(glam::vec2(400.0, 600.0), win);
+        assert!(approx_eq(world.x, 0.0));
+        assert!(approx_eq(world.y, 32.0));
+    }
+
+    #[test]
+    fn pixel_to_world_scales_with_zoom() {
+        // Zooming in (smaller cells_visible_y) → same pixel offset maps to
+        // smaller world delta.
+        let cam = Camera {
+            center: glam::vec2(0.0, 0.0),
+            cells_visible_y: 16.0, // 4× zoom vs 64
+        };
+        let win = glam::vec2(800.0, 600.0);
+        let world = cam.pixel_to_world(glam::vec2(400.0, 600.0), win);
+        // 16 cells across 600 px → +300 px = +8 cells.
+        assert!(approx_eq(world.y, 8.0));
+    }
+
+    #[test]
+    fn view_proj_is_invertible_around_camera_center() {
+        // The matrix should map camera.center to NDC origin.
+        let cam = Camera {
+            center: glam::vec2(50.0, 30.0),
+            cells_visible_y: 64.0,
+        };
+        let mat = cam.view_proj(800.0 / 600.0);
+        let center_ndc = mat * glam::vec4(50.0, 30.0, 0.0, 1.0);
+        assert!(approx_eq(center_ndc.x, 0.0));
+        assert!(approx_eq(center_ndc.y, 0.0));
+    }
+}

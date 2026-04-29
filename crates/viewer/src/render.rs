@@ -1020,3 +1020,152 @@ fn find_cell(chunks: &[Chunk], x: i32, y: i32) -> Option<(ChunkCoord, &Cell)> {
     let chunk = chunks.iter().find(|c| c.coord.x == cx && c.coord.y == cy)?;
     chunk.cells.get(cell_idx).map(|cell| (chunk.coord, cell))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{CHUNK_AREA, Cell, ChunkCoord, Direction, Genome, Occupant};
+
+    fn empty_chunk(cx: i32, cy: i32) -> Chunk {
+        let cells = (0..CHUNK_AREA)
+            .map(|_| Cell {
+                organic: 0,
+                soil_energy: 0,
+                sunlit: false,
+                occupant: Occupant::Empty,
+            })
+            .collect();
+        Chunk {
+            coord: ChunkCoord { x: cx, y: cy },
+            cells,
+        }
+    }
+
+    fn lookup_for(chunks: &[Chunk]) -> std::collections::HashMap<(i32, i32), usize> {
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ((c.coord.x, c.coord.y), i))
+            .collect()
+    }
+
+    #[test]
+    fn facing_to_u32_enumerates_directions() {
+        assert_eq!(facing_to_u32(Direction::North), 0);
+        assert_eq!(facing_to_u32(Direction::East), 1);
+        assert_eq!(facing_to_u32(Direction::South), 2);
+        assert_eq!(facing_to_u32(Direction::West), 3);
+    }
+
+    #[test]
+    fn parent_label_handles_none_and_each_direction() {
+        assert_eq!(parent_label(None), "—");
+        assert_eq!(parent_label(Some(Direction::North)), "North");
+        assert_eq!(parent_label(Some(Direction::West)), "West");
+    }
+
+    #[test]
+    fn connections_label_lists_only_set_bits() {
+        assert_eq!(connections_label(0), "—");
+        assert_eq!(connections_label(STEM_CONNECT_NORTH), "N");
+        assert_eq!(
+            connections_label(STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH),
+            "N|S"
+        );
+        assert_eq!(
+            connections_label(
+                STEM_CONNECT_NORTH | STEM_CONNECT_EAST | STEM_CONNECT_SOUTH | STEM_CONNECT_WEST
+            ),
+            "N|E|S|W"
+        );
+    }
+
+    #[test]
+    fn occupant_label_includes_kind_for_each_variant() {
+        assert_eq!(occupant_label(&Occupant::Empty), "empty");
+
+        let leaf = Occupant::Leaf {
+            plant: 1,
+            energy: 50,
+            facing: Direction::North,
+            parent: Some(Direction::South),
+        };
+        assert!(occupant_label(&leaf).starts_with("leaf"));
+
+        let stem = Occupant::Stem {
+            plant: 1,
+            energy: 0,
+            connections: STEM_CONNECT_NORTH,
+            parent: None,
+            children: STEM_CONNECT_SOUTH,
+        };
+        let s = occupant_label(&stem);
+        assert!(s.starts_with("stem"));
+        assert!(s.contains("conn N"));
+        assert!(s.contains("kids S"));
+
+        let sprout = Occupant::Sprout {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            genome: Box::new(Genome::default_vine()),
+            parent: None,
+            current_gene: 7,
+        };
+        assert!(occupant_label(&sprout).contains("gene 7"));
+    }
+
+    #[test]
+    fn find_cell_returns_cell_at_world_coord() {
+        let mut chunks = vec![empty_chunk(0, 0), empty_chunk(1, 0)];
+        // Mark a cell in chunk (1, 0) so we can identify it.
+        chunks[1].cells[0].organic = 99;
+
+        // World (CHUNK_EDGE, 0) → chunk (1, 0), local (0, 0).
+        let edge = CHUNK_EDGE as i32;
+        let (coord, cell) = find_cell(&chunks, edge, 0).expect("hit");
+        assert_eq!(coord, ChunkCoord { x: 1, y: 0 });
+        assert_eq!(cell.organic, 99);
+
+        // OOB returns None.
+        assert!(find_cell(&chunks, -1, 0).is_none());
+        assert!(find_cell(&chunks, edge * 5, 0).is_none());
+    }
+
+    #[test]
+    fn neighbor_present_distinguishes_empty_from_occupied() {
+        let mut chunks = vec![empty_chunk(0, 0)];
+        chunks[0].cells[1].occupant = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            parent: None,
+        };
+        let lookup = lookup_for(&chunks);
+
+        // (1, 0) holds the leaf.
+        assert!(neighbor_present(&chunks, &lookup, 1, 0));
+        // (0, 0) is empty.
+        assert!(!neighbor_present(&chunks, &lookup, 0, 0));
+        // Outside any known chunk → false.
+        assert!(!neighbor_present(&chunks, &lookup, -1, -1));
+    }
+
+    #[test]
+    fn effective_stem_connections_masks_out_empty_neighbors() {
+        let mut chunks = vec![empty_chunk(0, 0)];
+        // Place a leaf to the North of (5, 5) — i.e. at (5, 4).
+        chunks[0].cells[4 * (CHUNK_EDGE as usize) + 5].occupant = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            parent: None,
+        };
+        let lookup = lookup_for(&chunks);
+
+        let raw = STEM_CONNECT_NORTH | STEM_CONNECT_EAST;
+        let eff = effective_stem_connections(raw, &chunks, &lookup, 5, 5);
+        // North neighbor exists → bit kept. East neighbor empty → bit dropped.
+        assert_eq!(eff, STEM_CONNECT_NORTH as u32);
+    }
+}
