@@ -314,74 +314,95 @@ fn mutate_world(
         }
     }
 
-    // Phase 4: prune stem children. For each stem with a children bitmask,
-    // remove bits whose neighbor is not a valid energy sink (a sprout, or a
-    // stem that itself has children). Pre-prune state is read into a parallel
-    // array first, so cascading happens one level per tick.
+    // Phase 4: prune stem children. The local rule is unchanged — a child
+    // bit is valid iff the target is a Sprout/Seed (sink) or a Stem with
+    // children != 0. The bug it was masking is the *cascade timing*: with
+    // a single pass per tick, a chain like Stem→Stem→Sprout takes one
+    // tick per layer to unwind when the sprout dies. During the cascade,
+    // a parent that hasn't yet pruned its bit pushes energy to a child
+    // that just pruned its own bits and now pushes back to the parent —
+    // the energy "bounces" between them for a tick. With long chains the
+    // wave of bounces takes many ticks to clear, which is what "stem
+    // loops" looks like.
+    //
+    // Apply the same rule in a fixpoint loop: a pass drops every now-
+    // invalid bit; if anything changed, run again. One tick now resolves
+    // the entire cascade. Each pass is monotonic (only drops bits) so
+    // convergence is guaranteed; cycles (which game rules already
+    // shouldn't produce) leave their bits intact and the loop exits.
     let total_cells = chunks.len() * CHUNK_AREA;
-    let mut pruned_children: Vec<Option<u8>> = vec![None; total_cells];
     let bits = [
         STEM_CONNECT_NORTH,
         STEM_CONNECT_EAST,
         STEM_CONNECT_SOUTH,
         STEM_CONNECT_WEST,
     ];
-    for cy in 0..chunks_y {
-        for cx in 0..chunks_x {
-            for ly in 0..(CHUNK_EDGE as usize) {
-                for lx in 0..(CHUNK_EDGE as usize) {
-                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    let current_children =
-                        match &chunks[chunk_idx].cells[cell_idx].occupant {
-                            Occupant::Stem { children, .. } if *children != 0 => *children,
-                            _ => continue,
-                        };
-                    let wx = cx as i32 * edge + lx as i32;
-                    let wy = cy as i32 * edge + ly as i32;
-                    let mut kept = 0u8;
-                    for bit in bits {
-                        if current_children & bit == 0 {
-                            continue;
+    loop {
+        let mut pruned_children: Vec<Option<u8>> = vec![None; total_cells];
+        let mut any_change = false;
+        for cy in 0..chunks_y {
+            for cx in 0..chunks_x {
+                for ly in 0..(CHUNK_EDGE as usize) {
+                    for lx in 0..(CHUNK_EDGE as usize) {
+                        let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                        let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                        let current_children =
+                            match &chunks[chunk_idx].cells[cell_idx].occupant {
+                                Occupant::Stem { children, .. } if *children != 0 => *children,
+                                _ => continue,
+                            };
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        let mut kept = 0u8;
+                        for bit in bits {
+                            if current_children & bit == 0 {
+                                continue;
+                            }
+                            let dir = bit_to_dir(bit);
+                            let (dx, dy) = direction_to_delta(dir);
+                            let nx = wx + dx;
+                            let ny = wy + dy;
+                            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                                continue;
+                            }
+                            let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                                + (nx / edge) as usize;
+                            let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                                + (nx % edge) as usize;
+                            let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
+                            if is_valid_child(&neighbor.occupant) {
+                                kept |= bit;
+                            }
                         }
-                        let dir = bit_to_dir(bit);
-                        let (dx, dy) = direction_to_delta(dir);
-                        let nx = wx + dx;
-                        let ny = wy + dy;
-                        if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
-                            continue;
+                        if kept != current_children {
+                            pruned_children[linear_idx(chunks_x, wx, wy)] = Some(kept);
+                            any_change = true;
                         }
-                        let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
-                            + (nx / edge) as usize;
-                        let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
-                            + (nx % edge) as usize;
-                        let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
-                        if is_valid_child(&neighbor.occupant) {
-                            kept |= bit;
-                        }
-                    }
-                    if kept != current_children {
-                        pruned_children[linear_idx(chunks_x, wx, wy)] = Some(kept);
                     }
                 }
             }
         }
-    }
-    for cy in 0..chunks_y {
-        for cx in 0..chunks_x {
-            for ly in 0..(CHUNK_EDGE as usize) {
-                for lx in 0..(CHUNK_EDGE as usize) {
-                    let wx = cx as i32 * edge + lx as i32;
-                    let wy = cy as i32 * edge + ly as i32;
-                    let Some(new_c) = pruned_children[linear_idx(chunks_x, wx, wy)] else {
-                        continue;
-                    };
-                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    if let Occupant::Stem { children, .. } =
-                        &mut chunks[chunk_idx].cells[cell_idx].occupant
-                    {
-                        *children = new_c;
+        if !any_change {
+            break;
+        }
+        for cy in 0..chunks_y {
+            for cx in 0..chunks_x {
+                for ly in 0..(CHUNK_EDGE as usize) {
+                    for lx in 0..(CHUNK_EDGE as usize) {
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        let Some(new_c) =
+                            pruned_children[linear_idx(chunks_x, wx, wy)]
+                        else {
+                            continue;
+                        };
+                        let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                        let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                        if let Occupant::Stem { children, .. } =
+                            &mut chunks[chunk_idx].cells[cell_idx].occupant
+                        {
+                            *children = new_c;
+                        }
                     }
                 }
             }
@@ -2665,6 +2686,79 @@ mod tests {
             cell_at(&chunks, chunks_x, 10, 10).occupant,
             Occupant::Antenna { .. }
         ));
+    }
+
+    #[test]
+    fn phase_prune_cascades_dead_end_chain_in_one_tick() {
+        // Chain A → B → C with a sprout at the end that already died
+        // (cell at sprout position is Empty). After one tick of prune,
+        // every stem in the chain has children=0 and the head (parent=
+        // None) has orphan-died. Without the iterative fixpoint, this
+        // would take 3 ticks to fully cascade and energy would bounce
+        // between the cells while it propagated.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        // Head (parent=None, points north at B).
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Stem {
+                plant: 1,
+                energy: 100,
+                connections: STEM_CONNECT_NORTH,
+                parent: None,
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        // Middle B (points north at C).
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Stem {
+                plant: 1,
+                energy: 100,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: Some(Direction::South),
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        // Tail C (points north at where the sprout used to be — now
+        // Empty).
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            8,
+            Occupant::Stem {
+                plant: 1,
+                energy: 100,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: Some(Direction::South),
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        // Head was orphan after the cascade — it had children=0 and
+        // parent=None at death-collection time, so it died this tick.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Empty
+        ));
+        // Middle and tail no longer have children pointing north.
+        match &cell_at(&chunks, chunks_x, 10, 9).occupant {
+            Occupant::Stem { children, .. } => assert_eq!(*children, 0),
+            other => panic!("expected stem at middle, got {other:?}"),
+        }
+        match &cell_at(&chunks, chunks_x, 10, 8).occupant {
+            Occupant::Stem { children, .. } => assert_eq!(*children, 0),
+            other => panic!("expected stem at tail, got {other:?}"),
+        }
     }
 
     #[test]
