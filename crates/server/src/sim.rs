@@ -30,7 +30,7 @@ const COST_ANTENNA: Energy = 5;
 const COST_SEED: Energy = 30;
 
 /// Per-field probability of mutating a single field at any copy site.
-const MUTATION_RATE: f32 = 0.02;
+const MUTATION_RATE: f32 = 0.0;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -910,5 +910,221 @@ fn dir_to_bitmask(d: Direction) -> u8 {
         Direction::East => STEM_CONNECT_EAST,
         Direction::South => STEM_CONNECT_SOUTH,
         Direction::West => STEM_CONNECT_WEST,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::ChunkCoord;
+
+    fn empty_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
+        let mut v = Vec::with_capacity((chunks_x * chunks_y) as usize);
+        for cy in 0..chunks_y as i32 {
+            for cx in 0..chunks_x as i32 {
+                let cells = (0..CHUNK_AREA)
+                    .map(|_| Cell {
+                        organic: 0,
+                        soil_energy: 0,
+                        sunlit: false,
+                        occupant: Occupant::Empty,
+                    })
+                    .collect();
+                v.push(Chunk {
+                    coord: ChunkCoord { x: cx, y: cy },
+                    cells,
+                });
+            }
+        }
+        v
+    }
+
+    fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> &'a Cell {
+        let edge = CHUNK_EDGE as i32;
+        let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
+        let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;
+        &chunks[chunk_idx].cells[cell_idx]
+    }
+
+    fn place(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32, occ: Occupant) {
+        let edge = CHUNK_EDGE as i32;
+        let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
+        let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;
+        chunks[chunk_idx].cells[cell_idx].occupant = occ;
+    }
+
+    fn vine_sprout(energy: Energy) -> (Occupant, Genome) {
+        let genome = Genome::default_vine();
+        let occ = Occupant::Sprout {
+            plant: 1,
+            energy,
+            facing: Direction::North,
+            genome: Box::new(genome.clone()),
+            parent: None,
+            current_gene: 0,
+        };
+        (occ, genome)
+    }
+
+    #[test]
+    fn growth_with_clear_sides_spawns_sprout_and_two_leaves() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+        let (sprout, genome) = vine_sprout(100);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            100,
+            Direction::North,
+            None,
+            0,
+            &genome,
+        );
+
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Stem { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 9).occupant,
+            Occupant::Sprout { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 9, 10).occupant,
+            Occupant::Leaf { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 10).occupant,
+            Occupant::Leaf { .. }
+        ));
+    }
+
+    #[test]
+    fn growth_at_top_edge_grows_only_side_leaves() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+        let (sprout, genome) = vine_sprout(100);
+        // y=0 with facing North → front cell is OOB.
+        place(&mut chunks, chunks_x, 10, 0, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            0,
+            1,
+            100,
+            Direction::North,
+            None,
+            0,
+            &genome,
+        );
+
+        match &cell_at(&chunks, chunks_x, 10, 0).occupant {
+            Occupant::Stem { children, .. } => assert_eq!(*children, 0),
+            other => panic!("expected children-less stem, got {other:?}"),
+        }
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 9, 0).occupant,
+            Occupant::Leaf { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 0).occupant,
+            Occupant::Leaf { .. }
+        ));
+    }
+
+    #[test]
+    fn growth_dies_when_all_targets_blocked() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+        let blocker = || Occupant::Leaf {
+            plant: 99,
+            energy: 50,
+            facing: Direction::North,
+            parent: None,
+        };
+        place(&mut chunks, chunks_x, 10, 9, blocker());
+        place(&mut chunks, chunks_x, 9, 10, blocker());
+        place(&mut chunks, chunks_x, 11, 10, blocker());
+
+        let (sprout, genome) = vine_sprout(100);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            100,
+            Direction::North,
+            None,
+            0,
+            &genome,
+        );
+
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Empty
+        ));
+        // Center weight of DEATH_DEPOSIT_KERNEL is 4.
+        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 4);
+    }
+
+    #[test]
+    fn growth_waits_when_energy_below_cost() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+        // Vine cost = sprout(20) + leaf(5) + leaf(5) = 30. 5 is well below.
+        let (sprout, genome) = vine_sprout(5);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            5,
+            Direction::North,
+            None,
+            0,
+            &genome,
+        );
+
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Sprout { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 9).occupant,
+            Occupant::Empty
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 9, 10).occupant,
+            Occupant::Empty
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 10).occupant,
+            Occupant::Empty
+        ));
     }
 }
