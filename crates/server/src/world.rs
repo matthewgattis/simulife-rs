@@ -1,10 +1,21 @@
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ChunkCoord, Direction, Genome, Occupant,
-    STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST,
 };
+use rand::Rng;
+
+/// Inset (per side, as fraction of total dimension) where sunlight switches
+/// off. 0.10 → central 80% × 80% lit, dark frame around.
+const SUNLIT_MARGIN_FRAC: f32 = 0.10;
+
+/// Spacing between initial sprouts in `place_random_sprout_grid`.
+const SPROUT_GRID_SPACING: i32 = 32;
 
 pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
     let mut chunks = Vec::with_capacity((chunks_x * chunks_y) as usize);
+    let total_w = chunks_x * CHUNK_EDGE as u32;
+    let total_h = chunks_y * CHUNK_EDGE as u32;
+    let margin_x = (total_w as f32 * SUNLIT_MARGIN_FRAC) as u32;
+    let margin_y = (total_h as f32 * SUNLIT_MARGIN_FRAC) as u32;
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             let cells = (0..CHUNK_AREA)
@@ -13,10 +24,14 @@ pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
                     let local_y = (i / CHUNK_EDGE as usize) as u32;
                     let world_x = cx * CHUNK_EDGE as u32 + local_x;
                     let world_y = cy * CHUNK_EDGE as u32 + local_y;
+                    let sunlit = world_x >= margin_x
+                        && world_x < total_w - margin_x
+                        && world_y >= margin_y
+                        && world_y < total_h - margin_y;
                     Cell {
                         organic: ((world_x ^ world_y) & 0xff) as u16,
                         soil_energy: 100,
-                        sunlit: (world_x.wrapping_add(world_y)) % 3 != 0,
+                        sunlit,
                         occupant: Occupant::Empty,
                     }
                 })
@@ -33,159 +48,64 @@ pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
     chunks
 }
 
-pub fn place_showcase(chunks: &mut [Chunk], chunks_x: u32) {
-    let plant = 1u32;
-    let energy = 200u16;
-    let default_genome = || Box::new(Genome::default_vine());
-
-    // Inert showcase row (parent: None, children: 0). Existing cells are
-    // visually distinct but disconnected from any plant tree.
-    let entries: Vec<(i32, i32, Occupant)> = vec![
-        (
-            10,
-            20,
-            Occupant::Leaf {
-                plant,
-                energy,
-                facing: Direction::East,
-                parent: None,
-            },
-        ),
-        (
-            12,
-            20,
-            Occupant::Leaf {
-                plant,
-                energy,
-                facing: Direction::North,
-                parent: None,
-            },
-        ),
-        (
-            14,
-            20,
-            Occupant::Root {
-                plant,
-                energy,
-                parent: None,
-            },
-        ),
-        (
-            16,
-            20,
-            Occupant::Stem {
-                plant,
-                energy,
-                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
-                parent: None,
-                children: 0,
-            },
-        ),
-        (
-            18,
-            20,
-            Occupant::Stem {
-                plant,
-                energy,
-                connections: STEM_CONNECT_NORTH
-                    | STEM_CONNECT_EAST
-                    | STEM_CONNECT_SOUTH
-                    | STEM_CONNECT_WEST,
-                parent: None,
-                children: 0,
-            },
-        ),
-        (
-            20,
-            20,
-            Occupant::Stem {
-                plant,
-                energy,
-                connections: STEM_CONNECT_EAST | STEM_CONNECT_SOUTH,
-                parent: None,
-                children: 0,
-            },
-        ),
-        (
-            22,
-            20,
-            Occupant::Antenna {
-                plant,
-                energy,
-                parent: None,
-            },
-        ),
-        (
-            24,
-            20,
-            Occupant::Sprout {
-                plant,
-                energy,
-                facing: Direction::North,
-                genome: default_genome(),
-                parent: None,
-                current_gene: 0,
-            },
-        ),
-        (
-            26,
-            20,
-            Occupant::Seed {
-                plant,
-                energy,
-                facing: Direction::East,
-                genome: default_genome(),
-                parent: None,
-            },
-        ),
-    ];
-    for (x, y, occupant) in entries {
-        place_at(chunks, chunks_x, x, y, occupant);
+/// Place sprouts on a regular grid across the lit region of the world,
+/// each carrying a freshly-randomized genome. Returns the count placed so
+/// the caller can advance `next_plant_id`.
+pub fn place_random_sprout_grid(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    chunks_y: u32,
+    rng: &mut impl Rng,
+) -> u32 {
+    let total_w = chunks_x as i32 * CHUNK_EDGE as i32;
+    let total_h = chunks_y as i32 * CHUNK_EDGE as i32;
+    let mut count = 0u32;
+    let mut y = SPROUT_GRID_SPACING;
+    while y < total_h - SPROUT_GRID_SPACING {
+        let mut x = SPROUT_GRID_SPACING;
+        while x < total_w - SPROUT_GRID_SPACING {
+            if let Some(cell) = cell_at(chunks, chunks_x, x, y) {
+                if cell.sunlit {
+                    count += 1;
+                    let facing = match rng.r#gen::<u8>() % 4 {
+                        0 => Direction::North,
+                        1 => Direction::East,
+                        2 => Direction::South,
+                        _ => Direction::West,
+                    };
+                    let genome =
+                        crate::sim::mutate_genome(&Genome::default_vine(), 1.0, rng);
+                    place_at(
+                        chunks,
+                        chunks_x,
+                        x,
+                        y,
+                        Occupant::Sprout {
+                            plant: count,
+                            energy: 100,
+                            facing,
+                            genome: Box::new(genome),
+                            parent: None,
+                            current_gene: 0,
+                        },
+                    );
+                }
+            }
+            x += SPROUT_GRID_SPACING;
+        }
+        y += SPROUT_GRID_SPACING;
     }
+    count
+}
 
-    // Viable mini-plant centered around (50, 50). A trunk stem with a leaf
-    // on its east side (production source) and a sprout above it (growth
-    // sink). Energy: leaf -> trunk -> sprout, with leaf photosynthesis as
-    // the source and the sprout as a terminal sink.
-    let plant2 = 2u32;
-    let mini_plant: Vec<(i32, i32, Occupant)> = vec![
-        (
-            50,
-            51,
-            Occupant::Stem {
-                plant: plant2,
-                energy: 100,
-                connections: STEM_CONNECT_NORTH | STEM_CONNECT_EAST,
-                parent: None,
-                children: STEM_CONNECT_NORTH,
-            },
-        ),
-        (
-            50,
-            50,
-            Occupant::Sprout {
-                plant: plant2,
-                energy: 100,
-                facing: Direction::North,
-                genome: default_genome(),
-                parent: Some(Direction::South),
-                current_gene: 0,
-            },
-        ),
-        (
-            51,
-            51,
-            Occupant::Leaf {
-                plant: plant2,
-                energy: 100,
-                facing: Direction::East,
-                parent: Some(Direction::West),
-            },
-        ),
-    ];
-    for (x, y, occupant) in mini_plant {
-        place_at(chunks, chunks_x, x, y, occupant);
+fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&'a Cell> {
+    if x < 0 || y < 0 {
+        return None;
     }
+    let edge = CHUNK_EDGE as i32;
+    let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
+    let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;
+    chunks.get(chunk_idx)?.cells.get(cell_idx)
 }
 
 fn place_at(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32, occupant: Occupant) {
@@ -209,8 +129,9 @@ fn place_at(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32, occupant: Occup
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
-    fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> &'a Cell {
+    fn cell_at_test<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> &'a Cell {
         let edge = CHUNK_EDGE as i32;
         let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
         let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;
@@ -242,25 +163,44 @@ mod tests {
                 assert!(matches!(cell.occupant, Occupant::Empty));
             }
         }
-        // Spot-check the deterministic per-cell formulas at a few coords.
-        // organic = (x ^ y) & 0xff, sunlit = (x + y) % 3 != 0.
-        let c = cell_at(&chunks, 2, 0, 0);
+        // Spot-check organic formula. (Sunlit is checked in its own test.)
+        let c = cell_at_test(&chunks, 2, 0, 0);
         assert_eq!(c.organic, 0);
-        assert!(!c.sunlit); // (0+0) % 3 == 0 → not sunlit
-        let c = cell_at(&chunks, 2, 5, 7);
+        let c = cell_at_test(&chunks, 2, 5, 7);
         assert_eq!(c.organic, ((5u32 ^ 7) & 0xff) as u16);
-        // (5 + 7) % 3 == 0 → not sunlit.
-        assert!(!c.sunlit);
     }
 
     #[test]
-    fn build_world_sunlit_pattern_follows_formula() {
-        let chunks = build_world(2, 1);
-        for y in 0..(CHUNK_EDGE as i32) {
-            for x in 0..(2 * CHUNK_EDGE as i32) {
-                let expected =
-                    (x as u32).wrapping_add(y as u32) % 3 != 0;
-                assert_eq!(cell_at(&chunks, 2, x, y).sunlit, expected);
+    fn build_world_sunlit_is_central_rectangle() {
+        // 2x2 chunk world = 64×64. SUNLIT_MARGIN_FRAC=0.10 → margin 6.
+        let chunks = build_world(2, 2);
+        let total = 2 * CHUNK_EDGE as i32;
+        let margin = (total as f32 * SUNLIT_MARGIN_FRAC) as i32;
+        // Inside the lit center.
+        assert!(cell_at_test(&chunks, 2, total / 2, total / 2).sunlit);
+        // Just inside the margin on each axis.
+        assert!(cell_at_test(&chunks, 2, margin, total / 2).sunlit);
+        assert!(cell_at_test(&chunks, 2, total / 2, margin).sunlit);
+        // Just outside the margin → dark.
+        assert!(!cell_at_test(&chunks, 2, margin - 1, total / 2).sunlit);
+        assert!(!cell_at_test(&chunks, 2, total / 2, margin - 1).sunlit);
+        // Far corners → dark.
+        assert!(!cell_at_test(&chunks, 2, 0, 0).sunlit);
+        assert!(!cell_at_test(&chunks, 2, total - 1, total - 1).sunlit);
+    }
+
+    #[test]
+    fn place_random_sprout_grid_places_sprouts_only_in_lit_region() {
+        let mut chunks = build_world(4, 4);
+        let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(123);
+        let count = place_random_sprout_grid(&mut chunks, 4, 4, &mut rng);
+        assert!(count > 0, "expected at least one sprout in the lit region");
+        // Every placed sprout sits on a sunlit cell.
+        for chunk in &chunks {
+            for cell in &chunk.cells {
+                if matches!(cell.occupant, Occupant::Sprout { .. }) {
+                    assert!(cell.sunlit, "sprout placed on dark cell");
+                }
             }
         }
     }
@@ -322,51 +262,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn place_showcase_lays_out_inert_row_and_mini_plant() {
-        // World big enough for both: showcase row uses x up to 26, mini
-        // plant uses (50, 50). Need 2 chunks wide × 2 chunks tall (each 32).
-        let mut chunks = build_world(2, 2);
-        place_showcase(&mut chunks, 2);
-
-        // Spot-check the inert showcase row at y=20.
-        assert!(matches!(
-            cell_at(&chunks, 2, 10, 20).occupant,
-            Occupant::Leaf { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 14, 20).occupant,
-            Occupant::Root { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 16, 20).occupant,
-            Occupant::Stem { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 22, 20).occupant,
-            Occupant::Antenna { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 24, 20).occupant,
-            Occupant::Sprout { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 26, 20).occupant,
-            Occupant::Seed { .. }
-        ));
-
-        // Mini-plant trio.
-        assert!(matches!(
-            cell_at(&chunks, 2, 50, 50).occupant,
-            Occupant::Sprout { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 50, 51).occupant,
-            Occupant::Stem { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, 2, 51, 51).occupant,
-            Occupant::Leaf { .. }
-        ));
-    }
 }

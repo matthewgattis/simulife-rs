@@ -88,8 +88,7 @@ pub fn load_or_build(
             return load_world(path);
         }
     }
-    let mut chunks = world::build_world(world_width, world_height);
-    world::place_showcase(&mut chunks, world_width);
+    let chunks = world::build_world(world_width, world_height);
     Ok(WorldSnapshot {
         chunks_x: world_width,
         chunks_y: world_height,

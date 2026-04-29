@@ -33,7 +33,7 @@ const COST_ANTENNA: Energy = 5;
 const COST_SEED: Energy = 30;
 
 /// Per-field probability of mutating a single field at any copy site.
-const MUTATION_RATE: f32 = 0.0;
+const MUTATION_RATE: f32 = 0.02;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -137,16 +137,22 @@ pub fn regenerate_world(state: &SimState, seed: u64) {
     let chunks_y = state.chunks_y;
 
     let mut new_chunks = crate::world::build_world(chunks_x, chunks_y);
-    crate::world::place_showcase(&mut new_chunks, chunks_x);
+    let mut new_rng = ChaCha12Rng::seed_from_u64(seed);
+    let count = crate::world::place_random_sprout_grid(
+        &mut new_chunks,
+        chunks_x,
+        chunks_y,
+        &mut new_rng,
+    );
 
     {
         let mut world = state.world.lock().expect("sim lock poisoned");
         let mut rng = state.rng.lock().expect("rng lock poisoned");
         *world = new_chunks.clone();
-        *rng = ChaCha12Rng::seed_from_u64(seed);
+        *rng = new_rng;
     }
     state.seed.store(seed, Ordering::Relaxed);
-    state.next_plant_id.store(1, Ordering::Relaxed);
+    state.next_plant_id.store(count + 1, Ordering::Relaxed);
     state.current_tick.store(0, Ordering::Relaxed);
     info!(seed, "world regenerated");
 

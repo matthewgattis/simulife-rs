@@ -45,11 +45,11 @@ struct Args {
     key_path: Option<PathBuf>,
 
     /// World size in chunks (X axis).
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 12)]
     world_width: u32,
 
     /// World size in chunks (Y axis).
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 12)]
     world_height: u32,
 
     /// Simulation tick rate in Hz.
@@ -83,21 +83,32 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("install default rustls crypto provider");
 
-    let initial = persist::load_or_build(
+    let mut initial = persist::load_or_build(
         args.world_file.as_deref(),
         args.world_width,
         args.world_height,
     )?;
     // Loaded snapshots carry their own seed/RNG; only the CLI flag (or a
     // freshly-drawn random) takes effect for newly-built worlds.
+    let fresh_world = initial.seed.is_none();
     let seed = initial
         .seed
         .unwrap_or_else(|| args.seed.unwrap_or_else(|| rand::thread_rng().r#gen()));
-    let rng = initial
+    let mut rng = initial
         .rng
         .clone()
         .unwrap_or_else(|| ChaCha12Rng::seed_from_u64(seed));
     info!(seed, "world seed");
+    if fresh_world {
+        let count = world::place_random_sprout_grid(
+            &mut initial.chunks,
+            initial.chunks_x,
+            initial.chunks_y,
+            &mut rng,
+        );
+        initial.next_plant_id = count + 1;
+        info!(sprouts = count, "placed initial sprout grid");
+    }
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
         chunks_x: initial.chunks_x,
