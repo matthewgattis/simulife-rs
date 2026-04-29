@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use protocol::{CHUNK_EDGE, Chunk, ClientMessage};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -94,6 +94,8 @@ pub struct App {
     proxy: EventLoopProxy<UserEvent>,
     rt: Arc<tokio::runtime::Runtime>,
     network_started: bool,
+    /// When true, log a per-tick timing line in `UserEvent::Chunks`.
+    tick_metrics: bool,
 }
 
 impl App {
@@ -103,6 +105,7 @@ impl App {
         server_addr: SocketAddr,
         outgoing_tx: UnboundedSender<ClientMessage>,
         outgoing_rx: UnboundedReceiver<ClientMessage>,
+        tick_metrics: bool,
     ) -> Self {
         Self {
             state: None,
@@ -127,6 +130,7 @@ impl App {
             proxy,
             rt,
             network_started: false,
+            tick_metrics,
         }
     }
 }
@@ -157,8 +161,9 @@ impl ApplicationHandler<UserEvent> for App {
                 .pending_outgoing_rx
                 .take()
                 .expect("outgoing receiver consumed twice");
+            let tick_metrics = self.tick_metrics;
             self.rt.spawn(async move {
-                net::run_client(server_addr, proxy, outgoing_rx).await;
+                net::run_client(server_addr, proxy, outgoing_rx, tick_metrics).await;
             });
         }
     }
@@ -191,15 +196,34 @@ impl ApplicationHandler<UserEvent> for App {
                 self.network = status;
             }
             UserEvent::Chunks { tick, chunks } => {
+                let dispatch_start = if self.tick_metrics {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 if chunks.len() != self.chunks.len() {
                     info!(count = chunks.len(), tick, "world snapshot loaded");
                 } else {
                     debug!(count = chunks.len(), tick, "world ticked");
                 }
+                let assign_start = self.tick_metrics.then(Instant::now);
                 self.chunks = chunks;
+                let assign_us = assign_start
+                    .map(|t| t.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
                 self.sim_tick = tick;
-                if let Some(state) = self.state.as_mut() {
+                let upload_us = if let Some(state) = self.state.as_mut() {
+                    let t = self.tick_metrics.then(Instant::now);
                     state.upload_chunks(&self.chunks);
+                    t.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0)
+                } else {
+                    0
+                };
+                if self.tick_metrics {
+                    let total_us = dispatch_start
+                        .map(|t| t.elapsed().as_micros() as u64)
+                        .unwrap_or(0);
+                    info!(tick, assign_us, upload_us, total_us, "tick applied");
                 }
             }
         }

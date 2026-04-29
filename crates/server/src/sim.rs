@@ -33,7 +33,7 @@ const COST_ANTENNA: Energy = 5;
 const COST_SEED: Energy = 30;
 
 /// Per-field probability of mutating a single field at any copy site.
-const MUTATION_RATE: f32 = 0.02;
+const MUTATION_RATE: f32 = 0.01;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -824,10 +824,12 @@ fn attempt_growth(
         (rotate_right(facing), gene.right),
     ];
 
-    // Walk the plan and figure out which slots are *actually* growable: the
-    // slot has to be a real product (not Nothing) AND its target cell has to
-    // be in-bounds AND Empty.
+    // Walk the plan and figure out which slots are growable. A target is
+    // viable if (a) the slot is a real product, (b) the cell is in-bounds,
+    // and (c) the cell is Empty OR an edible foreign cell. Edible cells get
+    // their energy harvested into the eater's pool.
     let mut viable: [bool; 3] = [false; 3];
+    let mut harvested: [u32; 3] = [0; 3];
     for (i, (dir, slot)) in plan.iter().enumerate() {
         if matches!(slot, SlotProduct::Nothing) {
             continue;
@@ -838,12 +840,18 @@ fn attempt_growth(
         if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
             continue;
         }
-        let cleared = matches!(
-            cell_at_mut(chunks, chunks_x, nx, ny).map(|c| &c.occupant),
-            Some(Occupant::Empty)
-        );
-        if cleared {
-            viable[i] = true;
+        let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) else {
+            continue;
+        };
+        match edible_for(&cell.occupant, plant) {
+            EdibleStatus::Empty => {
+                viable[i] = true;
+            }
+            EdibleStatus::Edible(e) => {
+                viable[i] = true;
+                harvested[i] = e as u32;
+            }
+            EdibleStatus::Blocked => {}
         }
     }
 
@@ -866,7 +874,9 @@ fn attempt_growth(
         .filter(|(_, v)| **v)
         .map(|((_, slot), _)| slot_cost(*slot))
         .sum();
-    if sprout_energy <= effective_cost {
+    let total_harvested: u32 = harvested.iter().sum();
+    let pool: u32 = sprout_energy as u32 + total_harvested;
+    if pool <= effective_cost as u32 {
         return; // wait for more energy
     }
 
@@ -901,7 +911,10 @@ fn attempt_growth(
         if let Some(parent_dir) = parent {
             connections |= dir_to_bitmask(parent_dir);
         }
-        let new_energy = sprout_energy.saturating_sub(effective_cost);
+        // Pool already accounts for harvested energy from edible targets.
+        let new_energy = pool
+            .saturating_sub(effective_cost as u32)
+            .min(Energy::MAX as u32) as Energy;
         if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             self_cell.occupant = Occupant::Stem {
                 plant,
@@ -911,6 +924,31 @@ fn attempt_growth(
                 children,
             };
         }
+    }
+}
+
+/// Outcome of inspecting a growth target.
+enum EdibleStatus {
+    /// Cell is Empty — grow normally, no energy harvested.
+    Empty,
+    /// Cell is a foreign edible cell — replace it and harvest its energy.
+    Edible(Energy),
+    /// Cell is one of: own-plant, Root, Stem, OOB. Cannot grow into it.
+    Blocked,
+}
+
+fn edible_for(occ: &Occupant, eater_plant: u32) -> EdibleStatus {
+    match occ {
+        Occupant::Empty => EdibleStatus::Empty,
+        Occupant::Leaf { plant, energy, .. }
+        | Occupant::Antenna { plant, energy, .. }
+        | Occupant::Sprout { plant, energy, .. }
+        | Occupant::Seed { plant, energy, .. }
+            if *plant != eater_plant =>
+        {
+            EdibleStatus::Edible(*energy)
+        }
+        _ => EdibleStatus::Blocked,
     }
 }
 
@@ -1132,11 +1170,14 @@ mod tests {
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
-        let blocker = || Occupant::Leaf {
+        // Stems are inedible — they actually block. (Leaves and the like
+        // would just get eaten and turn into food.)
+        let blocker = || Occupant::Stem {
             plant: 99,
             energy: 50,
-            facing: Direction::North,
+            connections: 0,
             parent: None,
+            children: 0,
         };
         place(&mut chunks, chunks_x, 10, 9, blocker());
         place(&mut chunks, chunks_x, 9, 10, blocker());
@@ -1167,6 +1208,121 @@ mod tests {
         ));
         // Center weight of DEATH_DEPOSIT_KERNEL is 4.
         assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 4);
+    }
+
+    #[test]
+    fn growth_eats_foreign_leaves_and_pools_their_energy() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+
+        // Foreign leaves on all three growth targets — edible, not blocking.
+        let foreign_leaf = || Occupant::Leaf {
+            plant: 99,
+            energy: 50,
+            facing: Direction::North,
+            parent: None,
+        };
+        place(&mut chunks, chunks_x, 10, 9, foreign_leaf()); // front
+        place(&mut chunks, chunks_x, 9, 10, foreign_leaf()); // left
+        place(&mut chunks, chunks_x, 11, 10, foreign_leaf()); // right
+
+        let (sprout, genome) = vine_sprout(30);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            30,
+            Direction::North,
+            None,
+            0,
+            &genome,
+            &mut det_rng(),
+        );
+
+        // Sprout's pool: 30 own + 3*50 harvested = 180.
+        // Effective cost (Sprout=20 + Leaf=5 + Leaf=5) = 30.
+        // Resulting stem energy = 180 - 30 = 150.
+        match cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Stem { plant, energy, .. } => {
+                assert_eq!(plant, 1, "stem belongs to eater plant");
+                assert_eq!(energy, 150, "pool minus cost");
+            }
+            ref other => panic!("expected stem, got {other:?}"),
+        }
+        // The eaten cells now belong to the eater plant.
+        match cell_at(&chunks, chunks_x, 10, 9).occupant {
+            Occupant::Sprout { plant, .. } => assert_eq!(plant, 1),
+            ref other => panic!("expected eater sprout in front, got {other:?}"),
+        }
+        match cell_at(&chunks, chunks_x, 9, 10).occupant {
+            Occupant::Leaf { plant, .. } => assert_eq!(plant, 1),
+            ref other => panic!("expected eater leaf at left, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn growth_skips_own_plant_cells() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+
+        // Block the front with an own-plant leaf — cannot eat your own.
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: None,
+            },
+        );
+
+        let (sprout, genome) = vine_sprout(100);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            100,
+            Direction::North,
+            None,
+            0,
+            &genome,
+            &mut det_rng(),
+        );
+
+        // Front (own leaf) untouched; sides grow normally.
+        match cell_at(&chunks, chunks_x, 10, 9).occupant {
+            Occupant::Leaf { plant, energy, .. } => {
+                assert_eq!(plant, 1);
+                assert_eq!(energy, 50, "own leaf still intact");
+            }
+            ref other => panic!("expected own leaf preserved, got {other:?}"),
+        }
+        // Sides got the leaves.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 9, 10).occupant,
+            Occupant::Leaf { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 10).occupant,
+            Occupant::Leaf { .. }
+        ));
     }
 
     #[test]

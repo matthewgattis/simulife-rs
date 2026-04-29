@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, bail};
 use protocol::{ClientMessage, ServerMessage};
@@ -21,6 +25,7 @@ pub async fn run_client(
     server_addr: SocketAddr,
     proxy: EventLoopProxy<UserEvent>,
     mut outgoing: UnboundedReceiver<ClientMessage>,
+    tick_metrics: bool,
 ) {
     let mut last_reason: Option<String> = None;
     loop {
@@ -28,7 +33,7 @@ pub async fn run_client(
             last_reason.clone(),
         )));
 
-        match run_session(server_addr, &proxy, &mut outgoing).await {
+        match run_session(server_addr, &proxy, &mut outgoing, tick_metrics).await {
             Ok(SessionEnd::Shutdown) => return,
             Ok(SessionEnd::ServerClosed) => {
                 last_reason = Some("server closed connection".to_string());
@@ -47,6 +52,7 @@ async fn run_session(
     server_addr: SocketAddr,
     proxy: &EventLoopProxy<UserEvent>,
     outgoing: &mut UnboundedReceiver<ClientMessage>,
+    tick_metrics: bool,
 ) -> Result<SessionEnd> {
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(make_client_config()?);
@@ -85,6 +91,7 @@ async fn run_session(
     }
 
     info!("session live; multiplexing outgoing + incoming");
+    let mut last_tick_arrival: Option<Instant> = None;
     loop {
         tokio::select! {
             biased;
@@ -102,11 +109,36 @@ async fn run_session(
                         return Ok(SessionEnd::ServerClosed);
                     }
                 };
+                let read_start = if tick_metrics { Some(Instant::now()) } else { None };
                 let buf = recv.read_to_end(8 * 1024 * 1024).await?;
+                let read_us = read_start
+                    .map(|t| t.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
+                let bytes = buf.len();
+                let decode_start = if tick_metrics { Some(Instant::now()) } else { None };
                 let msg = protocol::decode_server_message(&buf)?;
+                let decode_us = decode_start
+                    .map(|t| t.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
                 match msg {
                     ServerMessage::ChunkBatch { tick, chunks } => {
-                        debug!(count = chunks.len(), tick, "tick chunk batch");
+                        if tick_metrics {
+                            let now = Instant::now();
+                            let inter_arrival_us = last_tick_arrival
+                                .map(|t| now.duration_since(t).as_micros() as u64)
+                                .unwrap_or(0);
+                            last_tick_arrival = Some(now);
+                            info!(
+                                tick,
+                                bytes,
+                                read_us,
+                                decode_us,
+                                inter_arrival_us,
+                                "tick received"
+                            );
+                        } else {
+                            debug!(count = chunks.len(), tick, "tick chunk batch");
+                        }
                         let _ = proxy.send_event(UserEvent::Chunks { tick, chunks });
                     }
                     ServerMessage::Welcome {

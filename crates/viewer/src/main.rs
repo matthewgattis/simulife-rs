@@ -18,6 +18,10 @@ struct Args {
     /// Server address to connect to.
     #[arg(long, default_value = "127.0.0.1:4433")]
     server_addr: SocketAddr,
+
+    /// Log per-tick timing (read/decode/upload times). Off by default.
+    #[arg(long)]
+    tick_metrics: bool,
 }
 
 fn main() -> Result<()> {
@@ -35,7 +39,14 @@ fn main() -> Result<()> {
 
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
 
-    let mut app = App::new(rt, proxy, args.server_addr, outgoing_tx, outgoing_rx);
+    let mut app = App::new(
+        rt,
+        proxy,
+        args.server_addr,
+        outgoing_tx,
+        outgoing_rx,
+        args.tick_metrics,
+    );
     event_loop.run_app(&mut app)?;
     Ok(())
 }
