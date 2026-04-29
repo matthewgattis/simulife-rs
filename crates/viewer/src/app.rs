@@ -345,11 +345,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 Key::Named(NamedKey::Space) => {
-                    self.sim_paused = !self.sim_paused;
+                    // Server is authoritative — request the toggle; the
+                    // broadcast Welcome will update self.sim_paused.
                     let _ = self
                         .outgoing
-                        .send(ClientMessage::SetPaused(self.sim_paused));
-                    state.window().request_redraw();
+                        .send(ClientMessage::SetPaused(!self.sim_paused));
                 }
                 _ => {}
             },

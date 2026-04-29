@@ -836,8 +836,9 @@ fn draw_ui(
             ui.horizontal(|ui| {
                 let label = if *sim_paused { "Resume" } else { "Pause" };
                 if ui.button(label).clicked() {
-                    *sim_paused = !*sim_paused;
-                    let _ = outgoing.send(ClientMessage::SetPaused(*sim_paused));
+                    // Server is authoritative — request the toggle and wait
+                    // for the broadcast Welcome to update *sim_paused.
+                    let _ = outgoing.send(ClientMessage::SetPaused(!*sim_paused));
                 }
                 if ui
                     .add_enabled(*sim_paused, egui::Button::new("Step"))
@@ -851,7 +852,9 @@ fn draw_ui(
                 .add(egui::Slider::new(&mut hz, 1..=60).text("Hz"))
                 .changed()
             {
-                *sim_tick_hz = hz;
+                // Server is authoritative — send a request; the slider
+                // snaps back to *sim_tick_hz next frame, then updates when
+                // the server broadcasts the new tick_hz.
                 let _ = outgoing.send(ClientMessage::SetTickHz(hz));
             }
             ui.separator();

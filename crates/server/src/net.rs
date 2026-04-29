@@ -8,6 +8,28 @@ use tracing::{debug, error, info, warn};
 
 use crate::sim::{self, SimState};
 
+/// Push a fresh `Welcome` containing the authoritative paused / tick_hz /
+/// tick / seed to every connected viewer. Used when a client-issued
+/// control change (pause, tick rate) modifies global sim state — every
+/// viewer's UI mirror needs to update, not just the requester's.
+fn broadcast_sim_status(state: &SimState) {
+    let (paused, tick_hz) = {
+        let ctrl = state.control.lock().expect("control poisoned");
+        (ctrl.paused, ctrl.tick_hz)
+    };
+    let welcome = ServerMessage::Welcome {
+        world_chunks_x: state.chunks_x,
+        world_chunks_y: state.chunks_y,
+        paused,
+        tick_hz,
+        tick: state.current_tick.load(Ordering::Relaxed),
+        seed: state.seed.load(Ordering::Relaxed),
+    };
+    if let Ok(bytes) = protocol::encode_server_message(&welcome) {
+        let _ = state.tick_tx.send(Arc::new(bytes));
+    }
+}
+
 pub async fn serve(state: Arc<SimState>, endpoint: Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
         let state = Arc::clone(&state);
@@ -69,9 +91,12 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
             sim::spawn_sprout(&state, x, y, facing);
         }
         ClientMessage::SetPaused(paused) => {
-            let mut ctrl = state.control.lock().expect("control poisoned");
-            ctrl.paused = paused;
+            {
+                let mut ctrl = state.control.lock().expect("control poisoned");
+                ctrl.paused = paused;
+            }
             info!(paused, "sim pause state changed");
+            broadcast_sim_status(&state);
         }
         ClientMessage::Step => {
             let mut ctrl = state.control.lock().expect("control poisoned");
@@ -80,9 +105,12 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
         }
         ClientMessage::SetTickHz(hz) => {
             let hz = hz.max(1);
-            let mut ctrl = state.control.lock().expect("control poisoned");
-            ctrl.tick_hz = hz;
+            {
+                let mut ctrl = state.control.lock().expect("control poisoned");
+                ctrl.tick_hz = hz;
+            }
             info!(tick_hz = hz, "tick rate changed");
+            broadcast_sim_status(&state);
         }
         ClientMessage::RegenerateWorld { seed } => {
             sim::regenerate_world(&state, seed);
