@@ -290,4 +290,184 @@ mod tests {
             _ => panic!("expected Welcome"),
         }
     }
+
+    fn assert_client_msg_roundtrips(msg: ClientMessage) {
+        let bytes = rmp_serde::to_vec(&msg).expect("encode");
+        let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("decode");
+        // Compare via Debug because ClientMessage doesn't impl PartialEq.
+        assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+    }
+
+    #[test]
+    fn client_message_variants_roundtrip() {
+        assert_client_msg_roundtrips(ClientMessage::Hello);
+        assert_client_msg_roundtrips(ClientMessage::Subscribe);
+        assert_client_msg_roundtrips(ClientMessage::SpawnSprout {
+            x: -3,
+            y: 17,
+            facing: Direction::West,
+        });
+        assert_client_msg_roundtrips(ClientMessage::SetPaused(true));
+        assert_client_msg_roundtrips(ClientMessage::SetPaused(false));
+        assert_client_msg_roundtrips(ClientMessage::Step);
+        assert_client_msg_roundtrips(ClientMessage::SetTickHz(60));
+    }
+
+    fn roundtrip_occupant(occ: Occupant) -> Occupant {
+        let cell = Cell {
+            organic: 0,
+            soil_energy: 0,
+            sunlit: false,
+            occupant: occ,
+        };
+        let bytes = rmp_serde::to_vec(&cell).expect("encode");
+        let decoded: Cell = rmp_serde::from_slice(&bytes).expect("decode");
+        decoded.occupant
+    }
+
+    #[test]
+    fn every_occupant_variant_roundtrips() {
+        assert!(matches!(
+            roundtrip_occupant(Occupant::Empty),
+            Occupant::Empty
+        ));
+
+        let leaf = roundtrip_occupant(Occupant::Leaf {
+            plant: 9,
+            energy: 100,
+            facing: Direction::East,
+            parent: Some(Direction::West),
+        });
+        match leaf {
+            Occupant::Leaf {
+                plant,
+                facing,
+                parent,
+                ..
+            } => {
+                assert_eq!(plant, 9);
+                assert_eq!(facing, Direction::East);
+                assert_eq!(parent, Some(Direction::West));
+            }
+            _ => panic!("leaf"),
+        }
+
+        let root = roundtrip_occupant(Occupant::Root {
+            plant: 1,
+            energy: 50,
+            parent: None,
+        });
+        assert!(matches!(root, Occupant::Root { parent: None, .. }));
+
+        let antenna = roundtrip_occupant(Occupant::Antenna {
+            plant: 2,
+            energy: 7,
+            parent: Some(Direction::North),
+        });
+        assert!(matches!(
+            antenna,
+            Occupant::Antenna {
+                parent: Some(Direction::North),
+                ..
+            }
+        ));
+
+        let stem = roundtrip_occupant(Occupant::Stem {
+            plant: 3,
+            energy: 0,
+            connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+            parent: Some(Direction::South),
+            children: STEM_CONNECT_NORTH,
+        });
+        match stem {
+            Occupant::Stem {
+                connections,
+                children,
+                ..
+            } => {
+                assert_eq!(connections, STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH);
+                assert_eq!(children, STEM_CONNECT_NORTH);
+            }
+            _ => panic!("stem"),
+        }
+
+        let sprout = roundtrip_occupant(Occupant::Sprout {
+            plant: 4,
+            energy: 25,
+            facing: Direction::South,
+            genome: Box::new(Genome::default_vine()),
+            parent: Some(Direction::North),
+            current_gene: 5,
+        });
+        match sprout {
+            Occupant::Sprout {
+                current_gene,
+                genome,
+                ..
+            } => {
+                assert_eq!(current_gene, 5);
+                assert_eq!(genome.genes.len(), GENOME_LEN);
+            }
+            _ => panic!("sprout"),
+        }
+
+        let seed = roundtrip_occupant(Occupant::Seed {
+            plant: 5,
+            energy: 30,
+            facing: Direction::West,
+            genome: Box::new(Genome::default_vine()),
+            parent: None,
+        });
+        assert!(matches!(seed, Occupant::Seed { parent: None, .. }));
+    }
+
+    #[test]
+    fn default_vine_genome_has_active_first_gene_and_dormant_rest() {
+        let g = Genome::default_vine();
+        assert_eq!(g.genes.len(), GENOME_LEN);
+
+        // Gene 0: active vine — front sprout, two leaf side branches.
+        assert_eq!(g.genes[0].front, SlotProduct::Sprout);
+        assert_eq!(g.genes[0].left, SlotProduct::Leaf);
+        assert_eq!(g.genes[0].right, SlotProduct::Leaf);
+        assert_eq!(g.genes[0].next, 0);
+
+        // The rest are dormant.
+        for gene in &g.genes[1..] {
+            assert_eq!(gene.front, SlotProduct::Nothing);
+            assert_eq!(gene.left, SlotProduct::Nothing);
+            assert_eq!(gene.right, SlotProduct::Nothing);
+        }
+    }
+
+    #[test]
+    fn gene_default_is_all_nothing() {
+        let gene = Gene::default();
+        assert_eq!(gene.front, SlotProduct::Nothing);
+        assert_eq!(gene.left, SlotProduct::Nothing);
+        assert_eq!(gene.right, SlotProduct::Nothing);
+        assert_eq!(gene.next, 0);
+    }
+
+    #[test]
+    fn chunk_batch_roundtrip() {
+        let cells = vec![empty_cell(true); CHUNK_AREA];
+        let chunk = Chunk {
+            coord: ChunkCoord { x: 0, y: 0 },
+            cells,
+        };
+        let msg = ServerMessage::ChunkBatch {
+            tick: 1234,
+            chunks: vec![chunk],
+        };
+        let bytes = rmp_serde::to_vec(&msg).expect("encode");
+        let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("decode");
+        match decoded {
+            ServerMessage::ChunkBatch { tick, chunks } => {
+                assert_eq!(tick, 1234);
+                assert_eq!(chunks.len(), 1);
+            }
+            _ => panic!("expected ChunkBatch"),
+        }
+    }
 }
