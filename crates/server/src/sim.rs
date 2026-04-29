@@ -12,6 +12,7 @@ use protocol::{
     ServerMessage, SlotProduct,
 };
 use rand::Rng;
+use rand_chacha::ChaCha12Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -56,6 +57,10 @@ pub struct SimState {
     pub next_plant_id: AtomicU32,
     pub current_tick: AtomicU64,
     pub control: std::sync::Mutex<SimControl>,
+    /// Seed used to initialize `rng`. Stable identifier for the run; useful
+    /// for reproducing simulations and surfacing in the viewer.
+    pub seed: u64,
+    pub rng: std::sync::Mutex<ChaCha12Rng>,
 }
 
 #[derive(Debug)]
@@ -103,7 +108,8 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
 
         let snapshot_chunks = {
             let mut chunks = state.world.lock().expect("sim lock poisoned");
-            mutate_world(&mut chunks, state.chunks_x, state.chunks_y);
+            let mut rng = state.rng.lock().expect("rng lock poisoned");
+            mutate_world(&mut chunks, state.chunks_x, state.chunks_y, &mut *rng);
             chunks.clone()
         };
         let tick = state.current_tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -149,7 +155,12 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     info!(x, y, plant, ?facing, "sprout spawned");
 }
 
-fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
+fn mutate_world(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    chunks_y: u32,
+    rng: &mut impl Rng,
+) {
     let edge = CHUNK_EDGE as i32;
     let max_x = chunks_x as i32 * edge;
     let max_y = chunks_y as i32 * edge;
@@ -387,6 +398,7 @@ fn mutate_world(chunks: &mut [Chunk], chunks_x: u32, chunks_y: u32) {
                             parent,
                             current_gene,
                             &genome,
+                            rng,
                         );
                     }
                 }
@@ -689,6 +701,7 @@ fn make_slot_occupant(
     parent: Direction,
     parent_genome: &Genome,
     next_gene: u8,
+    rng: &mut impl Rng,
 ) -> Option<Occupant> {
     let parent_back = Some(opposite_dir(parent));
     let _ = parent;
@@ -714,14 +727,14 @@ fn make_slot_occupant(
             plant,
             energy: COST_SEED,
             facing,
-            genome: Box::new(mutate_genome(parent_genome)),
+            genome: Box::new(mutate_genome(parent_genome, MUTATION_RATE, rng)),
             parent: parent_back,
         },
         SlotProduct::Sprout => Occupant::Sprout {
             plant,
             energy: COST_SPROUT,
             facing,
-            genome: Box::new(mutate_genome(parent_genome)),
+            genome: Box::new(mutate_genome(parent_genome, MUTATION_RATE, rng)),
             parent: parent_back,
             current_gene: next_gene,
         },
@@ -741,6 +754,7 @@ fn attempt_growth(
     parent: Option<Direction>,
     current_gene: u8,
     genome: &Genome,
+    rng: &mut impl Rng,
 ) {
     if genome.genes.is_empty() {
         return;
@@ -808,7 +822,8 @@ fn attempt_growth(
         if !viable[i] {
             continue;
         }
-        let Some(occ) = make_slot_occupant(*slot, plant, *dir, *dir, genome, next_gene) else {
+        let Some(occ) = make_slot_occupant(*slot, plant, *dir, *dir, genome, next_gene, rng)
+        else {
             continue;
         };
         let (dx, dy) = direction_to_delta(*dir);
@@ -842,23 +857,25 @@ fn attempt_growth(
 }
 
 /// Per-field mutation pass over a genome. Each gene's slots and `next` each
-/// roll independently against `MUTATION_RATE`. Called at every copy site:
+/// roll independently against `rate`. Called at every copy site:
 /// sprout-produces-sub-sprouts, sprout-produces-seed, seed-germinates.
-pub fn mutate_genome(g: &Genome) -> Genome {
-    let mut rng = rand::thread_rng();
+///
+/// Takes rate explicitly (instead of always reading MUTATION_RATE) so tests
+/// can drive a non-zero rate even while the live constant is 0.
+pub fn mutate_genome(g: &Genome, rate: f32, rng: &mut impl Rng) -> Genome {
     let len = g.genes.len();
     let mut new_genes: Vec<Gene> = g.genes.clone();
     for gene in new_genes.iter_mut() {
-        if rng.r#gen::<f32>() < MUTATION_RATE {
-            gene.front = random_slot(&mut rng);
+        if rng.r#gen::<f32>() < rate {
+            gene.front = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < MUTATION_RATE {
-            gene.left = random_slot(&mut rng);
+        if rng.r#gen::<f32>() < rate {
+            gene.left = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < MUTATION_RATE {
-            gene.right = random_slot(&mut rng);
+        if rng.r#gen::<f32>() < rate {
+            gene.right = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < MUTATION_RATE {
+        if rng.r#gen::<f32>() < rate {
             // Always wraps via modulo at read time, but keep it tidy.
             gene.next = (rng.r#gen::<usize>() % len.max(1)) as u8;
         }
@@ -917,6 +934,11 @@ fn dir_to_bitmask(d: Direction) -> u8 {
 mod tests {
     use super::*;
     use protocol::ChunkCoord;
+    use rand::SeedableRng;
+
+    fn det_rng() -> ChaCha12Rng {
+        ChaCha12Rng::seed_from_u64(0)
+    }
 
     fn empty_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
         let mut v = Vec::with_capacity((chunks_x * chunks_y) as usize);
@@ -987,6 +1009,7 @@ mod tests {
             None,
             0,
             &genome,
+            &mut det_rng(),
         );
 
         assert!(matches!(
@@ -1029,6 +1052,7 @@ mod tests {
             None,
             0,
             &genome,
+            &mut det_rng(),
         );
 
         match &cell_at(&chunks, chunks_x, 10, 0).occupant {
@@ -1076,6 +1100,7 @@ mod tests {
             None,
             0,
             &genome,
+            &mut det_rng(),
         );
 
         assert!(matches!(
@@ -1108,6 +1133,7 @@ mod tests {
             None,
             0,
             &genome,
+            &mut det_rng(),
         );
 
         assert!(matches!(
@@ -1403,9 +1429,16 @@ mod tests {
         // direction; the new cell's `parent` field should point the OPPOSITE
         // way (back at the producing sprout).
         let parent_genome = Genome::default_vine();
-        let leaf =
-            make_slot_occupant(SlotProduct::Leaf, 7, Direction::East, Direction::East, &parent_genome, 0)
-                .unwrap();
+        let leaf = make_slot_occupant(
+            SlotProduct::Leaf,
+            7,
+            Direction::East,
+            Direction::East,
+            &parent_genome,
+            0,
+            &mut det_rng(),
+        )
+        .unwrap();
         match leaf {
             Occupant::Leaf {
                 plant,
@@ -1428,6 +1461,7 @@ mod tests {
             Direction::North,
             &parent_genome,
             0,
+            &mut det_rng(),
         );
         assert!(nothing.is_none());
 
@@ -1438,6 +1472,7 @@ mod tests {
             Direction::North,
             &parent_genome,
             3,
+            &mut det_rng(),
         )
         .unwrap();
         match sprout {
@@ -1501,13 +1536,19 @@ mod tests {
 
     #[test]
     fn mutate_genome_at_rate_zero_clones_exactly() {
-        // MUTATION_RATE is currently 0.0, so this is a no-op clone. If the
-        // const ever becomes nonzero, this test will start to flake — at
-        // which point mutation should be tested via a seeded RNG instead.
-        assert_eq!(MUTATION_RATE, 0.0);
         let g = Genome::default_vine();
-        let copied = mutate_genome(&g);
+        let copied = mutate_genome(&g, 0.0, &mut det_rng());
         assert_eq!(copied, g);
+    }
+
+    #[test]
+    fn mutate_genome_with_same_seed_is_deterministic() {
+        let g = Genome::default_vine();
+        let a = mutate_genome(&g, 0.5, &mut ChaCha12Rng::seed_from_u64(42));
+        let b = mutate_genome(&g, 0.5, &mut ChaCha12Rng::seed_from_u64(42));
+        assert_eq!(a, b, "same seed should produce identical mutations");
+        let c = mutate_genome(&g, 0.5, &mut ChaCha12Rng::seed_from_u64(43));
+        assert_ne!(a, c, "different seed should diverge at rate 0.5");
     }
 
     // ---------- phase tests via mutate_world ----------
@@ -1572,7 +1613,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
         let _ = edge;
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
@@ -1632,7 +1673,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         // Center weight 2.
         assert_eq!(cell_at(&chunks, chunks_x, 10, 10).organic, 98);
@@ -1691,7 +1732,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         assert_eq!(cell_at(&chunks, chunks_x, 10, 10).soil_energy, 98);
         assert_eq!(cell_at(&chunks, chunks_x, 9, 10).soil_energy, 99);
@@ -1737,7 +1778,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
@@ -1785,7 +1826,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         match &cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Stem { children, .. } => {
@@ -1843,7 +1884,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Leaf { energy, .. } => assert_eq!(energy, 1),
@@ -1874,7 +1915,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -1925,7 +1966,7 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1);
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,

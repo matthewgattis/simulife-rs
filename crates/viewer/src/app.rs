@@ -29,6 +29,7 @@ pub enum NetworkStatus {
         paused: bool,
         tick_hz: u32,
         tick: u64,
+        seed: u64,
     },
 }
 
@@ -163,6 +164,7 @@ impl ApplicationHandler<UserEvent> for App {
                     paused,
                     tick_hz,
                     tick,
+                    ..
                 } = &status
                 {
                     if !self.centered_once {

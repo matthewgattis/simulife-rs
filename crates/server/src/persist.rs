@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use protocol::Chunk;
+use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -22,6 +23,14 @@ pub struct WorldSnapshot {
     #[serde(default)]
     pub current_tick: u64,
     pub chunks: Vec<Chunk>,
+    /// Seed used to initialize the RNG for this run. `None` on snapshots
+    /// saved before seed plumbing existed.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Full RNG state at save time. `None` on pre-seed snapshots; main
+    /// rebuilds a fresh RNG from `seed` in that case.
+    #[serde(default)]
+    pub rng: Option<ChaCha12Rng>,
 }
 
 pub fn load_world(path: &Path) -> Result<WorldSnapshot> {
@@ -52,6 +61,8 @@ pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
         next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
         current_tick: state.current_tick.load(Ordering::Relaxed),
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
+        seed: Some(state.seed),
+        rng: Some(state.rng.lock().expect("rng lock poisoned").clone()),
     };
     let raw = rmp_serde::to_vec(&snapshot)?;
     let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd encode")?;
@@ -85,6 +96,8 @@ pub fn load_or_build(
         next_plant_id: 1,
         current_tick: 0,
         chunks,
+        seed: None,
+        rng: None,
     })
 }
 
@@ -127,6 +140,7 @@ mod tests {
     use super::*;
     use crate::sim::{SimControl, SimState};
     use protocol::{CHUNK_AREA, Cell, ChunkCoord, Direction, Genome, Occupant};
+    use rand::SeedableRng;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
@@ -176,11 +190,14 @@ mod tests {
             next_plant_id: 42,
             current_tick: 99,
             chunks,
+            seed: Some(0xABCD_1234),
+            rng: Some(rand_chacha::ChaCha12Rng::seed_from_u64(0xABCD_1234)),
         }
     }
 
     fn build_state(snap: &WorldSnapshot) -> SimState {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let seed = snap.seed.unwrap_or(0);
         SimState {
             chunks_x: snap.chunks_x,
             chunks_y: snap.chunks_y,
@@ -193,6 +210,12 @@ mod tests {
                 tick_hz: 10,
                 step_pending: 0,
             }),
+            seed,
+            rng: Mutex::new(
+                snap.rng
+                    .clone()
+                    .unwrap_or_else(|| rand_chacha::ChaCha12Rng::seed_from_u64(seed)),
+            ),
         }
     }
 

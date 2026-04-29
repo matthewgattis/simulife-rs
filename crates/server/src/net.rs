@@ -128,6 +128,7 @@ async fn handle_stream(
                 paused,
                 tick_hz,
                 tick: state.current_tick.load(Ordering::Relaxed),
+                seed: state.seed,
             })
         }
         ClientMessage::Subscribe => {

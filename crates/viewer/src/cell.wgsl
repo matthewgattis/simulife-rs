@@ -92,7 +92,7 @@ fn soil_color(cell: Cell, show_organic: bool, show_energy: bool) -> vec3<f32> {
     if (show_energy) {
         color = mix(color, blue, f32(cell.soil_energy) / 255.0);
     }
-    return color;
+    return color * select(0.8, 1.0, cell.sunlit != 0u);
 }
 
 fn occupant_color(cell: Cell) -> vec3<f32> {
@@ -100,7 +100,7 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     if (cell.kind == KIND_ROOT) { return vec3<f32>(0.50, 0.30, 0.10); }
     if (cell.kind == KIND_STEM) { return vec3<f32>(0.55, 0.45, 0.25); }
     if (cell.kind == KIND_ANTENNA) { return vec3<f32>(0.30, 0.55, 0.95); }
-    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 0.85, 0.20); }
+    if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 1.00, 1.00); }
     if (cell.kind == KIND_SEED) { return vec3<f32>(0.80, 0.70, 0.35); }
     return vec3<f32>(0.0);
 }
@@ -162,17 +162,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let show_fg = (world.layer_flags & LAYER_FG) != 0u;
 
     var color = soil_color(cell, show_organic, show_energy);
+
     if (show_fg && cell.kind != KIND_EMPTY) {
         let s = shape_sdf(cell, cell_uv, aa_axis);
         let d = s.x;
         let aa_w = s.y;
         let aa_pixel = max(aa_axis.x, aa_axis.y);
         let outline_fade = 1.0 - smoothstep(0.05, 0.15, aa_pixel);
-        let outline_w = aa_w * 1.0 * outline_fade;
+        let outline_w = aa_w * 0.5 * outline_fade;
         let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
         let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
         let fg = occupant_color(cell);
-        //color = mix(color, OUTLINE_COLOR, alpha_outer);
+        color = mix(color, OUTLINE_COLOR, alpha_outer);
         color = mix(color, fg, alpha_inner);
     }
 

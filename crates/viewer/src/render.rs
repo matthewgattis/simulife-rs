@@ -795,6 +795,7 @@ fn draw_ui(
                 NetworkStatus::Connected {
                     world_chunks_x,
                     world_chunks_y,
+                    seed,
                     ..
                 } => {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
@@ -802,6 +803,7 @@ fn draw_ui(
                     ui.label(format!(
                         "World: {world_chunks_x} × {world_chunks_y} chunks"
                     ));
+                    ui.label(format!("Seed: {seed:#018x}"));
                 }
             }
             ui.separator();

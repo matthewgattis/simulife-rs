@@ -18,6 +18,8 @@ use anyhow::Result;
 use clap::Parser;
 use protocol::CHUNK_AREA;
 use quinn::Endpoint;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha12Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -65,6 +67,11 @@ struct Args {
     /// auto-saves; the final shutdown save still runs.
     #[arg(long, default_value_t = 30)]
     autosave_secs: u64,
+
+    /// World seed (u64). If omitted, a random seed is drawn from the OS RNG.
+    /// Loaded snapshots already include their seed and override this flag.
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 #[tokio::main]
@@ -81,6 +88,16 @@ async fn main() -> Result<()> {
         args.world_width,
         args.world_height,
     )?;
+    // Loaded snapshots carry their own seed/RNG; only the CLI flag (or a
+    // freshly-drawn random) takes effect for newly-built worlds.
+    let seed = initial
+        .seed
+        .unwrap_or_else(|| args.seed.unwrap_or_else(|| rand::thread_rng().r#gen()));
+    let rng = initial
+        .rng
+        .clone()
+        .unwrap_or_else(|| ChaCha12Rng::seed_from_u64(seed));
+    info!(seed, "world seed");
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
         chunks_x: initial.chunks_x,
@@ -94,6 +111,8 @@ async fn main() -> Result<()> {
             tick_hz: args.tick_hz.max(1),
             step_pending: 0,
         }),
+        seed,
+        rng: std::sync::Mutex::new(rng),
     });
 
     info!(
