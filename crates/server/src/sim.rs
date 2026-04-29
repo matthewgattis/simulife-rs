@@ -34,6 +34,16 @@ const SOIL_ENERGY_REGULATION: u16 = 1;
 /// reserves (upkeep ticks it down) until starvation or germination.
 const SEED_DROPOFF_THRESHOLD: Energy = 100;
 
+/// When a cell's soil organic exceeds this, the soil is toxic. Every
+/// occupant except a Root dies. Picked above the 0..=255 range build_world
+/// seeds organic with so a freshly-built world has no poisoned cells.
+const SOIL_ORGANIC_POISON: u16 = 300;
+
+/// When a cell's soil_energy exceeds this, every occupant except an
+/// Antenna dies. Above the 100 rest level so soil regulation alone can't
+/// trigger it; only sustained death-deposits push it here.
+const SOIL_ENERGY_POISON: u16 = 200;
+
 /// Per-slot spawn cost. Sprout drains the sum of these for whatever it
 /// produces in a generation. Each new cell starts with its slot's cost as
 /// its initial energy.
@@ -597,34 +607,68 @@ fn mutate_world(
         }
     }
 
-    // Phase 7: death — collect 0-energy occupants and stems with no push
-    // target (children == 0 AND parent is None or points at an empty cell),
-    // then deposit organic over a 3x3 area and replace the cell with Empty.
-    let mut dying: Vec<(i32, i32)> = Vec::new();
+    // Phase 7: death — collect cells that should die this tick. Reasons:
+    //   - energy_dead: occupant.energy is 0
+    //   - stranded:   stem with no push target (no children + missing parent)
+    //                 or production cell (Leaf/Root/Antenna) whose parent is
+    //                 missing
+    //   - poisoned:   soil organic or soil energy exceeds the toxicity
+    //                 threshold and the occupant isn't immune (Root is
+    //                 immune to organic, Antenna is immune to energy)
+    // Apply: deposit organic per kernel weight + distribute the dying
+    // cell's own energy across the kernel, then replace cell with Empty.
+    let mut dying: Vec<(i32, i32, Energy)> = Vec::new();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
                 for lx in 0..(CHUNK_EDGE as usize) {
                     let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
                     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    let occ = &chunks[chunk_idx].cells[cell_idx].occupant;
+                    let cell = &chunks[chunk_idx].cells[cell_idx];
+                    let occ = &cell.occupant;
                     let wx = cx as i32 * edge + lx as i32;
                     let wy = cy as i32 * edge + ly as i32;
                     let energy_dead = matches!(occupant_energy(occ), Some(0));
                     let stranded =
                         cell_has_no_push_target(occ, chunks, chunks_x, max_x, max_y, wx, wy);
-                    if energy_dead || stranded {
-                        dying.push((wx, wy));
+                    let poisoned = is_poisoned(occ, cell.organic, cell.soil_energy);
+                    if energy_dead || stranded || poisoned {
+                        let energy = occupant_energy(occ).unwrap_or(0);
+                        dying.push((wx, wy, energy));
                     }
                 }
             }
         }
     }
-    for (wx, wy) in dying {
-        deposit_kernel(chunks, chunks_x, wx, wy, max_x, max_y, &DEATH_DEPOSIT_KERNEL);
+    for (wx, wy, energy) in dying {
+        deposit_kernel(
+            chunks,
+            chunks_x,
+            wx,
+            wy,
+            max_x,
+            max_y,
+            &DEATH_DEPOSIT_KERNEL,
+            energy,
+        );
         if let Some(cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             cell.occupant = Occupant::Empty;
         }
+    }
+}
+
+/// True iff the soil's chemistry is fatal for this occupant.
+/// - Roots are immune to organic poisoning, vulnerable to energy.
+/// - Antennas are immune to energy poisoning, vulnerable to organic.
+/// - Everyone else dies to either.
+fn is_poisoned(occ: &Occupant, organic: u16, soil_energy: u16) -> bool {
+    let organic_toxic = organic > SOIL_ORGANIC_POISON;
+    let energy_toxic = soil_energy > SOIL_ENERGY_POISON;
+    match occ {
+        Occupant::Empty => false,
+        Occupant::Root { .. } => energy_toxic,
+        Occupant::Antenna { .. } => organic_toxic,
+        _ => organic_toxic || energy_toxic,
     }
 }
 
@@ -811,7 +855,16 @@ fn deposit_kernel(
     max_x: i32,
     max_y: i32,
     kernel: &[[u16; 3]; 3],
+    energy: Energy,
 ) {
+    let kernel_sum: u32 = kernel.iter().flatten().map(|&w| w as u32).sum();
+    // Integer-divide to keep the deposit lossless: per_unit * kernel_sum
+    // never exceeds energy, so we don't manufacture energy from death.
+    let per_unit = if kernel_sum > 0 {
+        energy as u32 / kernel_sum
+    } else {
+        0
+    };
     for dy in -1..=1i32 {
         for dx in -1..=1i32 {
             let weight = kernel[(dy + 1) as usize][(dx + 1) as usize];
@@ -825,6 +878,8 @@ fn deposit_kernel(
             }
             if let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) {
                 cell.organic = cell.organic.saturating_add(weight);
+                let energy_share = (per_unit * weight as u32).min(u16::MAX as u32) as u16;
+                cell.soil_energy = cell.soil_energy.saturating_add(energy_share);
             }
         }
     }
@@ -998,7 +1053,16 @@ fn attempt_growth(
     // pinned at the world edge with all sides blocked) from accumulating
     // energy forever.
     if !viable.iter().any(|v| *v) {
-        deposit_kernel(chunks, chunks_x, wx, wy, max_x, max_y, &DEATH_DEPOSIT_KERNEL);
+        deposit_kernel(
+            chunks,
+            chunks_x,
+            wx,
+            wy,
+            max_x,
+            max_y,
+            &DEATH_DEPOSIT_KERNEL,
+            sprout_energy,
+        );
         if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             self_cell.occupant = Occupant::Empty;
         }
@@ -2462,6 +2526,145 @@ mod tests {
             }
             other => panic!("expected stem, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn phase_death_distributes_dying_cell_energy() {
+        // Lone leaf with parent=None — orphan-dies on tick 1. Its 50 units
+        // of energy should be sprinkled across the 3x3 death kernel into
+        // surrounding soil_energy. With kernel_sum=16 and energy=50, each
+        // unit weight gets 50/16 = 3 units.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: None,
+            },
+        );
+
+        // Snapshot soil_energy beforehand so we can compute deltas without
+        // worrying about phase 1.5 regulation.
+        let before: Vec<u16> = chunks[0].cells.iter().map(|c| c.soil_energy).collect();
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        // Center weight=4 → +12 energy. Cardinals weight=2 → +6. Corners
+        // weight=1 → +3. Soil regulation also adds +1 to every cell since
+        // they all started below the rest level.
+        let cell_at_idx =
+            |x: i32, y: i32| -> usize { (y as usize) * (CHUNK_EDGE as usize) + x as usize };
+        let center_idx = cell_at_idx(10, 10);
+        let north_idx = cell_at_idx(10, 9);
+        let nw_idx = cell_at_idx(9, 9);
+        assert_eq!(chunks[0].cells[center_idx].soil_energy, before[center_idx] + 1 + 12);
+        assert_eq!(chunks[0].cells[north_idx].soil_energy, before[north_idx] + 1 + 6);
+        assert_eq!(chunks[0].cells[nw_idx].soil_energy, before[nw_idx] + 1 + 3);
+    }
+
+    #[test]
+    fn phase_death_organic_poison_kills_leaf_but_not_root() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        // Two cells with high organic. One holds a leaf, one a root. Both
+        // also need parents/structure that wouldn't kill them on their own.
+        // Easiest: give them both Some(direction) parents pointing at each
+        // other so neither orphan-dies — root.parent=East (at leaf),
+        // leaf.parent=West (at root). Same plant.
+        let high_organic = SOIL_ORGANIC_POISON + 10;
+        let leaf_idx = 10 * (CHUNK_EDGE as usize) + 11;
+        let root_idx = 10 * (CHUNK_EDGE as usize) + 10;
+        chunks[0].cells[leaf_idx].organic = high_organic;
+        chunks[0].cells[root_idx].organic = high_organic;
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Root {
+                plant: 1,
+                energy: 50,
+                parent: Some(Direction::East),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            11,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: Some(Direction::West),
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        // Leaf died from organic poisoning.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 10).occupant,
+            Occupant::Empty
+        ));
+        // Root survived — immune to organic poison.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Root { .. }
+        ));
+    }
+
+    #[test]
+    fn phase_death_energy_poison_kills_leaf_but_not_antenna() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let high_energy = SOIL_ENERGY_POISON + 10;
+        let leaf_idx = 10 * (CHUNK_EDGE as usize) + 11;
+        let antenna_idx = 10 * (CHUNK_EDGE as usize) + 10;
+        chunks[0].cells[leaf_idx].soil_energy = high_energy;
+        chunks[0].cells[antenna_idx].soil_energy = high_energy;
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Antenna {
+                plant: 1,
+                energy: 50,
+                parent: Some(Direction::East),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            11,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: Some(Direction::West),
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        // Leaf died from energy poisoning.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 10).occupant,
+            Occupant::Empty
+        ));
+        // Antenna survived — immune to energy poison.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Antenna { .. }
+        ));
     }
 
     #[test]
