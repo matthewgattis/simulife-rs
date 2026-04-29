@@ -23,6 +23,17 @@ const UPKEEP_DEFAULT: Energy = 1;
 const UPKEEP_SEED: Energy = 1;
 const UPKEEP_SPROUT: Energy = 3;
 
+/// Soil energy "rest level". Each tick every cell's soil_energy drifts by
+/// SOIL_ENERGY_REGULATION toward this value.
+const SOIL_ENERGY_REST: u16 = 100;
+const SOIL_ENERGY_REGULATION: u16 = 1;
+
+/// Once a seed has accumulated this much energy from its parent stem, it
+/// disconnects: parent stem drops the children-bit pointing at the seed,
+/// and the seed clears its own parent. The seed then lives off its
+/// reserves (upkeep ticks it down) until starvation or germination.
+const SEED_DROPOFF_THRESHOLD: Energy = 100;
+
 /// Per-slot spawn cost. Sprout drains the sum of these for whatever it
 /// produces in a generation. Each new cell starts with its slot's cost as
 /// its initial energy.
@@ -33,7 +44,7 @@ const COST_ANTENNA: Energy = 5;
 const COST_SEED: Energy = 30;
 
 /// Per-field probability of mutating a single field at any copy site.
-const MUTATION_RATE: f32 = 0.01;
+const MUTATION_RATE: f32 = 0.02;
 
 const ROOT_PULL_KERNEL: [[u16; 3]; 3] = [
     [0, 1, 0],
@@ -243,6 +254,23 @@ fn mutate_world(
         }
     }
 
+    // Phase 1.5: soil energy regulation. Each cell drifts its soil_energy
+    // toward SOIL_ENERGY_REST by SOIL_ENERGY_REGULATION per tick. Runs
+    // before soil pulls so antennae deplete a freshened soil each tick.
+    for chunk in chunks.iter_mut() {
+        for cell in chunk.cells.iter_mut() {
+            if cell.soil_energy < SOIL_ENERGY_REST {
+                cell.soil_energy = (cell.soil_energy + SOIL_ENERGY_REGULATION)
+                    .min(SOIL_ENERGY_REST);
+            } else if cell.soil_energy > SOIL_ENERGY_REST {
+                cell.soil_energy = cell
+                    .soil_energy
+                    .saturating_sub(SOIL_ENERGY_REGULATION)
+                    .max(SOIL_ENERGY_REST);
+            }
+        }
+    }
+
     // Phase 2: soil pulls. Serial — multiple roots near the same soil cell
     // each take their share in iteration order until that cell is empty.
     for cy in 0..chunks_y {
@@ -423,7 +451,51 @@ fn mutate_world(
         }
     }
 
-    // Phase 5: growth — sprouts execute their current gene if energy covers
+    // Phase 5.5: seed dropoff. After push, any seed at or above the
+    // threshold disconnects from its parent stem — clearing the stem's
+    // children-bit pointing at it and zeroing the seed's own parent. The
+    // seed then lives off accumulated energy until starvation.
+    let mut dropoffs: Vec<(i32, i32, i32, i32, u8)> = Vec::new();
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    if let Occupant::Seed {
+                        energy,
+                        parent: Some(parent_dir),
+                        ..
+                    } = &chunks[chunk_idx].cells[cell_idx].occupant
+                    {
+                        if *energy >= SEED_DROPOFF_THRESHOLD {
+                            let wx = cx as i32 * edge + lx as i32;
+                            let wy = cy as i32 * edge + ly as i32;
+                            let (dx, dy) = direction_to_delta(*parent_dir);
+                            let parent_x = wx + dx;
+                            let parent_y = wy + dy;
+                            let parent_bit = dir_to_bitmask(opposite_dir(*parent_dir));
+                            dropoffs.push((wx, wy, parent_x, parent_y, parent_bit));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (sx, sy, px, py, bit) in dropoffs {
+        if let Some(seed_cell) = cell_at_mut(chunks, chunks_x, sx, sy) {
+            if let Occupant::Seed { parent, .. } = &mut seed_cell.occupant {
+                *parent = None;
+            }
+        }
+        if let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py) {
+            if let Occupant::Stem { children, .. } = &mut parent_cell.occupant {
+                *children &= !bit;
+            }
+        }
+    }
+
+    // Phase 6: growth — sprouts execute their current gene if energy covers
     // the slot costs and all desired targets are Empty.
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
@@ -2208,5 +2280,128 @@ mod tests {
             cell_at(&chunks, chunks_x, 10, 10).occupant,
             Occupant::Empty
         ));
+    }
+
+    #[test]
+    fn phase_soil_regulation_drifts_toward_rest() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        // Three sample cells: below, at, above the rest level.
+        let edge = CHUNK_EDGE as usize;
+        chunks[0].cells[0].soil_energy = 50; // below
+        chunks[0].cells[1].soil_energy = SOIL_ENERGY_REST; // at rest
+        chunks[0].cells[2].soil_energy = 200; // above
+        // No occupants, so other phases are no-ops.
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        assert_eq!(chunks[0].cells[0].soil_energy, 50 + SOIL_ENERGY_REGULATION);
+        assert_eq!(chunks[0].cells[1].soil_energy, SOIL_ENERGY_REST);
+        assert_eq!(chunks[0].cells[2].soil_energy, 200 - SOIL_ENERGY_REGULATION);
+        let _ = edge;
+    }
+
+    #[test]
+    fn phase_soil_regulation_clamps_at_rest() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        // Just-below and just-above cases — must not overshoot rest.
+        chunks[0].cells[0].soil_energy = SOIL_ENERGY_REST - 1;
+        chunks[0].cells[1].soil_energy = SOIL_ENERGY_REST + 1;
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        assert_eq!(chunks[0].cells[0].soil_energy, SOIL_ENERGY_REST);
+        assert_eq!(chunks[0].cells[1].soil_energy, SOIL_ENERGY_REST);
+    }
+
+    /// Build trunk-stem + middle-stem-pointing-at-seed + seed setup so the
+    /// middle stem doesn't orphan-die after dropoff clears its child bit.
+    fn place_seed_dropoff_fixture(chunks: &mut [Chunk], seed_energy: Energy) {
+        place(
+            chunks,
+            1,
+            10,
+            12,
+            Occupant::Stem {
+                plant: 1,
+                energy: 50,
+                connections: STEM_CONNECT_NORTH,
+                parent: None,
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        place(
+            chunks,
+            1,
+            10,
+            11,
+            Occupant::Stem {
+                plant: 1,
+                energy: 50,
+                connections: STEM_CONNECT_NORTH | STEM_CONNECT_SOUTH,
+                parent: Some(Direction::South),
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        place(
+            chunks,
+            1,
+            10,
+            10,
+            Occupant::Seed {
+                plant: 1,
+                energy: seed_energy,
+                facing: Direction::North,
+                genome: Box::new(Genome::default_vine()),
+                parent: Some(Direction::South),
+            },
+        );
+    }
+
+    #[test]
+    fn phase_seed_dropoff_disconnects_at_threshold() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place_seed_dropoff_fixture(&mut chunks, SEED_DROPOFF_THRESHOLD);
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        match &cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Seed { parent, .. } => assert_eq!(*parent, None),
+            other => panic!("expected seed, got {other:?}"),
+        }
+        match &cell_at(&chunks, chunks_x, 10, 11).occupant {
+            Occupant::Stem { children, .. } => {
+                assert_eq!(
+                    *children & STEM_CONNECT_NORTH,
+                    0,
+                    "north (seed) bit should be cleared"
+                );
+            }
+            other => panic!("expected stem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_seed_dropoff_keeps_below_threshold_connected() {
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        // Low enough that even after upkeep + push from the trunk chain,
+        // it stays under the dropoff threshold.
+        place_seed_dropoff_fixture(&mut chunks, 30);
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        match &cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Seed { parent, .. } => assert_eq!(*parent, Some(Direction::South)),
+            other => panic!("expected seed, got {other:?}"),
+        }
+        match &cell_at(&chunks, chunks_x, 10, 11).occupant {
+            Occupant::Stem { children, .. } => {
+                assert_eq!(*children & STEM_CONNECT_NORTH, STEM_CONNECT_NORTH);
+            }
+            other => panic!("expected stem, got {other:?}"),
+        }
     }
 }
