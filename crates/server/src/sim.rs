@@ -1127,4 +1127,386 @@ mod tests {
             Occupant::Empty
         ));
     }
+
+    // ---------- pure-helper tests ----------
+
+    #[test]
+    fn dir_bitmask_round_trip() {
+        for d in [
+            Direction::North,
+            Direction::East,
+            Direction::South,
+            Direction::West,
+        ] {
+            let mask = dir_to_bitmask(d);
+            let dirs = bitmask_to_dirs(mask);
+            assert_eq!(dirs, vec![d]);
+            assert_eq!(bit_to_dir(mask), d);
+        }
+    }
+
+    #[test]
+    fn bitmask_to_dirs_decodes_combined_mask() {
+        let mask = STEM_CONNECT_NORTH | STEM_CONNECT_EAST | STEM_CONNECT_SOUTH | STEM_CONNECT_WEST;
+        assert_eq!(
+            bitmask_to_dirs(mask),
+            vec![
+                Direction::North,
+                Direction::East,
+                Direction::South,
+                Direction::West,
+            ]
+        );
+        assert!(bitmask_to_dirs(0).is_empty());
+    }
+
+    #[test]
+    fn rotate_left_cycles_through_all_dirs() {
+        let mut d = Direction::North;
+        d = rotate_left(d);
+        assert_eq!(d, Direction::West);
+        d = rotate_left(d);
+        assert_eq!(d, Direction::South);
+        d = rotate_left(d);
+        assert_eq!(d, Direction::East);
+        d = rotate_left(d);
+        assert_eq!(d, Direction::North);
+    }
+
+    #[test]
+    fn rotate_right_cycles_through_all_dirs() {
+        let mut d = Direction::North;
+        d = rotate_right(d);
+        assert_eq!(d, Direction::East);
+        d = rotate_right(d);
+        assert_eq!(d, Direction::South);
+        d = rotate_right(d);
+        assert_eq!(d, Direction::West);
+        d = rotate_right(d);
+        assert_eq!(d, Direction::North);
+    }
+
+    #[test]
+    fn opposite_dir_is_involution() {
+        for d in [
+            Direction::North,
+            Direction::East,
+            Direction::South,
+            Direction::West,
+        ] {
+            assert_eq!(opposite_dir(opposite_dir(d)), d);
+        }
+        assert_eq!(opposite_dir(Direction::North), Direction::South);
+        assert_eq!(opposite_dir(Direction::East), Direction::West);
+    }
+
+    #[test]
+    fn direction_to_delta_matches_screen_axes() {
+        assert_eq!(direction_to_delta(Direction::North), (0, -1));
+        assert_eq!(direction_to_delta(Direction::East), (1, 0));
+        assert_eq!(direction_to_delta(Direction::South), (0, 1));
+        assert_eq!(direction_to_delta(Direction::West), (-1, 0));
+    }
+
+    #[test]
+    fn linear_idx_packs_chunks_then_cells() {
+        // 2x1 chunk world: idx 0 is chunk(0,0)'s first cell.
+        assert_eq!(linear_idx(2, 0, 0), 0);
+        // last cell of chunk(0,0)
+        let edge = CHUNK_EDGE as i32;
+        assert_eq!(
+            linear_idx(2, edge - 1, edge - 1),
+            CHUNK_AREA - 1
+        );
+        // first cell of chunk(1,0)
+        assert_eq!(linear_idx(2, edge, 0), CHUNK_AREA);
+    }
+
+    #[test]
+    fn is_valid_child_only_for_sinks() {
+        let sprout = Occupant::Sprout {
+            plant: 1,
+            energy: 10,
+            facing: Direction::North,
+            genome: Box::new(Genome::default_vine()),
+            parent: None,
+            current_gene: 0,
+        };
+        let stem_with_kids = Occupant::Stem {
+            plant: 1,
+            energy: 10,
+            connections: STEM_CONNECT_NORTH,
+            parent: None,
+            children: STEM_CONNECT_NORTH,
+        };
+        let stem_no_kids = Occupant::Stem {
+            plant: 1,
+            energy: 10,
+            connections: 0,
+            parent: None,
+            children: 0,
+        };
+        let leaf = Occupant::Leaf {
+            plant: 1,
+            energy: 10,
+            facing: Direction::North,
+            parent: None,
+        };
+        assert!(is_valid_child(&sprout));
+        assert!(is_valid_child(&stem_with_kids));
+        assert!(!is_valid_child(&stem_no_kids));
+        assert!(!is_valid_child(&leaf));
+        assert!(!is_valid_child(&Occupant::Empty));
+    }
+
+    #[test]
+    fn push_targets_match_role() {
+        let leaf = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            parent: Some(Direction::South),
+        };
+        assert_eq!(push_targets(&leaf), vec![Direction::South]);
+
+        let leaf_orphan = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            parent: None,
+        };
+        assert!(push_targets(&leaf_orphan).is_empty());
+
+        let stem_kids = Occupant::Stem {
+            plant: 1,
+            energy: 0,
+            connections: 0,
+            parent: Some(Direction::South),
+            children: STEM_CONNECT_NORTH | STEM_CONNECT_EAST,
+        };
+        assert_eq!(
+            push_targets(&stem_kids),
+            vec![Direction::North, Direction::East]
+        );
+
+        let stem_no_kids = Occupant::Stem {
+            plant: 1,
+            energy: 0,
+            connections: 0,
+            parent: Some(Direction::South),
+            children: 0,
+        };
+        assert_eq!(push_targets(&stem_no_kids), vec![Direction::South]);
+
+        let sprout = Occupant::Sprout {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            genome: Box::new(Genome::default_vine()),
+            parent: Some(Direction::South),
+            current_gene: 0,
+        };
+        assert!(push_targets(&sprout).is_empty(), "sprouts are sinks");
+
+        assert!(push_targets(&Occupant::Empty).is_empty());
+    }
+
+    #[test]
+    fn cell_has_no_push_target_for_orphans_and_oob() {
+        let chunks_x = 1u32;
+        let max = CHUNK_EDGE as i32;
+        let mut chunks = empty_world(chunks_x, 1);
+
+        // Stem with children=0 and parent=None → orphan.
+        let stem_orphan = Occupant::Stem {
+            plant: 1,
+            energy: 0,
+            connections: 0,
+            parent: None,
+            children: 0,
+        };
+        assert!(cell_has_no_push_target(
+            &stem_orphan, &chunks, chunks_x, max, max, 5, 5
+        ));
+
+        // Stem with children present → not orphan.
+        let stem_kid = Occupant::Stem {
+            plant: 1,
+            energy: 0,
+            connections: 0,
+            parent: None,
+            children: STEM_CONNECT_NORTH,
+        };
+        assert!(!cell_has_no_push_target(
+            &stem_kid, &chunks, chunks_x, max, max, 5, 5
+        ));
+
+        // Leaf whose parent direction points at an Empty cell → orphan.
+        let leaf = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            parent: Some(Direction::South),
+        };
+        assert!(cell_has_no_push_target(
+            &leaf, &chunks, chunks_x, max, max, 5, 5
+        ));
+
+        // Same leaf, but place a stem in the parent direction → not orphan.
+        place(
+            &mut chunks,
+            chunks_x,
+            5,
+            6,
+            Occupant::Stem {
+                plant: 1,
+                energy: 0,
+                connections: 0,
+                parent: None,
+                children: STEM_CONNECT_NORTH,
+            },
+        );
+        assert!(!cell_has_no_push_target(
+            &leaf, &chunks, chunks_x, max, max, 5, 5
+        ));
+
+        // Leaf at top edge with parent=North → OOB, orphan.
+        let leaf_top = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::South,
+            parent: Some(Direction::North),
+        };
+        assert!(cell_has_no_push_target(
+            &leaf_top, &chunks, chunks_x, max, max, 5, 0
+        ));
+
+        // Sprout / seed / empty are not subject to orphan death.
+        assert!(!cell_has_no_push_target(
+            &Occupant::Empty, &chunks, chunks_x, max, max, 0, 0
+        ));
+    }
+
+    #[test]
+    fn slot_cost_per_product() {
+        assert_eq!(slot_cost(SlotProduct::Nothing), 0);
+        assert_eq!(slot_cost(SlotProduct::Leaf), COST_LEAF);
+        assert_eq!(slot_cost(SlotProduct::Root), COST_ROOT);
+        assert_eq!(slot_cost(SlotProduct::Antenna), COST_ANTENNA);
+        assert_eq!(slot_cost(SlotProduct::Seed), COST_SEED);
+        assert_eq!(slot_cost(SlotProduct::Sprout), COST_SPROUT);
+    }
+
+    #[test]
+    fn make_slot_occupant_sets_parent_back_toward_creator() {
+        // The parent direction passed to make_slot_occupant is the spawn
+        // direction; the new cell's `parent` field should point the OPPOSITE
+        // way (back at the producing sprout).
+        let parent_genome = Genome::default_vine();
+        let leaf =
+            make_slot_occupant(SlotProduct::Leaf, 7, Direction::East, Direction::East, &parent_genome, 0)
+                .unwrap();
+        match leaf {
+            Occupant::Leaf {
+                plant,
+                facing,
+                parent,
+                energy,
+            } => {
+                assert_eq!(plant, 7);
+                assert_eq!(facing, Direction::East);
+                assert_eq!(parent, Some(Direction::West));
+                assert_eq!(energy, COST_LEAF);
+            }
+            _ => panic!("expected leaf"),
+        }
+
+        let nothing = make_slot_occupant(
+            SlotProduct::Nothing,
+            1,
+            Direction::North,
+            Direction::North,
+            &parent_genome,
+            0,
+        );
+        assert!(nothing.is_none());
+
+        let sprout = make_slot_occupant(
+            SlotProduct::Sprout,
+            5,
+            Direction::North,
+            Direction::North,
+            &parent_genome,
+            3,
+        )
+        .unwrap();
+        match sprout {
+            Occupant::Sprout {
+                current_gene,
+                parent,
+                ..
+            } => {
+                assert_eq!(current_gene, 3);
+                assert_eq!(parent, Some(Direction::South));
+            }
+            _ => panic!("expected sprout"),
+        }
+    }
+
+    #[test]
+    fn occupant_energy_get_set_round_trip() {
+        let mut occ = Occupant::Stem {
+            plant: 1,
+            energy: 50,
+            connections: 0,
+            parent: None,
+            children: STEM_CONNECT_NORTH,
+        };
+        assert_eq!(occupant_energy(&occ), Some(50));
+        set_occupant_energy(&mut occ, 99);
+        assert_eq!(occupant_energy(&occ), Some(99));
+
+        let empty = Occupant::Empty;
+        assert_eq!(occupant_energy(&empty), None);
+    }
+
+    #[test]
+    fn upkeep_for_each_occupant() {
+        let leaf = Occupant::Leaf {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            parent: None,
+        };
+        let sprout = Occupant::Sprout {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            genome: Box::new(Genome::default_vine()),
+            parent: None,
+            current_gene: 0,
+        };
+        let seed = Occupant::Seed {
+            plant: 1,
+            energy: 0,
+            facing: Direction::North,
+            genome: Box::new(Genome::default_vine()),
+            parent: None,
+        };
+        assert_eq!(upkeep_for(&leaf), UPKEEP_DEFAULT);
+        assert_eq!(upkeep_for(&sprout), UPKEEP_SPROUT);
+        assert_eq!(upkeep_for(&seed), UPKEEP_SEED);
+        assert_eq!(upkeep_for(&Occupant::Empty), 0);
+    }
+
+    #[test]
+    fn mutate_genome_at_rate_zero_clones_exactly() {
+        // MUTATION_RATE is currently 0.0, so this is a no-op clone. If the
+        // const ever becomes nonzero, this test will start to flake — at
+        // which point mutation should be tested via a seeded RNG instead.
+        assert_eq!(MUTATION_RATE, 0.0);
+        let g = Genome::default_vine();
+        let copied = mutate_genome(&g);
+        assert_eq!(copied, g);
+    }
 }
