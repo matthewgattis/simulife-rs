@@ -840,10 +840,8 @@ fn draw_ui(
                     // for the broadcast Welcome to update *sim_paused.
                     let _ = outgoing.send(ClientMessage::SetPaused(!*sim_paused));
                 }
-                if ui
-                    .add_enabled(*sim_paused, egui::Button::new("Step"))
-                    .clicked()
-                {
+                if ui.button("Step").clicked() {
+                    // Step always pauses — server treats it that way.
                     let _ = outgoing.send(ClientMessage::Step);
                 }
             });

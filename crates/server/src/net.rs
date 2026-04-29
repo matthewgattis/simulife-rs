@@ -99,9 +99,19 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
             broadcast_sim_status(&state);
         }
         ClientMessage::Step => {
-            let mut ctrl = state.control.lock().expect("control poisoned");
-            ctrl.step_pending = ctrl.step_pending.saturating_add(1);
-            debug!(step_pending = ctrl.step_pending, "step requested");
+            let was_running = {
+                let mut ctrl = state.control.lock().expect("control poisoned");
+                let was_running = !ctrl.paused;
+                ctrl.paused = true;
+                ctrl.step_pending = ctrl.step_pending.saturating_add(1);
+                debug!(step_pending = ctrl.step_pending, "step requested");
+                was_running
+            };
+            // Step inherently pauses — if it just transitioned the sim from
+            // running to paused, viewers need to know.
+            if was_running {
+                broadcast_sim_status(&state);
+            }
         }
         ClientMessage::SetTickHz(hz) => {
             let hz = hz.max(1);

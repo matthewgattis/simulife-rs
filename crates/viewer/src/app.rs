@@ -351,6 +351,11 @@ impl ApplicationHandler<UserEvent> for App {
                         .outgoing
                         .send(ClientMessage::SetPaused(!self.sim_paused));
                 }
+                Key::Character(c) if c.as_str() == "." => {
+                    // Step inherently pauses (server-side); works whether
+                    // currently running or paused.
+                    let _ = self.outgoing.send(ClientMessage::Step);
+                }
                 _ => {}
             },
             WindowEvent::MouseWheel { delta, .. } => {
