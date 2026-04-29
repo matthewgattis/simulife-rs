@@ -672,6 +672,39 @@ fn mutate_world(
             &DEATH_DEPOSIT_KERNEL,
             energy,
         );
+        // Clear parent direction on any neighbor that pointed at us.
+        // Otherwise, if a foreign cell later repopulates our position
+        // (via growth or eating into Empty), the orphan would silently
+        // re-attach across plants and pump energy.
+        for d in [
+            Direction::North,
+            Direction::East,
+            Direction::South,
+            Direction::West,
+        ] {
+            let (dx, dy) = direction_to_delta(d);
+            let nx = wx + dx;
+            let ny = wy + dy;
+            if nx < 0 || ny < 0 || nx >= max_x || ny >= max_y {
+                continue;
+            }
+            let opp = opposite_dir(d);
+            if let Some(neighbor) = cell_at_mut(chunks, chunks_x, nx, ny) {
+                match &mut neighbor.occupant {
+                    Occupant::Leaf { parent, .. }
+                    | Occupant::Root { parent, .. }
+                    | Occupant::Antenna { parent, .. }
+                    | Occupant::Stem { parent, .. }
+                    | Occupant::Sprout { parent, .. }
+                    | Occupant::Seed { parent, .. } => {
+                        if *parent == Some(opp) {
+                            *parent = None;
+                        }
+                    }
+                    Occupant::Empty => {}
+                }
+            }
+        }
         if let Some(cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
             cell.occupant = Occupant::Empty;
         }
@@ -2758,6 +2791,62 @@ mod tests {
         match &cell_at(&chunks, chunks_x, 10, 8).occupant {
             Occupant::Stem { children, .. } => assert_eq!(*children, 0),
             other => panic!("expected stem at tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_death_clears_parent_on_neighbors_pointing_at_dying() {
+        // A leaf at (10, 10) with parent=South pointing at a stem at
+        // (10, 11). The stem dies (orphan + zero energy). After the
+        // tick the leaf's parent should be None — so even if a foreign
+        // cell later repopulates (10, 11), the leaf can't silently
+        // re-attach.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Leaf {
+                plant: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: Some(Direction::South),
+            },
+        );
+        // Stem about to die: zero energy and no children.
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            11,
+            Occupant::Stem {
+                plant: 1,
+                energy: 0,
+                connections: 0,
+                parent: None,
+                children: 0,
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1, &mut det_rng());
+
+        // Stem died.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 10, 11).occupant,
+            Occupant::Empty
+        ));
+        // Leaf's parent has been cleared (it was Some(South), pointing
+        // at the now-dead stem). It will orphan-die next tick — we
+        // don't need to assert the leaf's still alive here, only that
+        // its parent is gone.
+        match &cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Leaf { parent, .. } => assert_eq!(*parent, None),
+            // Acceptable if it already orphan-died — that's the
+            // immediate consequence of clearing parent + push lossage.
+            Occupant::Empty => {}
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
