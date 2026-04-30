@@ -455,70 +455,10 @@ fn mutate_world(
         }
     }
 
-    // Phase 4: prune stem children. Local rule: a child bit is valid iff
-    // the target is a Sprout/Seed (sink) or a Stem with children != 0.
-    //
-    // Single-pass, compute-then-apply. Each stem reads its own + 3×3
-    // neighborhood snapshot, decides which bits to drop, and writes only
-    // to itself in the apply pass. Cascades unfold at one cell/tick — a
-    // chain of N stems whose tip dies prunes one link per tick. That
-    // matches the rest of the sim's CA semantics; we explicitly accept
-    // a few ticks of mid-cascade "energy bouncing" because the trade is
-    // worth it (no fixpoint loop, no full-world allocation per pass).
+    // Phase 4: prune. See `phase_prune_pull`.
     let _phase_prune = tracing::info_span!("phase_prune").entered();
-    let bits = [
-        STEM_CONNECT_NORTH,
-        STEM_CONNECT_EAST,
-        STEM_CONNECT_SOUTH,
-        STEM_CONNECT_WEST,
-    ];
-    let mut prune_changes: Vec<(usize, usize, u8)> = Vec::new();
-    for cy in 0..chunks_y {
-        for cx in 0..chunks_x {
-            for ly in 0..(CHUNK_EDGE as usize) {
-                for lx in 0..(CHUNK_EDGE as usize) {
-                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    let current_children =
-                        match &chunks[chunk_idx].cells[cell_idx].occupant {
-                            Occupant::Stem { children, .. } if *children != 0 => *children,
-                            _ => continue,
-                        };
-                    let wx = cx as i32 * edge + lx as i32;
-                    let wy = cy as i32 * edge + ly as i32;
-                    let mut kept = 0u8;
-                    for bit in bits {
-                        if current_children & bit == 0 {
-                            continue;
-                        }
-                        let dir = bit_to_dir(bit);
-                        let (dx, dy) = direction_to_delta(dir);
-                        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
-                        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
-                        let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
-                            + (nx / edge) as usize;
-                        let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
-                            + (nx % edge) as usize;
-                        let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
-                        if is_valid_child(&neighbor.occupant) {
-                            kept |= bit;
-                        }
-                    }
-                    if kept != current_children {
-                        prune_changes.push((chunk_idx, cell_idx, kept));
-                    }
-                }
-            }
-        }
-    }
-    let prune_change_count = prune_changes.len() as u64;
-    for (chunk_idx, cell_idx, new_c) in prune_changes {
-        if let Occupant::Stem { children, .. } =
-            &mut chunks[chunk_idx].cells[cell_idx].occupant
-        {
-            *children = new_c;
-        }
-    }
+    let prune_change_count =
+        phase_prune_pull(chunks, chunks_x, chunks_y, max_x, max_y);
     drop(_phase_prune);
     tracing::event!(
         tracing::Level::INFO,
@@ -715,70 +655,17 @@ fn mutate_world(
         "phase_germination_done"
     );
 
-    // Phase 6: growth — sprouts execute their current gene if energy covers
-    // the slot costs and all desired targets are Empty.
+    // Phase 6: growth (pull-pattern). See `phase_growth_pull` for the
+    // full multi-pass coordination logic.
     let _phase_growth = tracing::info_span!("phase_growth").entered();
-    let mut growth_attempts: u64 = 0;
-    for cy in 0..chunks_y {
-        for cx in 0..chunks_x {
-            for ly in 0..(CHUNK_EDGE as usize) {
-                for lx in 0..(CHUNK_EDGE as usize) {
-                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    let info = match &chunks[chunk_idx].cells[cell_idx].occupant {
-                        Occupant::Sprout {
-                            plant,
-                            clan,
-                            energy,
-                            facing,
-                            parent,
-                            current_gene,
-                            genome,
-                        } => Some((
-                            *plant,
-                            *clan,
-                            *energy,
-                            *facing,
-                            *parent,
-                            *current_gene,
-                            genome.clone(),
-                        )),
-                        _ => None,
-                    };
-                    if let Some((plant, clan, energy, facing, parent, current_gene, genome)) =
-                        info
-                    {
-                        let wx = cx as i32 * edge + lx as i32;
-                        let wy = cy as i32 * edge + ly as i32;
-                        growth_attempts += 1;
-                        attempt_growth(
-                            chunks,
-                            chunks_x,
-                            max_x,
-                            max_y,
-                            wx,
-                            wy,
-                            plant,
-                            clan,
-                            energy,
-                            facing,
-                            parent,
-                            current_gene,
-                            &genome,
-                            rng,
-                        );
-                    }
-                }
-            }
-        }
-    }
+    let growth_attempts =
+        phase_growth_pull(chunks, chunks_x, chunks_y, max_x, max_y, rng);
     drop(_phase_growth);
     tracing::event!(
         tracing::Level::INFO,
         growth_attempts,
         "phase_growth_done"
     );
-
     // Phase 7: death — collect cells that should die this tick. Reasons:
     //   - energy_dead: occupant.energy is 0
     //   - stranded:   stem with no push target (no children + missing parent)
@@ -954,13 +841,38 @@ fn push_targets(occ: &Occupant) -> Vec<Direction> {
     }
 }
 
-fn is_valid_child(occ: &Occupant) -> bool {
+/// True if a neighbor cell should keep a stem's connection bit pointing
+/// at it. Empty is kept (shader masks it visually anyway, and the cell
+/// may belong to the same plant later via a child cell that grew here).
+/// Same-plant occupants of any kind are kept. Foreign live cells get
+/// the connection bit dropped — the stem visually severs from invaders.
+fn is_kin_or_empty(occ: &Occupant, parent_plant: u32) -> bool {
+    match occ {
+        Occupant::Empty => true,
+        Occupant::Sprout { plant, .. }
+        | Occupant::Seed { plant, .. }
+        | Occupant::Stem { plant, .. }
+        | Occupant::Leaf { plant, .. }
+        | Occupant::Root { plant, .. }
+        | Occupant::Antenna { plant, .. } => *plant == parent_plant,
+    }
+}
+
+fn is_valid_child(occ: &Occupant, parent_plant: u32) -> bool {
     match occ {
         // Seeds and sprouts are terminal sinks — both legitimately receive
         // pushed energy. Stems with at least one valid child also count;
         // stems with no children are dead-ends and get pruned.
-        Occupant::Sprout { .. } | Occupant::Seed { .. } => true,
-        Occupant::Stem { children, .. } => *children != 0,
+        //
+        // Plant id must match: if a foreign sprout invaded what used to
+        // be one of our children (via eat), prune drops the bit so we
+        // don't keep treating that foreign cell as kin.
+        Occupant::Sprout { plant, .. } | Occupant::Seed { plant, .. } => {
+            *plant == parent_plant
+        }
+        Occupant::Stem {
+            plant, children, ..
+        } => *plant == parent_plant && *children != 0,
         _ => false,
     }
 }
@@ -1123,18 +1035,6 @@ fn occupant_energy(occ: &Occupant) -> Option<Energy> {
     }
 }
 
-fn occupant_parent(occ: &Occupant) -> Option<Direction> {
-    match occ {
-        Occupant::Empty => None,
-        Occupant::Leaf { parent, .. }
-        | Occupant::Root { parent, .. }
-        | Occupant::Stem { parent, .. }
-        | Occupant::Antenna { parent, .. }
-        | Occupant::Sprout { parent, .. }
-        | Occupant::Seed { parent, .. } => *parent,
-    }
-}
-
 fn set_occupant_energy(occ: &mut Occupant, new_energy: Energy) {
     match occ {
         Occupant::Empty => {}
@@ -1220,76 +1120,421 @@ fn make_slot_occupant(
     })
 }
 
-fn attempt_growth(
-    chunks: &mut [Chunk],
-    chunks_x: u32,
-    max_x: i32,
-    max_y: i32,
-    wx: i32,
-    wy: i32,
+/// Pre-tick snapshot of one sprout's growth-relevant state. Filled in
+/// pass A; mutated in pass C (`won[]`); read in pass D.
+struct SproutSnapshot {
+    src_chunk_idx: usize,
+    src_cell_idx: usize,
+    src_wx: i32,
+    src_wy: i32,
     plant: u32,
     clan: ClanId,
-    sprout_energy: Energy,
-    facing: Direction,
+    energy: Energy,
     parent: Option<Direction>,
-    current_gene: u8,
-    genome: &Genome,
-    rng: &mut impl Rng,
-) {
-    if genome.genes.is_empty() {
-        return;
+    next_gene: u8,
+    genome: Box<Genome>,
+    plan_dirs: [Direction; 3],
+    plan_slots: [SlotProduct; 3],
+    harvested: [u32; 3],
+    no_viable: bool,
+    can_afford: bool,
+    won: [bool; 3],
+}
+
+/// One sprout's bid on one destination cell. Built in pass A; consumed
+/// in passes B and D.
+struct SproutBid {
+    sprout_idx: usize,
+    slot_idx: usize,
+    dst_chunk_idx: usize,
+    dst_cell_idx: usize,
+    dst_global_idx: usize,
+    /// Smallest-wins tiebreak score derived from the (src, dst) pair.
+    /// Symmetric across the world — no positional or lineage bias.
+    score: u64,
+}
+
+/// Hash of (src_pos, dst_pos) used as a deterministic tiebreak score
+/// when multiple sprouts bid on the same destination cell. FNV-1a-ish.
+/// The smallest score wins.
+fn tiebreak_score(src_wx: i32, src_wy: i32, dst_wx: i32, dst_wy: i32) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in [src_wx, src_wy, dst_wx, dst_wy] {
+        h ^= v as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
     }
-    let gene = genome.genes[(current_gene as usize) % genome.genes.len()];
-    let next_gene = (gene.next as usize % genome.genes.len()) as u8;
+    h
+}
 
-    let plan = [
-        (facing, gene.front),
-        (rotate_left(facing), gene.left),
-        (rotate_right(facing), gene.right),
+/// Pull-pattern prune phase. Each stem reads its 3×3 source state and
+/// decides which `children` / `connections` bits to drop. Returns the
+/// count of stems whose bits changed (for tracing).
+///
+/// Bits drop monotonically — never grow back. Cascades unfold at one
+/// cell per tick (compute-then-apply matches CA "speed of light").
+///
+/// `children`: drop a bit if the neighbor is not a same-plant sink
+/// (Sprout/Seed) or a same-plant Stem with `children != 0`.
+///
+/// `connections`: drop a bit if the neighbor is a foreign live cell
+/// (different plant). Empty neighbors keep the bit (the shader masks
+/// them visually, and "empty" is a former kin position).
+fn phase_prune_pull(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    chunks_y: u32,
+    max_x: i32,
+    max_y: i32,
+) -> u64 {
+    let edge = CHUNK_EDGE as i32;
+    let bits = [
+        STEM_CONNECT_NORTH,
+        STEM_CONNECT_EAST,
+        STEM_CONNECT_SOUTH,
+        STEM_CONNECT_WEST,
     ];
-
-    // Walk the plan and figure out which slots are growable. A target is
-    // viable if (a) the slot is a real product, (b) the cell is in-bounds,
-    // and (c) the cell is Empty, OR the slot produces a Sprout / Seed and
-    // the cell is an edible non-empty cell. Only Sprouts and Seeds can
-    // eat — they're the "active" products that displace existing biomass.
-    // Static slots (leaf/root/antenna) need Empty. Eaten cells get their
-    // energy harvested into the eater's pool, and we remember their old
-    // parent direction so we can sever them from the foreign stem they
-    // used to belong to.
-    let mut viable: [bool; 3] = [false; 3];
-    let mut harvested: [u32; 3] = [0; 3];
-    let mut eaten_parent: [Option<Direction>; 3] = [None; 3];
-    for (i, (dir, slot)) in plan.iter().enumerate() {
-        if matches!(slot, SlotProduct::Nothing) {
-            continue;
-        }
-        let (dx, dy) = direction_to_delta(*dir);
-        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
-        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
-        let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) else {
-            continue;
-        };
-        match edible_for(&cell.occupant, plant) {
-            EdibleStatus::Empty => {
-                viable[i] = true;
-            }
-            EdibleStatus::Edible(e) => {
-                if matches!(slot, SlotProduct::Sprout | SlotProduct::Seed) {
-                    viable[i] = true;
-                    harvested[i] = e as u32;
-                    eaten_parent[i] = occupant_parent(&cell.occupant);
+    let mut prune_changes: Vec<(usize, usize, u8, u8)> = Vec::new();
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let (cur_children, cur_connections, parent_plant, parent_dir) =
+                        match &chunks[chunk_idx].cells[cell_idx].occupant {
+                            Occupant::Stem {
+                                children,
+                                connections,
+                                plant,
+                                parent,
+                                ..
+                            } => (*children, *connections, *plant, *parent),
+                            _ => continue,
+                        };
+                    if cur_children == 0 && cur_connections == 0 {
+                        continue;
+                    }
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let mut kept_children = 0u8;
+                    let mut kept_connections = 0u8;
+                    for bit in bits {
+                        let in_children = cur_children & bit != 0;
+                        let in_connections = cur_connections & bit != 0;
+                        if !in_children && !in_connections {
+                            continue;
+                        }
+                        let dir = bit_to_dir(bit);
+                        let same_as_parent = Some(dir) == parent_dir;
+                        let (dx, dy) = direction_to_delta(dir);
+                        let neighbor_occ = match (
+                            in_bounds(wx + dx, max_x),
+                            in_bounds(wy + dy, max_y),
+                        ) {
+                            (Some(nx), Some(ny)) => {
+                                let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                                    + (nx / edge) as usize;
+                                let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                                    + (nx % edge) as usize;
+                                Some(&chunks[n_chunk_idx].cells[n_cell_idx].occupant)
+                            }
+                            _ => None,
+                        };
+                        if in_children {
+                            if let Some(n) = neighbor_occ {
+                                if is_valid_child(n, parent_plant) {
+                                    kept_children |= bit;
+                                }
+                            }
+                        }
+                        if in_connections {
+                            let keep = same_as_parent
+                                || match neighbor_occ {
+                                    Some(n) => is_kin_or_empty(n, parent_plant),
+                                    None => false,
+                                };
+                            if keep {
+                                kept_connections |= bit;
+                            }
+                        }
+                    }
+                    if kept_children != cur_children || kept_connections != cur_connections {
+                        prune_changes.push((chunk_idx, cell_idx, kept_children, kept_connections));
+                    }
                 }
             }
-            EdibleStatus::Blocked => {}
+        }
+    }
+    let prune_change_count = prune_changes.len() as u64;
+    for (chunk_idx, cell_idx, new_children, new_connections) in prune_changes {
+        if let Occupant::Stem {
+            children,
+            connections,
+            ..
+        } = &mut chunks[chunk_idx].cells[cell_idx].occupant
+        {
+            *children = new_children;
+            *connections = new_connections;
+        }
+    }
+    prune_change_count
+}
+
+/// Pull-pattern growth phase. Each sprout decides which destinations
+/// it would like to spawn into; each destination cell picks a winner
+/// among bidders; each source then decides what it becomes (Stem,
+/// Empty+deposit, or unchanged) based on which of its bids actually
+/// won. Only writes a cell to itself in the apply passes.
+///
+/// Returns the number of sprouts considered (for tracing).
+fn phase_growth_pull(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    chunks_y: u32,
+    max_x: i32,
+    max_y: i32,
+    rng: &mut impl Rng,
+) -> u64 {
+    let edge = CHUNK_EDGE as i32;
+    let mut sprouts: Vec<SproutSnapshot> = Vec::new();
+    let mut bids: Vec<SproutBid> = Vec::new();
+
+    // Pass A: gather sprouts and bids from a single read-only scan.
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let (plant, clan, energy, facing, parent, current_gene, genome) =
+                        match &chunks[chunk_idx].cells[cell_idx].occupant {
+                            Occupant::Sprout {
+                                plant,
+                                clan,
+                                energy,
+                                facing,
+                                parent,
+                                current_gene,
+                                genome,
+                            } => (
+                                *plant,
+                                *clan,
+                                *energy,
+                                *facing,
+                                *parent,
+                                *current_gene,
+                                genome.clone(),
+                            ),
+                            _ => continue,
+                        };
+                    if genome.genes.is_empty() {
+                        continue;
+                    }
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let gene = genome.genes[(current_gene as usize) % genome.genes.len()];
+                    let next_gene = (gene.next as usize % genome.genes.len()) as u8;
+                    let plan_dirs = [
+                        facing,
+                        rotate_left(facing),
+                        rotate_right(facing),
+                    ];
+                    let plan_slots = [gene.front, gene.left, gene.right];
+
+                    let mut viable = [false; 3];
+                    let mut harvested = [0u32; 3];
+                    for i in 0..3 {
+                        if matches!(plan_slots[i], SlotProduct::Nothing) {
+                            continue;
+                        }
+                        let (dx, dy) = direction_to_delta(plan_dirs[i]);
+                        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+                        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
+                        let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                            + (nx / edge) as usize;
+                        let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                            + (nx % edge) as usize;
+                        let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
+                        match edible_for(&neighbor.occupant, plant) {
+                            EdibleStatus::Empty => viable[i] = true,
+                            EdibleStatus::Edible(e) => {
+                                if matches!(
+                                    plan_slots[i],
+                                    SlotProduct::Sprout | SlotProduct::Seed
+                                ) {
+                                    viable[i] = true;
+                                    harvested[i] = e as u32;
+                                }
+                            }
+                            EdibleStatus::Blocked => {}
+                        }
+                    }
+
+                    let no_viable = !viable.iter().any(|v| *v);
+                    let effective_cost: Energy = (0..3)
+                        .filter(|i| viable[*i])
+                        .map(|i| slot_cost(plan_slots[i]))
+                        .sum();
+                    let total_harvested: u32 = harvested.iter().sum();
+                    let pool: u32 = energy as u32 + total_harvested;
+                    let can_afford = !no_viable && pool > effective_cost as u32;
+
+                    let sprout_idx = sprouts.len();
+                    sprouts.push(SproutSnapshot {
+                        src_chunk_idx: chunk_idx,
+                        src_cell_idx: cell_idx,
+                        src_wx: wx,
+                        src_wy: wy,
+                        plant,
+                        clan,
+                        energy,
+                        parent,
+                        next_gene,
+                        genome,
+                        plan_dirs,
+                        plan_slots,
+                        harvested,
+                        no_viable,
+                        can_afford,
+                        won: [false; 3],
+                    });
+
+                    if !can_afford {
+                        continue;
+                    }
+                    for i in 0..3 {
+                        if !viable[i] {
+                            continue;
+                        }
+                        let (dx, dy) = direction_to_delta(plan_dirs[i]);
+                        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+                        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
+                        let dst_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                            + (nx / edge) as usize;
+                        let dst_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                            + (nx % edge) as usize;
+                        let dst_global_idx = dst_chunk_idx * CHUNK_AREA + dst_cell_idx;
+                        bids.push(SproutBid {
+                            sprout_idx,
+                            slot_idx: i,
+                            dst_chunk_idx,
+                            dst_cell_idx,
+                            dst_global_idx,
+                            score: tiebreak_score(wx, wy, nx, ny),
+                        });
+                    }
+                }
+            }
         }
     }
 
-    // No slot can produce anything — sprout has nowhere to grow. Die in
-    // place: deposit organic and become Empty. Keeps trapped sprouts (e.g.
-    // pinned at the world edge with all sides blocked) from accumulating
-    // energy forever.
-    if !viable.iter().any(|v| *v) {
+    // Pass B: per-destination tiebreak. Track winning bid index per dst.
+    let mut winning_bid: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(bids.len());
+    for (bidi, bid) in bids.iter().enumerate() {
+        match winning_bid.get(&bid.dst_global_idx).copied() {
+            None => {
+                winning_bid.insert(bid.dst_global_idx, bidi);
+            }
+            Some(prev_i) => {
+                if bid.score < bids[prev_i].score {
+                    winning_bid.insert(bid.dst_global_idx, bidi);
+                }
+            }
+        }
+    }
+
+    // Pass C: mark which slots each sprout won.
+    for (&_dst_idx, &bidi) in winning_bid.iter() {
+        let bid = &bids[bidi];
+        sprouts[bid.sprout_idx].won[bid.slot_idx] = true;
+    }
+    let mut eaten_sprout: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for sprout in &sprouts {
+        let src_global = sprout.src_chunk_idx * CHUNK_AREA + sprout.src_cell_idx;
+        if winning_bid.contains_key(&src_global) {
+            eaten_sprout.insert(src_global);
+        }
+    }
+
+    // Pass D1: place new occupants at winning destinations.
+    let growth_attempts = sprouts.len() as u64;
+    for (&_dst_idx, &bidi) in winning_bid.iter() {
+        let bid = &bids[bidi];
+        let sprout = &sprouts[bid.sprout_idx];
+        let dir = sprout.plan_dirs[bid.slot_idx];
+        let slot = sprout.plan_slots[bid.slot_idx];
+        if let Some(occ) = make_slot_occupant(
+            slot,
+            sprout.plant,
+            sprout.clan,
+            dir,
+            dir,
+            &sprout.genome,
+            sprout.next_gene,
+            rng,
+        ) {
+            chunks[bid.dst_chunk_idx].cells[bid.dst_cell_idx].occupant = occ;
+        }
+    }
+
+    // Pass D2: each sprout writes its own outcome.
+    let mut deposit_tasks: Vec<(i32, i32, Energy)> = Vec::new();
+    for sprout in &sprouts {
+        let src_global = sprout.src_chunk_idx * CHUNK_AREA + sprout.src_cell_idx;
+        if eaten_sprout.contains(&src_global) {
+            continue;
+        }
+        if sprout.no_viable {
+            deposit_tasks.push((sprout.src_wx, sprout.src_wy, sprout.energy));
+            chunks[sprout.src_chunk_idx].cells[sprout.src_cell_idx].occupant =
+                Occupant::Empty;
+            continue;
+        }
+        if !sprout.can_afford {
+            continue;
+        }
+        let any_won = sprout.won.iter().any(|w| *w);
+        if !any_won {
+            continue;
+        }
+        let mut connections = 0u8;
+        let mut children = 0u8;
+        let mut won_cost: u32 = 0;
+        let mut won_harvested: u32 = 0;
+        for i in 0..3 {
+            if !sprout.won[i] {
+                continue;
+            }
+            connections |= dir_to_bitmask(sprout.plan_dirs[i]);
+            if matches!(
+                sprout.plan_slots[i],
+                SlotProduct::Sprout | SlotProduct::Seed
+            ) {
+                children |= dir_to_bitmask(sprout.plan_dirs[i]);
+            }
+            won_cost += slot_cost(sprout.plan_slots[i]) as u32;
+            won_harvested += sprout.harvested[i];
+        }
+        if let Some(parent_dir) = sprout.parent {
+            connections |= dir_to_bitmask(parent_dir);
+        }
+        let new_energy = ((sprout.energy as u32) + won_harvested)
+            .saturating_sub(won_cost)
+            .min(Energy::MAX as u32) as Energy;
+        chunks[sprout.src_chunk_idx].cells[sprout.src_cell_idx].occupant =
+            Occupant::Stem {
+                plant: sprout.plant,
+                clan: sprout.clan,
+                energy: new_energy,
+                connections,
+                parent: sprout.parent,
+                children,
+            };
+    }
+    // Pass D3: deposit organic for sprouts that died without growing.
+    for (wx, wy, energy) in deposit_tasks {
         deposit_kernel(
             chunks,
             chunks_x,
@@ -1298,107 +1543,19 @@ fn attempt_growth(
             max_x,
             max_y,
             &DEATH_DEPOSIT_KERNEL,
-            sprout_energy,
+            energy,
         );
-        if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
-            self_cell.occupant = Occupant::Empty;
-        }
-        return;
     }
-
-    // Cost = sum over the slots that will actually spawn.
-    let effective_cost: Energy = plan
-        .iter()
-        .zip(viable.iter())
-        .filter(|(_, v)| **v)
-        .map(|((_, slot), _)| slot_cost(*slot))
-        .sum();
-    let total_harvested: u32 = harvested.iter().sum();
-    let pool: u32 = sprout_energy as u32 + total_harvested;
-    if pool <= effective_cost as u32 {
-        return; // wait for more energy
-    }
-
-    let mut connections = 0u8;
-    let mut children = 0u8;
-    let mut grew = false;
-
-    for (i, (dir, slot)) in plan.iter().enumerate() {
-        if !viable[i] {
-            continue;
-        }
-        let Some(occ) = make_slot_occupant(*slot, plant, clan, *dir, *dir, genome, next_gene, rng)
-        else {
-            continue;
-        };
-        let (dx, dy) = direction_to_delta(*dir);
-        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
-        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
-        if let Some(target) = cell_at_mut(chunks, chunks_x, nx, ny) {
-            target.occupant = occ;
-            connections |= dir_to_bitmask(*dir);
-            // Both sprouts and seeds need energy from the parent stem to
-            // function, so include them in the children mask.
-            if matches!(slot, SlotProduct::Sprout | SlotProduct::Seed) {
-                children |= dir_to_bitmask(*dir);
-            }
-            grew = true;
-        }
-        // If we ate a cell that had a parent stem, sever the link: clear
-        // the connections + children bit on that foreign stem pointing at
-        // (nx, ny). Otherwise the foreign tree would keep treating this
-        // cell as its child and pump energy into our occupant — eating
-        // does not merge plants. Same-plant eating goes through the same
-        // path so a stem also drops the bit when it loses a child this
-        // way.
-        if let Some(eaten_back) = eaten_parent[i] {
-            let (pdx, pdy) = direction_to_delta(eaten_back);
-            if let (Some(px), Some(py)) =
-                (in_bounds(nx + pdx, max_x), in_bounds(ny + pdy, max_y))
-            {
-                let bit_back = dir_to_bitmask(opposite_dir(eaten_back));
-                if let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py) {
-                    if let Occupant::Stem {
-                        connections: pconns,
-                        children: pchildren,
-                        ..
-                    } = &mut parent_cell.occupant
-                    {
-                        *pconns &= !bit_back;
-                        *pchildren &= !bit_back;
-                    }
-                }
-            }
-        }
-    }
-
-    if grew {
-        if let Some(parent_dir) = parent {
-            connections |= dir_to_bitmask(parent_dir);
-        }
-        // Pool already accounts for harvested energy from edible targets.
-        let new_energy = pool
-            .saturating_sub(effective_cost as u32)
-            .min(Energy::MAX as u32) as Energy;
-        if let Some(self_cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
-            self_cell.occupant = Occupant::Stem {
-                plant,
-                clan,
-                energy: new_energy,
-                connections,
-                parent,
-                children,
-            };
-        }
-    }
+    growth_attempts
 }
+
 
 /// Outcome of inspecting a growth target.
 enum EdibleStatus {
     /// Cell is Empty — grow normally, no energy harvested.
     Empty,
     /// Cell is an edible non-empty cell. Only Sprout / Seed slots may
-    /// consume it (see `attempt_growth`); other slots ignore Edible and
+    /// consume it (see `phase_growth_pull`); other slots ignore Edible and
     /// treat the target as unavailable.
     Edible(Energy),
     /// Cell is Root or Stem (always inviolate). Cannot grow into it.
@@ -1591,22 +1748,7 @@ mod tests {
         let (sprout, genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            100,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -1638,22 +1780,7 @@ mod tests {
         let (sprout, genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 0, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            0,
-            1,
-            0,
-            100,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         // Center cell: stem with no children (front was OOB).
         match &cell_at(&chunks, chunks_x, 10, 0).occupant {
@@ -1693,22 +1820,7 @@ mod tests {
         let (sprout, genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            100,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -1745,22 +1857,7 @@ mod tests {
         let (sprout, genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            40,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         // Pool: 40 own + 50 harvested = 90. Cost = COST_SEED (60). Stem = 30.
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
@@ -1827,22 +1924,7 @@ mod tests {
             },
         );
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            100,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         // Foreign leaf intact.
         match cell_at(&chunks, chunks_x, 10, 9).occupant {
@@ -1881,22 +1963,7 @@ mod tests {
         let (sprout, genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            40,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         // Front cell still the own-plant leaf, energy intact.
         match cell_at(&chunks, chunks_x, 10, 9).occupant {
@@ -1957,25 +2024,16 @@ mod tests {
 
         // Plant 1's sprout (front=Seed) eats (10, 9). Only Seed slots can
         // eat under the current rule.
-        let (sprout, genome) = seed_front_sprout(40);
+        let (sprout, _genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            40,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        // Run growth, then run prune. With pull-pattern there's no
+        // explicit sever-on-eat in growth — prune is what notices a
+        // foreign cell and drops the foreign stem's child + connection
+        // bits naturally. (In the live sim this happens one tick later;
+        // here we run it in-line for a tight assertion.)
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
+        phase_prune_pull(&mut chunks, chunks_x, 1, max, max);
 
         // (10, 9) replaced with our Seed (plant 1).
         match &cell_at(&chunks, chunks_x, 10, 9).occupant {
@@ -2015,22 +2073,7 @@ mod tests {
         let (sprout, genome) = vine_sprout(5);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        attempt_growth(
-            &mut chunks,
-            chunks_x,
-            max,
-            max,
-            10,
-            10,
-            1,
-            0,
-            5,
-            Direction::North,
-            None,
-            0,
-            &genome,
-            &mut det_rng(),
-        );
+        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -2186,12 +2229,21 @@ mod tests {
             genome: Box::new(Genome::default_vine()),
             parent: None,
         };
-        assert!(is_valid_child(&sprout));
-        assert!(is_valid_child(&seed), "seeds receive energy like sprouts");
-        assert!(is_valid_child(&stem_with_kids));
-        assert!(!is_valid_child(&stem_no_kids));
-        assert!(!is_valid_child(&leaf));
-        assert!(!is_valid_child(&Occupant::Empty));
+        // Same-plant: all sinks valid.
+        assert!(is_valid_child(&sprout, 1));
+        assert!(
+            is_valid_child(&seed, 1),
+            "seeds receive energy like sprouts"
+        );
+        assert!(is_valid_child(&stem_with_kids, 1));
+        assert!(!is_valid_child(&stem_no_kids, 1));
+        assert!(!is_valid_child(&leaf, 1));
+        assert!(!is_valid_child(&Occupant::Empty, 1));
+        // Different-plant: even valid sinks are blocked. Lets prune
+        // naturally sever cells that got eaten by a foreign plant.
+        assert!(!is_valid_child(&sprout, 2));
+        assert!(!is_valid_child(&seed, 2));
+        assert!(!is_valid_child(&stem_with_kids, 2));
     }
 
     #[test]
