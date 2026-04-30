@@ -895,18 +895,18 @@ fn draw_ui(
             let mut energy = (*layer_flags & LAYER_ENERGY) != 0;
             let mut fg = (*layer_flags & LAYER_FG) != 0;
             let mut clan = (*layer_flags & LAYER_CLAN) != 0;
-            if ui.checkbox(&mut organic, "Organic").changed() {
+            if ui.checkbox(&mut organic, "Organic [1]").changed() {
                 *layer_flags = (*layer_flags & !LAYER_ORGANIC)
                     | (if organic { LAYER_ORGANIC } else { 0 });
             }
-            if ui.checkbox(&mut energy, "Energy").changed() {
+            if ui.checkbox(&mut energy, "Energy [2]").changed() {
                 *layer_flags = (*layer_flags & !LAYER_ENERGY)
                     | (if energy { LAYER_ENERGY } else { 0 });
             }
-            if ui.checkbox(&mut fg, "Occupants").changed() {
+            if ui.checkbox(&mut fg, "Occupants [3]").changed() {
                 *layer_flags = (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
             }
-            if ui.checkbox(&mut clan, "Clan colors").changed() {
+            if ui.checkbox(&mut clan, "Clan colors [4]").changed() {
                 *layer_flags = (*layer_flags & !LAYER_CLAN)
                     | (if clan { LAYER_CLAN } else { 0 });
             }

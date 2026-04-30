@@ -16,7 +16,7 @@ use winit::{
 };
 
 use crate::net;
-use crate::render::{LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
+use crate::render::{LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
@@ -355,6 +355,19 @@ impl ApplicationHandler<UserEvent> for App {
                     // Step inherently pauses (server-side); works whether
                     // currently running or paused.
                     let _ = self.outgoing.send(ClientMessage::Step);
+                }
+                Key::Character(c) if matches!(c.as_str(), "1" | "2" | "3" | "4") => {
+                    // Layer toggles, in panel order: 1=Organic, 2=Energy,
+                    // 3=Occupants, 4=Clan colors.
+                    let bit = match c.as_str() {
+                        "1" => LAYER_ORGANIC,
+                        "2" => LAYER_ENERGY,
+                        "3" => LAYER_FG,
+                        "4" => LAYER_CLAN,
+                        _ => unreachable!(),
+                    };
+                    self.layer_flags ^= bit;
+                    state.window().request_redraw();
                 }
                 _ => {}
             },
