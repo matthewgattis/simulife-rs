@@ -337,102 +337,76 @@ fn mutate_world(
         }
     }
 
-    // Phase 4: prune stem children. The local rule is unchanged — a child
-    // bit is valid iff the target is a Sprout/Seed (sink) or a Stem with
-    // children != 0. The bug it was masking is the *cascade timing*: with
-    // a single pass per tick, a chain like Stem→Stem→Sprout takes one
-    // tick per layer to unwind when the sprout dies. During the cascade,
-    // a parent that hasn't yet pruned its bit pushes energy to a child
-    // that just pruned its own bits and now pushes back to the parent —
-    // the energy "bounces" between them for a tick. With long chains the
-    // wave of bounces takes many ticks to clear, which is what "stem
-    // loops" looks like.
+    // Phase 4: prune stem children. Local rule: a child bit is valid iff
+    // the target is a Sprout/Seed (sink) or a Stem with children != 0.
     //
-    // Apply the same rule in a fixpoint loop: a pass drops every now-
-    // invalid bit; if anything changed, run again. One tick now resolves
-    // the entire cascade. Each pass is monotonic (only drops bits) so
-    // convergence is guaranteed; cycles (which game rules already
-    // shouldn't produce) leave their bits intact and the loop exits.
+    // Single-pass, compute-then-apply. Each stem reads its own + 3×3
+    // neighborhood snapshot, decides which bits to drop, and writes only
+    // to itself in the apply pass. Cascades unfold at one cell/tick — a
+    // chain of N stems whose tip dies prunes one link per tick. That
+    // matches the rest of the sim's CA semantics; we explicitly accept
+    // a few ticks of mid-cascade "energy bouncing" because the trade is
+    // worth it (no fixpoint loop, no full-world allocation per pass).
     let _phase_prune = tracing::info_span!("phase_prune").entered();
-    let total_cells = chunks.len() * CHUNK_AREA;
     let bits = [
         STEM_CONNECT_NORTH,
         STEM_CONNECT_EAST,
         STEM_CONNECT_SOUTH,
         STEM_CONNECT_WEST,
     ];
-    let mut prune_passes: u32 = 0;
-    loop {
-        let mut pruned_children: Vec<Option<u8>> = vec![None; total_cells];
-        let mut any_change = false;
-        for cy in 0..chunks_y {
-            for cx in 0..chunks_x {
-                for ly in 0..(CHUNK_EDGE as usize) {
-                    for lx in 0..(CHUNK_EDGE as usize) {
-                        let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                        let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                        let current_children =
-                            match &chunks[chunk_idx].cells[cell_idx].occupant {
-                                Occupant::Stem { children, .. } if *children != 0 => *children,
-                                _ => continue,
-                            };
-                        let wx = cx as i32 * edge + lx as i32;
-                        let wy = cy as i32 * edge + ly as i32;
-                        let mut kept = 0u8;
-                        for bit in bits {
-                            if current_children & bit == 0 {
-                                continue;
-                            }
-                            let dir = bit_to_dir(bit);
-                            let (dx, dy) = direction_to_delta(dir);
-                            let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
-                            let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
-                            let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
-                                + (nx / edge) as usize;
-                            let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
-                                + (nx % edge) as usize;
-                            let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
-                            if is_valid_child(&neighbor.occupant) {
-                                kept |= bit;
-                            }
+    let mut prune_changes: Vec<(usize, usize, u8)> = Vec::new();
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let current_children =
+                        match &chunks[chunk_idx].cells[cell_idx].occupant {
+                            Occupant::Stem { children, .. } if *children != 0 => *children,
+                            _ => continue,
+                        };
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    let mut kept = 0u8;
+                    for bit in bits {
+                        if current_children & bit == 0 {
+                            continue;
                         }
-                        if kept != current_children {
-                            pruned_children[linear_idx(chunks_x, wx, wy)] = Some(kept);
-                            any_change = true;
+                        let dir = bit_to_dir(bit);
+                        let (dx, dy) = direction_to_delta(dir);
+                        let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+                        let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
+                        let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                            + (nx / edge) as usize;
+                        let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                            + (nx % edge) as usize;
+                        let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
+                        if is_valid_child(&neighbor.occupant) {
+                            kept |= bit;
                         }
                     }
-                }
-            }
-        }
-        if !any_change {
-            break;
-        }
-        prune_passes += 1;
-        for cy in 0..chunks_y {
-            for cx in 0..chunks_x {
-                for ly in 0..(CHUNK_EDGE as usize) {
-                    for lx in 0..(CHUNK_EDGE as usize) {
-                        let wx = cx as i32 * edge + lx as i32;
-                        let wy = cy as i32 * edge + ly as i32;
-                        let Some(new_c) =
-                            pruned_children[linear_idx(chunks_x, wx, wy)]
-                        else {
-                            continue;
-                        };
-                        let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                        let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                        if let Occupant::Stem { children, .. } =
-                            &mut chunks[chunk_idx].cells[cell_idx].occupant
-                        {
-                            *children = new_c;
-                        }
+                    if kept != current_children {
+                        prune_changes.push((chunk_idx, cell_idx, kept));
                     }
                 }
             }
         }
     }
+    let prune_change_count = prune_changes.len() as u64;
+    for (chunk_idx, cell_idx, new_c) in prune_changes {
+        if let Occupant::Stem { children, .. } =
+            &mut chunks[chunk_idx].cells[cell_idx].occupant
+        {
+            *children = new_c;
+        }
+    }
     drop(_phase_prune);
-    tracing::event!(tracing::Level::INFO, prune_passes, "phase_prune_done");
+    tracing::event!(
+        tracing::Level::INFO,
+        prune_changes = prune_change_count,
+        "phase_prune_done"
+    );
 
     // Phase 5: directed push. Production cells push surplus to parent, stems
     // split surplus across children, sprouts/seeds are terminal sinks. Build
@@ -3155,16 +3129,15 @@ mod tests {
     }
 
     #[test]
-    fn phase_prune_cascades_dead_end_chain_in_one_tick() {
-        // Chain A → B → C with a sprout at the end that already died
-        // (cell at sprout position is Empty). After one tick of prune,
-        // every stem in the chain has children=0 and the head (parent=
-        // None) has orphan-died. Without the iterative fixpoint, this
-        // would take 3 ticks to fully cascade and energy would bounce
-        // between the cells while it propagated.
+    fn phase_prune_cascades_one_link_per_tick() {
+        // Chain A → B → C with a sprout at the tip that already died (cell
+        // at sprout position is Empty). Prune is a single-pass local rule:
+        // each stem reads its 3×3 neighborhood and drops invalid bits.
+        // That means each tick advances the cascade by exactly one stem,
+        // tip-side first.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
-        // Head (parent=None, points north at B).
+        // Head A (parent=None, points north at B).
         place(
             &mut chunks,
             chunks_x,
@@ -3211,23 +3184,46 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
+        // Helper: snapshot just the (alive?, children) of A/B/C.
+        let snap = |chunks: &[Chunk]| -> [(bool, u8); 3] {
+            let cells = [(10, 10), (10, 9), (10, 8)];
+            let mut out = [(false, 0u8); 3];
+            for (i, (x, y)) in cells.iter().enumerate() {
+                match &cell_at(chunks, chunks_x, *x, *y).occupant {
+                    Occupant::Stem { children, .. } => out[i] = (true, *children),
+                    Occupant::Empty => out[i] = (false, 0),
+                    other => panic!("unexpected occupant: {other:?}"),
+                }
+            }
+            out
+        };
 
-        // Head was orphan after the cascade — it had children=0 and
-        // parent=None at death-collection time, so it died this tick.
-        assert!(matches!(
-            cell_at(&chunks, chunks_x, 10, 10).occupant,
-            Occupant::Empty
-        ));
-        // Middle and tail no longer have children pointing north.
-        match &cell_at(&chunks, chunks_x, 10, 9).occupant {
-            Occupant::Stem { children, .. } => assert_eq!(*children, 0),
-            other => panic!("expected stem at middle, got {other:?}"),
-        }
-        match &cell_at(&chunks, chunks_x, 10, 8).occupant {
-            Occupant::Stem { children, .. } => assert_eq!(*children, 0),
-            other => panic!("expected stem at tail, got {other:?}"),
-        }
+        // Tick 1: only the tip C sees an Empty neighbor → drops its N bit.
+        // B and A still see the chain intact during the compute pass and
+        // keep their bits.
+        mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
+        assert_eq!(
+            snap(&chunks),
+            [
+                (true, STEM_CONNECT_NORTH),
+                (true, STEM_CONNECT_NORTH),
+                (true, 0),
+            ],
+            "after tick 1 only C should have pruned"
+        );
+
+        // Tick 2: B now sees C with children=0 → drops its N bit. A still
+        // sees B with N (B's update happens in this tick's apply pass).
+        mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
+        assert_eq!(
+            snap(&chunks),
+            [(true, STEM_CONNECT_NORTH), (true, 0), (true, 0)],
+            "after tick 2 B should also have pruned"
+        );
+
+        // After this point, the cascade keeps unfolding but other phases
+        // (death, energy redistribution) start firing too — that's
+        // covered by orphan/death tests, not this prune-shape test.
     }
 
     #[test]
