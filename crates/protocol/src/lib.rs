@@ -161,7 +161,25 @@ pub struct Cell {
     pub organic: u16,
     pub soil_energy: u16,
     pub sunlit: bool,
+    /// Quantized mutation_rate of the lineage that occupies this cell
+    /// (0..255 → 0.0..MUTATION_RATE_MAX). Set whenever a plant cell is
+    /// written, propagated from the parent sprout's genome rate. Stale
+    /// when the cell is Empty — viewer only renders it when an
+    /// occupant is present.
+    pub lineage_mutation_rate: u8,
     pub occupant: Occupant,
+}
+
+/// Convert a real-valued mutation rate in `[0.0, MUTATION_RATE_MAX]`
+/// to a u8 for storage on Cell. Out-of-range values are clamped.
+pub fn quantize_mutation_rate(rate: f32) -> u8 {
+    let frac = (rate / MUTATION_RATE_MAX).clamp(0.0, 1.0);
+    (frac * 255.0).round() as u8
+}
+
+/// Inverse of `quantize_mutation_rate`.
+pub fn dequantize_mutation_rate(q: u8) -> f32 {
+    (q as f32 / 255.0) * MUTATION_RATE_MAX
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -226,6 +244,7 @@ pub struct WireCell {
     pub organic: u16,
     pub soil_energy: u16,
     pub sunlit: bool,
+    pub lineage_mutation_rate: u8,
     pub occupant: WireOccupant,
 }
 
@@ -329,6 +348,7 @@ impl From<&Cell> for WireCell {
             organic: c.organic,
             soil_energy: c.soil_energy,
             sunlit: c.sunlit,
+            lineage_mutation_rate: c.lineage_mutation_rate,
             occupant: WireOccupant::from(&c.occupant),
         }
     }
@@ -351,6 +371,10 @@ pub enum ClientMessage {
     SetPaused(bool),
     Step,
     SetTickHz(u32),
+    /// Toggle whether the server respects `tick_hz`. When false the
+    /// server runs as fast as it can; when true it sleeps between
+    /// ticks to honor the requested rate.
+    SetTickRateLimited(bool),
     RegenerateWorld { seed: u64 },
 }
 
@@ -361,6 +385,7 @@ pub enum ServerMessage {
         world_chunks_y: u32,
         paused: bool,
         tick_hz: u32,
+        tick_rate_limited: bool,
         tick: u64,
         seed: u64,
     },
@@ -405,6 +430,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit,
+            lineage_mutation_rate: 0,
             occupant: Occupant::Empty,
         }
     }
@@ -417,6 +443,7 @@ mod tests {
             organic: 12,
             soil_energy: 7,
             sunlit: false,
+            lineage_mutation_rate: 0,
             occupant: Occupant::Sprout {
                 plant: 1,
                 clan: 0,
@@ -431,6 +458,7 @@ mod tests {
             organic: 200,
             soil_energy: 50,
             sunlit: true,
+            lineage_mutation_rate: 0,
             occupant: Occupant::Seed {
                 plant: 1,
                 clan: 0,
@@ -444,6 +472,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit: true,
+            lineage_mutation_rate: 0,
             occupant: Occupant::Leaf {
                 plant: 1,
                 clan: 0,
@@ -504,6 +533,7 @@ mod tests {
             world_chunks_y: 16,
             paused: false,
             tick_hz: 10,
+            tick_rate_limited: false,
             tick: 42,
             seed: 0xCAFE_BABE_DEAD_BEEF,
         };
@@ -515,6 +545,7 @@ mod tests {
                 world_chunks_y,
                 paused,
                 tick_hz,
+                tick_rate_limited,
                 tick,
                 seed,
             } => {
@@ -522,6 +553,7 @@ mod tests {
                 assert_eq!(world_chunks_y, 16);
                 assert!(!paused);
                 assert_eq!(tick_hz, 10);
+                assert!(!tick_rate_limited);
                 assert_eq!(tick, 42);
                 assert_eq!(seed, 0xCAFE_BABE_DEAD_BEEF);
             }
@@ -559,6 +591,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit: false,
+            lineage_mutation_rate: 0,
             occupant: occ,
         };
         let bytes = rmp_serde::to_vec(&cell).expect("encode");
@@ -701,6 +734,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit,
+            lineage_mutation_rate: 0,
             occupant: WireOccupant::Empty,
         }
     }

@@ -89,6 +89,9 @@ pub struct SimState {
 pub struct SimControl {
     pub paused: bool,
     pub tick_hz: u32,
+    /// When false (default), the sim ticks as fast as it can. When
+    /// true, it honors `tick_hz` between ticks. Pause is independent.
+    pub tick_rate_limited: bool,
     pub step_pending: u32,
 }
 
@@ -108,14 +111,16 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
     loop {
         let action = {
             let mut ctrl = state.control.lock().expect("control poisoned");
-            let dur = Duration::from_millis(1000 / ctrl.tick_hz.max(1) as u64);
             if ctrl.step_pending > 0 {
                 ctrl.step_pending -= 1;
                 SimAction::TickNow
-            } else if !ctrl.paused {
+            } else if ctrl.paused {
+                SimAction::Wait
+            } else if ctrl.tick_rate_limited {
+                let dur = Duration::from_millis(1000 / ctrl.tick_hz.max(1) as u64);
                 SimAction::TickAfter(dur)
             } else {
-                SimAction::Wait
+                SimAction::TickNow
             }
         };
 
@@ -194,15 +199,16 @@ pub fn regenerate_world(state: &SimState, seed: u64) {
     state.current_tick.store(0, Ordering::Relaxed);
     info!(seed, "world regenerated");
 
-    let (paused, tick_hz) = {
+    let (paused, tick_hz, tick_rate_limited) = {
         let ctrl = state.control.lock().expect("control poisoned");
-        (ctrl.paused, ctrl.tick_hz)
+        (ctrl.paused, ctrl.tick_hz, ctrl.tick_rate_limited)
     };
     let welcome = ServerMessage::Welcome {
         world_chunks_x: chunks_x,
         world_chunks_y: chunks_y,
         paused,
         tick_hz,
+        tick_rate_limited,
         tick: 0,
         seed,
     };
@@ -240,12 +246,15 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     // any lineage (yet). If we ever want clan to reflect spawn position,
     // we can compute it from (x, y) the same way world::place_random does.
     let mut chunks = state.world.lock().expect("sim lock poisoned");
+    let genome = Genome::default_vine();
+    let rate_q = protocol::quantize_mutation_rate(genome.mutation_rate);
+    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = rate_q;
     chunks[chunk_idx].cells[cell_idx].occupant = Occupant::Sprout {
         plant,
         clan: 0,
         energy: 100,
         facing,
-        genome: Box::new(Genome::default_vine()),
+        genome: Box::new(genome),
         parent: None,
         current_gene: 0,
     };
@@ -1457,7 +1466,9 @@ fn phase_growth_pull(
         }
     }
 
-    // Pass D1: place new occupants at winning destinations.
+    // Pass D1: place new occupants at winning destinations. Stamp the
+    // destination cell with the parent's lineage rate so the viewer can
+    // color whole plants by their lineage's mutation rate.
     let growth_attempts = sprouts.len() as u64;
     for (&_dst_idx, &bidi) in winning_bid.iter() {
         let bid = &bids[bidi];
@@ -1474,7 +1485,10 @@ fn phase_growth_pull(
             sprout.next_gene,
             rng,
         ) {
-            chunks[bid.dst_chunk_idx].cells[bid.dst_cell_idx].occupant = occ;
+            let cell = &mut chunks[bid.dst_chunk_idx].cells[bid.dst_cell_idx];
+            cell.lineage_mutation_rate =
+                protocol::quantize_mutation_rate(sprout.genome.mutation_rate);
+            cell.occupant = occ;
         }
     }
 
@@ -1796,6 +1810,7 @@ mod tests {
                         organic: 0,
                         soil_energy: 0,
                         sunlit: false,
+                        lineage_mutation_rate: 0,
                         occupant: Occupant::Empty,
                     })
                     .collect();

@@ -72,6 +72,7 @@ pub fn build_world(chunks_x: u32, chunks_y: u32) -> Vec<Chunk> {
                         organic,
                         soil_energy: 100,
                         sunlit,
+                        lineage_mutation_rate: 0,
                         occupant: Occupant::Empty,
                     }
                 })
@@ -127,6 +128,7 @@ pub fn place_random_sprout_grid(
                     let bx = (x / box_w) as u32;
                     let by = (y / box_h) as u32;
                     let clan = (by * BOXES_PER_DIMENSION + bx) as protocol::ClanId;
+                    let rate_q = protocol::quantize_mutation_rate(genome.mutation_rate);
                     place_at(
                         chunks,
                         chunks_x,
@@ -142,6 +144,9 @@ pub fn place_random_sprout_grid(
                             current_gene: 0,
                         },
                     );
+                    if let Some(cell) = cell_at_mut(chunks, chunks_x, x, y) {
+                        cell.lineage_mutation_rate = rate_q;
+                    }
                 }
             }
             x += SPROUT_GRID_SPACING;
@@ -159,6 +164,21 @@ fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&'a
     let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
     let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;
     chunks.get(chunk_idx)?.cells.get(cell_idx)
+}
+
+fn cell_at_mut<'a>(
+    chunks: &'a mut [Chunk],
+    chunks_x: u32,
+    x: i32,
+    y: i32,
+) -> Option<&'a mut Cell> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let edge = CHUNK_EDGE as i32;
+    let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
+    let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;
+    chunks.get_mut(chunk_idx)?.cells.get_mut(cell_idx)
 }
 
 fn place_at(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32, occupant: Occupant) {

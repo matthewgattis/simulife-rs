@@ -163,6 +163,7 @@ mod tests {
                 organic: 0,
                 soil_energy: 0,
                 sunlit: false,
+                lineage_mutation_rate: 0,
                 occupant: Occupant::Empty,
             })
             .collect();
@@ -208,6 +209,7 @@ mod tests {
             control: Mutex::new(SimControl {
                 paused: true,
                 tick_hz: 10,
+                tick_rate_limited: false,
                 step_pending: 0,
             }),
             seed: AtomicU64::new(seed),

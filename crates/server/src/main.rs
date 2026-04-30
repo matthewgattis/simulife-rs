@@ -137,6 +137,7 @@ async fn main() -> Result<()> {
         control: std::sync::Mutex::new(SimControl {
             paused: !args.start_running,
             tick_hz: args.tick_hz.max(1),
+            tick_rate_limited: false,
             step_pending: 0,
         }),
         seed: AtomicU64::new(seed),

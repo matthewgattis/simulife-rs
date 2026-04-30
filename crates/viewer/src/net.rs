@@ -61,22 +61,33 @@ async fn run_session(
     info!(remote = %conn.remote_address(), "connected");
 
     let welcome = request(&conn, &ClientMessage::Hello).await?;
-    let (world_chunks_x, world_chunks_y, paused, tick_hz, tick, seed) = match welcome {
-        ServerMessage::Welcome {
-            world_chunks_x,
-            world_chunks_y,
-            paused,
-            tick_hz,
-            tick,
-            seed,
-        } => (world_chunks_x, world_chunks_y, paused, tick_hz, tick, seed),
-        other => bail!("unexpected first message: {other:?}"),
-    };
+    let (world_chunks_x, world_chunks_y, paused, tick_hz, tick_rate_limited, tick, seed) =
+        match welcome {
+            ServerMessage::Welcome {
+                world_chunks_x,
+                world_chunks_y,
+                paused,
+                tick_hz,
+                tick_rate_limited,
+                tick,
+                seed,
+            } => (
+                world_chunks_x,
+                world_chunks_y,
+                paused,
+                tick_hz,
+                tick_rate_limited,
+                tick,
+                seed,
+            ),
+            other => bail!("unexpected first message: {other:?}"),
+        };
     let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
         world_chunks_x,
         world_chunks_y,
         paused,
         tick_hz,
+        tick_rate_limited,
         tick,
         seed,
     }));
@@ -152,6 +163,7 @@ async fn run_session(
                         world_chunks_y,
                         paused,
                         tick_hz,
+                        tick_rate_limited,
                         tick,
                         seed,
                     } => {
@@ -164,6 +176,7 @@ async fn run_session(
                                 world_chunks_y,
                                 paused,
                                 tick_hz,
+                                tick_rate_limited,
                                 tick,
                                 seed,
                             },

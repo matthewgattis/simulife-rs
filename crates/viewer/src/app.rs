@@ -16,7 +16,9 @@ use winit::{
 };
 
 use crate::net;
-use crate::render::{LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_ORGANIC, RenderState};
+use crate::render::{
+    LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_MUTATION_RATE, LAYER_ORGANIC, RenderState,
+};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
@@ -33,6 +35,7 @@ pub enum NetworkStatus {
         world_chunks_y: u32,
         paused: bool,
         tick_hz: u32,
+        tick_rate_limited: bool,
         tick: u64,
         seed: u64,
     },
@@ -87,6 +90,7 @@ pub struct App {
     layer_flags: u32,
     sim_paused: bool,
     sim_tick_hz: u32,
+    sim_tick_rate_limited: bool,
     sim_tick: u64,
     centered_once: bool,
     dragging: bool,
@@ -123,6 +127,7 @@ impl App {
             layer_flags: LAYER_ORGANIC | LAYER_FG | LAYER_ENERGY,
             sim_paused: false,
             sim_tick_hz: 10,
+            sim_tick_rate_limited: false,
             sim_tick: 0,
             centered_once: false,
             dragging: false,
@@ -191,6 +196,7 @@ impl ApplicationHandler<UserEvent> for App {
                     world_chunks_y,
                     paused,
                     tick_hz,
+                    tick_rate_limited,
                     tick,
                     ..
                 } = &status
@@ -205,6 +211,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.sim_paused = *paused;
                     self.sim_tick_hz = *tick_hz;
+                    self.sim_tick_rate_limited = *tick_rate_limited;
                     self.sim_tick = *tick;
                 }
                 self.network = status;
@@ -356,14 +363,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // currently running or paused.
                     let _ = self.outgoing.send(ClientMessage::Step);
                 }
-                Key::Character(c) if matches!(c.as_str(), "1" | "2" | "3" | "4") => {
+                Key::Character(c) if matches!(c.as_str(), "1" | "2" | "3" | "4" | "5") => {
                     // Layer toggles, in panel order: 1=Organic, 2=Energy,
-                    // 3=Occupants, 4=Clan colors.
+                    // 3=Occupants, 4=Clan colors, 5=Mutation rate.
                     let bit = match c.as_str() {
                         "1" => LAYER_ORGANIC,
                         "2" => LAYER_ENERGY,
                         "3" => LAYER_FG,
                         "4" => LAYER_CLAN,
+                        "5" => LAYER_MUTATION_RATE,
                         _ => unreachable!(),
                     };
                     self.layer_flags ^= bit;
@@ -390,6 +398,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &mut self.layer_flags,
                     &mut self.sim_paused,
                     &mut self.sim_tick_hz,
+                    &mut self.sim_tick_rate_limited,
                     self.sim_tick,
                     self.last_cursor,
                     &mut self.context_menu,

@@ -22,6 +22,11 @@ pub const LAYER_ENERGY: u32 = 1 << 2;
 /// per-cell-type colors. Lets you see which lineage each cell descended
 /// from regardless of which box it currently lives in.
 pub const LAYER_CLAN: u32 = 1 << 3;
+/// When set, occupants are colored by their lineage's mutation_rate
+/// (blue = low, red = high). Stems/leaves/roots/antennas inherit
+/// the rate of the ancestor sprout that placed them, so the entire
+/// plant is coherently colored by its mutation pressure.
+pub const LAYER_MUTATION_RATE: u32 = 1 << 4;
 
 pub struct RenderState {
     window: Arc<Window>,
@@ -156,6 +161,7 @@ impl RenderState {
         layer_flags: &mut u32,
         sim_paused: &mut bool,
         sim_tick_hz: &mut u32,
+        sim_tick_rate_limited: &mut bool,
         sim_tick: u64,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
@@ -201,6 +207,7 @@ impl RenderState {
                 layer_flags,
                 sim_paused,
                 sim_tick_hz,
+                sim_tick_rate_limited,
                 sim_tick,
                 regen_dialog,
                 outgoing,
@@ -317,7 +324,11 @@ struct GpuCell {
     facing: u32,
     connections: u32,
     clan: u32,
-    _pad: [u32; 3],
+    /// Quantized mutation_rate: 0..255 maps to 0.0..MUTATION_RATE_MAX.
+    /// Set on every plant-cell write; stale on Empty cells (shader
+    /// only reads it when LAYER_MUTATION_RATE is on AND kind != EMPTY).
+    mutation_rate: u32,
+    _pad: [u32; 2],
 }
 
 const GPU_KIND_EMPTY: u32 = 0;
@@ -752,7 +763,8 @@ fn to_gpu_cell(cell: &WireCell) -> GpuCell {
         facing,
         connections,
         clan,
-        _pad: [0; 3],
+        mutation_rate: u32::from(cell.lineage_mutation_rate),
+        _pad: [0; 2],
     }
 }
 
@@ -818,6 +830,7 @@ fn draw_ui(
     layer_flags: &mut u32,
     sim_paused: &mut bool,
     sim_tick_hz: &mut u32,
+    sim_tick_rate_limited: &mut bool,
     sim_tick: u64,
     regen_dialog: &mut Option<RegenDialog>,
     outgoing: &UnboundedSender<ClientMessage>,
@@ -875,15 +888,21 @@ fn draw_ui(
                     let _ = outgoing.send(ClientMessage::Step);
                 }
             });
+            // Tick-rate limit toggle. When unchecked the server runs as
+            // fast as it can; the Hz slider only matters when this is
+            // checked.
+            let mut limited = *sim_tick_rate_limited;
+            if ui.checkbox(&mut limited, "Limit tick rate").changed() {
+                let _ = outgoing.send(ClientMessage::SetTickRateLimited(limited));
+            }
             let mut hz = *sim_tick_hz;
-            if ui
-                .add(
-                    egui::Slider::new(&mut hz, 1..=1000)
-                        .text("Hz")
-                        .logarithmic(true),
-                )
-                .changed()
-            {
+            let slider_resp = ui.add_enabled(
+                *sim_tick_rate_limited,
+                egui::Slider::new(&mut hz, 1..=1000)
+                    .text("Hz")
+                    .logarithmic(true),
+            );
+            if slider_resp.changed() {
                 // Server is authoritative — send a request; the slider
                 // snaps back to *sim_tick_hz next frame, then updates when
                 // the server broadcasts the new tick_hz.
@@ -895,6 +914,7 @@ fn draw_ui(
             let mut energy = (*layer_flags & LAYER_ENERGY) != 0;
             let mut fg = (*layer_flags & LAYER_FG) != 0;
             let mut clan = (*layer_flags & LAYER_CLAN) != 0;
+            let mut mutrate = (*layer_flags & LAYER_MUTATION_RATE) != 0;
             if ui.checkbox(&mut organic, "Organic [1]").changed() {
                 *layer_flags = (*layer_flags & !LAYER_ORGANIC)
                     | (if organic { LAYER_ORGANIC } else { 0 });
@@ -909,6 +929,10 @@ fn draw_ui(
             if ui.checkbox(&mut clan, "Clan colors [4]").changed() {
                 *layer_flags = (*layer_flags & !LAYER_CLAN)
                     | (if clan { LAYER_CLAN } else { 0 });
+            }
+            if ui.checkbox(&mut mutrate, "Mutation rate [5]").changed() {
+                *layer_flags = (*layer_flags & !LAYER_MUTATION_RATE)
+                    | (if mutrate { LAYER_MUTATION_RATE } else { 0 });
             }
             ui.separator();
             match cursor_world {
@@ -1169,6 +1193,7 @@ mod tests {
                 organic: 0,
                 soil_energy: 0,
                 sunlit: false,
+                lineage_mutation_rate: 0,
                 occupant: WireOccupant::Empty,
             })
             .collect();

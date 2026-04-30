@@ -13,15 +13,16 @@ use crate::sim::{self, SimState};
 /// control change (pause, tick rate) modifies global sim state — every
 /// viewer's UI mirror needs to update, not just the requester's.
 fn broadcast_sim_status(state: &SimState) {
-    let (paused, tick_hz) = {
+    let (paused, tick_hz, tick_rate_limited) = {
         let ctrl = state.control.lock().expect("control poisoned");
-        (ctrl.paused, ctrl.tick_hz)
+        (ctrl.paused, ctrl.tick_hz, ctrl.tick_rate_limited)
     };
     let welcome = ServerMessage::Welcome {
         world_chunks_x: state.chunks_x,
         world_chunks_y: state.chunks_y,
         paused,
         tick_hz,
+        tick_rate_limited,
         tick: state.current_tick.load(Ordering::Relaxed),
         seed: state.seed.load(Ordering::Relaxed),
     };
@@ -122,6 +123,14 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
             info!(tick_hz = hz, "tick rate changed");
             broadcast_sim_status(&state);
         }
+        ClientMessage::SetTickRateLimited(limited) => {
+            {
+                let mut ctrl = state.control.lock().expect("control poisoned");
+                ctrl.tick_rate_limited = limited;
+            }
+            info!(tick_rate_limited = limited, "tick rate limit toggled");
+            broadcast_sim_status(&state);
+        }
         ClientMessage::RegenerateWorld { seed } => {
             sim::regenerate_world(&state, seed);
         }
@@ -159,15 +168,16 @@ async fn handle_stream(
 
     let response = match msg {
         ClientMessage::Hello => {
-            let (paused, tick_hz) = {
+            let (paused, tick_hz, tick_rate_limited) = {
                 let ctrl = state.control.lock().expect("control poisoned");
-                (ctrl.paused, ctrl.tick_hz)
+                (ctrl.paused, ctrl.tick_hz, ctrl.tick_rate_limited)
             };
             Some(ServerMessage::Welcome {
                 world_chunks_x: state.chunks_x,
                 world_chunks_y: state.chunks_y,
                 paused,
                 tick_hz,
+                tick_rate_limited,
                 tick: state.current_tick.load(Ordering::Relaxed),
                 seed: state.seed.load(Ordering::Relaxed),
             })
@@ -187,6 +197,7 @@ async fn handle_stream(
         | ClientMessage::SetPaused(_)
         | ClientMessage::Step
         | ClientMessage::SetTickHz(_)
+        | ClientMessage::SetTickRateLimited(_)
         | ClientMessage::RegenerateWorld { .. } => {
             warn!("control / spawn message arrived on bidi stream; expected on uni");
             None

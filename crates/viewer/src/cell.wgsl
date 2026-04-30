@@ -19,9 +19,9 @@ struct Cell {
     facing: u32,
     connections: u32,
     clan: u32,
+    mutation_rate: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -66,6 +66,7 @@ const LAYER_ORGANIC: u32 = 1u;
 const LAYER_FG: u32 = 2u;
 const LAYER_ENERGY: u32 = 4u;
 const LAYER_CLAN: u32 = 8u;
+const LAYER_MUTATION_RATE: u32 = 16u;
 
 const CLEAR_COLOR: vec3<f32> = vec3<f32>(0.05, 0.07, 0.10);
 const OUTLINE_COLOR: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
@@ -108,6 +109,15 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     if (cell.kind == KIND_SPROUT) { return vec3<f32>(1.00, 1.00, 1.00); }
     if (cell.kind == KIND_SEED) { return vec3<f32>(0.80, 0.70, 0.35); }
     return vec3<f32>(0.0);
+}
+
+// Mutation-rate gradient: blue (low / stable) → red (high / chaotic).
+// `q` is the quantized rate in [0, 255].
+fn mutation_rate_color(q: u32) -> vec3<f32> {
+    let t = clamp(f32(q) / 255.0, 0.0, 1.0);
+    let cold = vec3<f32>(0.30, 0.55, 0.95); // blue
+    let warm = vec3<f32>(0.95, 0.30, 0.30); // red
+    return mix(cold, warm, t);
 }
 
 // Distinct palette for clans 0..3 (top-left, top-right, bottom-left,
@@ -182,6 +192,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let show_energy = (world.layer_flags & LAYER_ENERGY) != 0u;
     let show_fg = (world.layer_flags & LAYER_FG) != 0u;
     let show_clan = (world.layer_flags & LAYER_CLAN) != 0u;
+    let show_mutation = (world.layer_flags & LAYER_MUTATION_RATE) != 0u;
 
     var color = soil_color(cell, show_organic, show_energy);
 
@@ -194,7 +205,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let outline_w = aa_w * 0.5 * outline_fade;
         let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
         let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
-        let fg = select(occupant_color(cell), clan_color(cell.clan), show_clan);
+        // Resolve fill color: mutation > clan > occupant. Mutation
+        // gradient takes priority because it's the most visually
+        // distinct overlay; clan still beats default occupant colors.
+        var fg = occupant_color(cell);
+        if (show_clan) { fg = clan_color(cell.clan); }
+        if (show_mutation) { fg = mutation_rate_color(cell.mutation_rate); }
         color = mix(color, OUTLINE_COLOR, alpha_outer);
         color = mix(color, fg, alpha_inner);
     }
