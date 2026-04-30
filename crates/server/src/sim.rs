@@ -973,6 +973,18 @@ fn occupant_energy(occ: &Occupant) -> Option<Energy> {
     }
 }
 
+fn occupant_parent(occ: &Occupant) -> Option<Direction> {
+    match occ {
+        Occupant::Empty => None,
+        Occupant::Leaf { parent, .. }
+        | Occupant::Root { parent, .. }
+        | Occupant::Stem { parent, .. }
+        | Occupant::Antenna { parent, .. }
+        | Occupant::Sprout { parent, .. }
+        | Occupant::Seed { parent, .. } => *parent,
+    }
+}
+
 fn set_occupant_energy(occ: &mut Occupant, new_energy: Energy) {
     match occ {
         Occupant::Empty => {}
@@ -1088,10 +1100,13 @@ fn attempt_growth(
 
     // Walk the plan and figure out which slots are growable. A target is
     // viable if (a) the slot is a real product, (b) the cell is in-bounds,
-    // and (c) the cell is Empty OR an edible foreign cell. Edible cells get
-    // their energy harvested into the eater's pool.
+    // and (c) the cell is Empty OR an edible cell. Edible cells get their
+    // energy harvested into the eater's pool, and we remember their old
+    // parent direction so we can sever them from the foreign stem they
+    // used to belong to.
     let mut viable: [bool; 3] = [false; 3];
     let mut harvested: [u32; 3] = [0; 3];
+    let mut eaten_parent: [Option<Direction>; 3] = [None; 3];
     for (i, (dir, slot)) in plan.iter().enumerate() {
         if matches!(slot, SlotProduct::Nothing) {
             continue;
@@ -1109,6 +1124,7 @@ fn attempt_growth(
             EdibleStatus::Edible(e) => {
                 viable[i] = true;
                 harvested[i] = e as u32;
+                eaten_parent[i] = occupant_parent(&cell.occupant);
             }
             EdibleStatus::Blocked => {}
         }
@@ -1172,6 +1188,32 @@ fn attempt_growth(
                 children |= dir_to_bitmask(*dir);
             }
             grew = true;
+        }
+        // If we ate a cell that had a parent stem, sever the link: clear
+        // the connections + children bit on that foreign stem pointing at
+        // (nx, ny). Otherwise the foreign tree would keep treating this
+        // cell as its child and pump energy into our occupant — eating
+        // does not merge plants. Same-plant eating goes through the same
+        // path so a stem also drops the bit when it loses a child this
+        // way.
+        if let Some(eaten_back) = eaten_parent[i] {
+            let (pdx, pdy) = direction_to_delta(eaten_back);
+            if let (Some(px), Some(py)) =
+                (in_bounds(nx + pdx, max_x), in_bounds(ny + pdy, max_y))
+            {
+                let bit_back = dir_to_bitmask(opposite_dir(eaten_back));
+                if let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py) {
+                    if let Occupant::Stem {
+                        connections: pconns,
+                        children: pchildren,
+                        ..
+                    } = &mut parent_cell.occupant
+                    {
+                        *pconns &= !bit_back;
+                        *pchildren &= !bit_back;
+                    }
+                }
+            }
         }
     }
 
@@ -1598,6 +1640,98 @@ mod tests {
             cell_at(&chunks, chunks_x, 10, 9).occupant,
             Occupant::Sprout { .. }
         ));
+    }
+
+    #[test]
+    fn growth_severs_eaten_cell_from_foreign_parent_stem() {
+        // Plant 2 has a Stem at (10, 8) with a child Leaf to its south at
+        // (10, 9). Plant 1's sprout at (10, 10) faces north and eats that
+        // leaf. The foreign stem must drop its South children/connections
+        // bit — otherwise it would keep treating the now-foreign cell as
+        // its child (silently merging the two plants and pumping energy
+        // across).
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+
+        // Foreign stem at (10, 8): South child bit set.
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            8,
+            Occupant::Stem {
+                plant: 2,
+                clan: 1,
+                energy: 30,
+                connections: STEM_CONNECT_SOUTH,
+                parent: None,
+                children: STEM_CONNECT_SOUTH,
+            },
+        );
+        // Foreign leaf at (10, 9), parent: North (back to (10, 8)).
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Leaf {
+                plant: 2,
+                clan: 1,
+                energy: 50,
+                facing: Direction::North,
+                parent: Some(Direction::North),
+            },
+        );
+
+        // Plant 1's sprout, facing north, eats (10, 9).
+        let (sprout, genome) = vine_sprout(100);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            0,
+            100,
+            Direction::North,
+            None,
+            0,
+            &genome,
+            &mut det_rng(),
+        );
+
+        // (10, 9) replaced with our slot product (plant 1).
+        match &cell_at(&chunks, chunks_x, 10, 9).occupant {
+            Occupant::Sprout { plant, .. } => assert_eq!(*plant, 1),
+            other => panic!("expected own-plant Sprout, got {other:?}"),
+        }
+        // Foreign stem at (10, 8) lost its South child + connection bit.
+        match &cell_at(&chunks, chunks_x, 10, 8).occupant {
+            Occupant::Stem {
+                plant,
+                connections,
+                children,
+                ..
+            } => {
+                assert_eq!(*plant, 2, "foreign stem still belongs to plant 2");
+                assert_eq!(
+                    *children & STEM_CONNECT_SOUTH,
+                    0,
+                    "foreign stem's South child bit should be cleared"
+                );
+                assert_eq!(
+                    *connections & STEM_CONNECT_SOUTH,
+                    0,
+                    "foreign stem's South connection bit should be cleared"
+                );
+            }
+            other => panic!("expected foreign Stem at (10,8), got {other:?}"),
+        }
     }
 
     #[test]
