@@ -67,9 +67,9 @@ const ANTENNA_PULL_KERNEL: [[u16; 3]; 3] = [
     [1, 2, 1],
 ];
 const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [
+    [0, 1, 0],
     [1, 2, 1],
-    [2, 4, 2],
-    [1, 2, 1],
+    [0, 1, 0],
 ];
 
 pub struct SimState {
@@ -1100,13 +1100,13 @@ fn attempt_growth(
 
     // Walk the plan and figure out which slots are growable. A target is
     // viable if (a) the slot is a real product, (b) the cell is in-bounds,
-    // and (c) the cell is Empty, OR the slot produces a Seed and the cell
-    // is an edible non-empty cell. Only Seeds can eat — the seed is the
-    // invasive product that displaces existing biomass; every other slot
-    // (leaf/root/antenna/sprout) needs Empty. Eaten cells get their energy
-    // harvested into the eater's pool, and we remember their old parent
-    // direction so we can sever them from the foreign stem they used to
-    // belong to.
+    // and (c) the cell is Empty, OR the slot produces a Sprout / Seed and
+    // the cell is an edible non-empty cell. Only Sprouts and Seeds can
+    // eat — they're the "active" products that displace existing biomass.
+    // Static slots (leaf/root/antenna) need Empty. Eaten cells get their
+    // energy harvested into the eater's pool, and we remember their old
+    // parent direction so we can sever them from the foreign stem they
+    // used to belong to.
     let mut viable: [bool; 3] = [false; 3];
     let mut harvested: [u32; 3] = [0; 3];
     let mut eaten_parent: [Option<Direction>; 3] = [None; 3];
@@ -1125,7 +1125,7 @@ fn attempt_growth(
                 viable[i] = true;
             }
             EdibleStatus::Edible(e) => {
-                if matches!(slot, SlotProduct::Seed) {
+                if matches!(slot, SlotProduct::Sprout | SlotProduct::Seed) {
                     viable[i] = true;
                     harvested[i] = e as u32;
                     eaten_parent[i] = occupant_parent(&cell.occupant);
@@ -1247,9 +1247,9 @@ fn attempt_growth(
 enum EdibleStatus {
     /// Cell is Empty — grow normally, no energy harvested.
     Empty,
-    /// Cell is an edible non-empty cell. Only Seed slots may consume it
-    /// (see `attempt_growth`); other slots ignore Edible and treat the
-    /// target as unavailable.
+    /// Cell is an edible non-empty cell. Only Sprout / Seed slots may
+    /// consume it (see `attempt_growth`); other slots ignore Edible and
+    /// treat the target as unavailable.
     Edible(Energy),
     /// Cell is Root or Stem (always inviolate). Cannot grow into it.
     Blocked,
@@ -1260,7 +1260,7 @@ fn edible_for(occ: &Occupant, eater_plant: u32) -> EdibleStatus {
     // tree they hold up). Same-plant cells are also blocked — a sprout
     // cannot cannibalise its own lineage. The caller further narrows
     // which slot products can actually consume an Edible (currently
-    // Seeds only).
+    // Sprouts and Seeds).
     match occ {
         Occupant::Empty => EdibleStatus::Empty,
         Occupant::Leaf { plant, energy, .. }
@@ -1564,8 +1564,9 @@ mod tests {
             cell_at(&chunks, chunks_x, 10, 10).occupant,
             Occupant::Empty
         ));
-        // Center weight of DEATH_DEPOSIT_KERNEL is 4.
-        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 4);
+        // Some organic was deposited at the center (DEATH_DEPOSIT_KERNEL
+        // center weight is non-zero).
+        assert!(cell_at(&chunks, chunks_x, 10, 10).organic > 0);
     }
 
     #[test]
@@ -1627,10 +1628,11 @@ mod tests {
     }
 
     #[test]
-    fn growth_non_seed_slot_cannot_eat_foreign_leaf() {
-        // Vine sprout (front=Sprout, sides=Leaf) can no longer eat — only
-        // Seed slots can. Front leaf survives untouched; sides grow normally
-        // into Empty.
+    fn growth_static_slot_cannot_eat_foreign_leaf() {
+        // A genome whose front gene is a Leaf can't eat — only Sprout or
+        // Seed slots have that power. Foreign leaf in front survives
+        // untouched; the sprout has no other viable slot, so it dies in
+        // place.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
@@ -1649,8 +1651,31 @@ mod tests {
             },
         );
 
-        let (sprout, genome) = vine_sprout(100);
-        place(&mut chunks, chunks_x, 10, 10, sprout);
+        let mut genes = vec![Gene {
+            front: SlotProduct::Leaf,
+            left: SlotProduct::Nothing,
+            right: SlotProduct::Nothing,
+            next: 0,
+        }];
+        while genes.len() < GENOME_LEN {
+            genes.push(Gene::default());
+        }
+        let genome = Genome { genes };
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Sprout {
+                plant: 1,
+                clan: 0,
+                energy: 100,
+                facing: Direction::North,
+                genome: Box::new(genome.clone()),
+                parent: None,
+                current_gene: 0,
+            },
+        );
 
         attempt_growth(
             &mut chunks,
@@ -1669,23 +1694,14 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Front foreign leaf intact (plant 99, energy 50).
+        // Foreign leaf intact.
         match cell_at(&chunks, chunks_x, 10, 9).occupant {
             Occupant::Leaf { plant, energy, .. } => {
-                assert_eq!(plant, 99, "foreign leaf survives — sprout slot can't eat");
+                assert_eq!(plant, 99, "foreign leaf survives — Leaf slot can't eat");
                 assert_eq!(energy, 50);
             }
             ref other => panic!("expected foreign leaf untouched, got {other:?}"),
         }
-        // Sides got our leaves.
-        assert!(matches!(
-            cell_at(&chunks, chunks_x, 9, 10).occupant,
-            Occupant::Leaf { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, chunks_x, 11, 10).occupant,
-            Occupant::Leaf { .. }
-        ));
     }
 
     #[test]
@@ -2699,13 +2715,13 @@ mod tests {
             cell_at(&chunks, chunks_x, 10, 10).occupant,
             Occupant::Empty
         ));
-        // DEATH_DEPOSIT_KERNEL center weight = 4.
-        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 4);
-        // Cardinals weight 2.
-        assert!(cell_at(&chunks, chunks_x, 9, 10).organic >= 2);
-        assert!(cell_at(&chunks, chunks_x, 11, 10).organic >= 2);
-        // Corners weight 1.
-        assert!(cell_at(&chunks, chunks_x, 9, 9).organic >= 1);
+        // DEATH_DEPOSIT_KERNEL center weight = 2.
+        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 2);
+        // Cardinals weight 1.
+        assert!(cell_at(&chunks, chunks_x, 9, 10).organic >= 1);
+        assert!(cell_at(&chunks, chunks_x, 11, 10).organic >= 1);
+        // Corners weight 0 — kernel is cardinal-only.
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).organic, 0);
     }
 
     #[test]
@@ -2915,17 +2931,18 @@ mod tests {
 
         mutate_world(&mut chunks, 1, 1, &mut det_rng());
 
-        // Center weight=4 → +12 energy. Cardinals weight=2 → +6. Corners
-        // weight=1 → +3. Soil regulation also adds +1 to every cell since
-        // they all started below the rest level.
+        // DEATH_DEPOSIT_KERNEL is cardinal-only, sum=6 → per_unit=50/6=8.
+        // Center weight=2 → +16 energy. Cardinals weight=1 → +8. Corners
+        // weight=0 → no death deposit. Soil regulation adds +1 everywhere
+        // (all cells started below the rest level).
         let cell_at_idx =
             |x: i32, y: i32| -> usize { (y as usize) * (CHUNK_EDGE as usize) + x as usize };
         let center_idx = cell_at_idx(10, 10);
         let north_idx = cell_at_idx(10, 9);
         let nw_idx = cell_at_idx(9, 9);
-        assert_eq!(chunks[0].cells[center_idx].soil_energy, before[center_idx] + 1 + 12);
-        assert_eq!(chunks[0].cells[north_idx].soil_energy, before[north_idx] + 1 + 6);
-        assert_eq!(chunks[0].cells[nw_idx].soil_energy, before[nw_idx] + 1 + 3);
+        assert_eq!(chunks[0].cells[center_idx].soil_energy, before[center_idx] + 1 + 16);
+        assert_eq!(chunks[0].cells[north_idx].soil_energy, before[north_idx] + 1 + 8);
+        assert_eq!(chunks[0].cells[nw_idx].soil_energy, before[nw_idx] + 1);
     }
 
     #[test]

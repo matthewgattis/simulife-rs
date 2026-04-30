@@ -23,7 +23,7 @@ const TOXIC_BORDER_ORGANIC: u16 = 1000;
 
 /// Organic seeded everywhere else. Below the poison threshold; just
 /// some baseline soil chemistry.
-const DEFAULT_ORGANIC: u16 = 40;
+const DEFAULT_ORGANIC: u16 = 0;
 
 /// World layout: BOXES_PER_DIMENSION × BOXES_PER_DIMENSION isolated
 /// "boxes," each with its own sunlit interior and toxic-border ring.
