@@ -1100,10 +1100,13 @@ fn attempt_growth(
 
     // Walk the plan and figure out which slots are growable. A target is
     // viable if (a) the slot is a real product, (b) the cell is in-bounds,
-    // and (c) the cell is Empty OR an edible cell. Edible cells get their
-    // energy harvested into the eater's pool, and we remember their old
-    // parent direction so we can sever them from the foreign stem they
-    // used to belong to.
+    // and (c) the cell is Empty, OR the slot produces a Seed and the cell
+    // is an edible non-empty cell. Only Seeds can eat — the seed is the
+    // invasive product that displaces existing biomass; every other slot
+    // (leaf/root/antenna/sprout) needs Empty. Eaten cells get their energy
+    // harvested into the eater's pool, and we remember their old parent
+    // direction so we can sever them from the foreign stem they used to
+    // belong to.
     let mut viable: [bool; 3] = [false; 3];
     let mut harvested: [u32; 3] = [0; 3];
     let mut eaten_parent: [Option<Direction>; 3] = [None; 3];
@@ -1122,9 +1125,11 @@ fn attempt_growth(
                 viable[i] = true;
             }
             EdibleStatus::Edible(e) => {
-                viable[i] = true;
-                harvested[i] = e as u32;
-                eaten_parent[i] = occupant_parent(&cell.occupant);
+                if matches!(slot, SlotProduct::Seed) {
+                    viable[i] = true;
+                    harvested[i] = e as u32;
+                    eaten_parent[i] = occupant_parent(&cell.occupant);
+                }
             }
             EdibleStatus::Blocked => {}
         }
@@ -1242,17 +1247,19 @@ fn attempt_growth(
 enum EdibleStatus {
     /// Cell is Empty — grow normally, no energy harvested.
     Empty,
-    /// Cell is an edible cell — replace it and harvest its energy.
+    /// Cell is an edible non-empty cell. Only Seed slots may consume it
+    /// (see `attempt_growth`); other slots ignore Edible and treat the
+    /// target as unavailable.
     Edible(Energy),
     /// Cell is Root or Stem (always inviolate). Cannot grow into it.
     Blocked,
 }
 
 fn edible_for(occ: &Occupant, _eater_plant: u32) -> EdibleStatus {
-    // Same-plant cells are no longer protected from eating — sprouts may
-    // cannibalise their own lineage. Roots and Stems remain inviolate
-    // because they aren't terminal cells (eating them would orphan the
-    // tree they hold up); everything else is fair game.
+    // Same-plant cells aren't protected — only Roots and Stems are
+    // inviolate (eating them would orphan the tree they hold up). The
+    // caller decides which slot products can actually consume an Edible:
+    // currently Seeds only.
     match occ {
         Occupant::Empty => EdibleStatus::Empty,
         Occupant::Leaf { energy, .. }
@@ -1340,7 +1347,7 @@ fn dir_to_bitmask(d: Direction) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::ChunkCoord;
+    use protocol::{ChunkCoord, GENOME_LEN};
     use rand::SeedableRng;
 
     fn det_rng() -> ChaCha12Rng {
@@ -1384,6 +1391,31 @@ mod tests {
 
     fn vine_sprout(energy: Energy) -> (Occupant, Genome) {
         let genome = Genome::default_vine();
+        let occ = Occupant::Sprout {
+            plant: 1,
+            clan: 0,
+            energy,
+            facing: Direction::North,
+            genome: Box::new(genome.clone()),
+            parent: None,
+            current_gene: 0,
+        };
+        (occ, genome)
+    }
+
+    /// Sprout whose first gene plants a Seed straight ahead. Used by tests
+    /// that need to exercise the "only Seeds can eat" rule.
+    fn seed_front_sprout(energy: Energy) -> (Occupant, Genome) {
+        let mut genes = vec![Gene {
+            front: SlotProduct::Seed,
+            left: SlotProduct::Nothing,
+            right: SlotProduct::Nothing,
+            next: 0,
+        }];
+        while genes.len() < GENOME_LEN {
+            genes.push(Gene::default());
+        }
+        let genome = Genome { genes };
         let occ = Occupant::Sprout {
             plant: 1,
             clan: 0,
@@ -1532,24 +1564,29 @@ mod tests {
     }
 
     #[test]
-    fn growth_eats_foreign_leaves_and_pools_their_energy() {
+    fn growth_seed_slot_eats_foreign_leaf_and_pools_its_energy() {
+        // A sprout whose front gene is Seed: the seed lands on a foreign
+        // leaf, harvesting its energy. The side slots are Nothing — they
+        // don't try to grow at all.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
 
-        // Foreign leaves on all three growth targets — edible, not blocking.
-        let foreign_leaf = || Occupant::Leaf {
-            plant: 99,
-            clan: 0,
-            energy: 50,
-            facing: Direction::North,
-            parent: None,
-        };
-        place(&mut chunks, chunks_x, 10, 9, foreign_leaf()); // front
-        place(&mut chunks, chunks_x, 9, 10, foreign_leaf()); // left
-        place(&mut chunks, chunks_x, 11, 10, foreign_leaf()); // right
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Leaf {
+                plant: 99,
+                clan: 0,
+                energy: 50,
+                facing: Direction::North,
+                parent: None,
+            },
+        );
 
-        let (sprout, genome) = vine_sprout(30);
+        let (sprout, genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         attempt_growth(
@@ -1561,7 +1598,7 @@ mod tests {
             10,
             1,
             0,
-            30,
+            40,
             Direction::North,
             None,
             0,
@@ -1569,44 +1606,37 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Sprout's pool: 30 own + 3*50 harvested = 180.
-        // Effective cost (Sprout=20 + Leaf=5 + Leaf=5) = 30.
-        // Resulting stem energy = 180 - 30 = 150.
+        // Pool: 40 own + 50 harvested = 90. Cost = COST_SEED (30). Stem = 60.
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Stem { plant, energy, .. } => {
                 assert_eq!(plant, 1, "stem belongs to eater plant");
-                assert_eq!(energy, 150, "pool minus cost");
+                assert_eq!(energy, 60, "pool minus cost");
             }
             ref other => panic!("expected stem, got {other:?}"),
         }
-        // The eaten cells now belong to the eater plant.
+        // Eaten cell is now our Seed.
         match cell_at(&chunks, chunks_x, 10, 9).occupant {
-            Occupant::Sprout { plant, .. } => assert_eq!(plant, 1),
-            ref other => panic!("expected eater sprout in front, got {other:?}"),
-        }
-        match cell_at(&chunks, chunks_x, 9, 10).occupant {
-            Occupant::Leaf { plant, .. } => assert_eq!(plant, 1),
-            ref other => panic!("expected eater leaf at left, got {other:?}"),
+            Occupant::Seed { plant, .. } => assert_eq!(plant, 1),
+            ref other => panic!("expected eater seed in front, got {other:?}"),
         }
     }
 
     #[test]
-    fn growth_eats_own_plant_cells_too() {
-        // Same-plant eating is allowed — sprouts cannibalise their own
-        // lineage. The previous "skips own plant" rule was removed to see
-        // whether self-consumption is a useful evolutionary lever.
+    fn growth_non_seed_slot_cannot_eat_foreign_leaf() {
+        // Vine sprout (front=Sprout, sides=Leaf) can no longer eat — only
+        // Seed slots can. Front leaf survives untouched; sides grow normally
+        // into Empty.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
 
-        // Front cell holds an own-plant leaf with 50 energy.
         place(
             &mut chunks,
             chunks_x,
             10,
             9,
             Occupant::Leaf {
-                plant: 1,
+                plant: 99,
                 clan: 0,
                 energy: 50,
                 facing: Direction::North,
@@ -1634,11 +1664,72 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Front leaf got eaten and replaced with the eater's slot product
-        // (a Sprout for default vine).
+        // Front foreign leaf intact (plant 99, energy 50).
+        match cell_at(&chunks, chunks_x, 10, 9).occupant {
+            Occupant::Leaf { plant, energy, .. } => {
+                assert_eq!(plant, 99, "foreign leaf survives — sprout slot can't eat");
+                assert_eq!(energy, 50);
+            }
+            ref other => panic!("expected foreign leaf untouched, got {other:?}"),
+        }
+        // Sides got our leaves.
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 9, 10).occupant,
+            Occupant::Leaf { .. }
+        ));
+        assert!(matches!(
+            cell_at(&chunks, chunks_x, 11, 10).occupant,
+            Occupant::Leaf { .. }
+        ));
+    }
+
+    #[test]
+    fn growth_seed_slot_eats_own_plant_cells_too() {
+        // Same-plant eating isn't blocked — when the slot is a Seed, even
+        // an own-plant cell gets consumed. Useful for confirming the
+        // "Seeds only" rule doesn't accidentally re-add a same-plant guard.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        let max = CHUNK_EDGE as i32;
+
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Leaf {
+                plant: 1,
+                clan: 0,
+                energy: 50,
+                facing: Direction::North,
+                parent: None,
+            },
+        );
+
+        let (sprout, genome) = seed_front_sprout(40);
+        place(&mut chunks, chunks_x, 10, 10, sprout);
+
+        attempt_growth(
+            &mut chunks,
+            chunks_x,
+            max,
+            max,
+            10,
+            10,
+            1,
+            0,
+            40,
+            Direction::North,
+            None,
+            0,
+            &genome,
+            &mut det_rng(),
+        );
+
+        // Eaten cell is replaced with our Seed.
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 9).occupant,
-            Occupant::Sprout { .. }
+            Occupant::Seed { .. }
         ));
     }
 
@@ -1684,8 +1775,9 @@ mod tests {
             },
         );
 
-        // Plant 1's sprout, facing north, eats (10, 9).
-        let (sprout, genome) = vine_sprout(100);
+        // Plant 1's sprout (front=Seed) eats (10, 9). Only Seed slots can
+        // eat under the current rule.
+        let (sprout, genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         attempt_growth(
@@ -1697,7 +1789,7 @@ mod tests {
             10,
             1,
             0,
-            100,
+            40,
             Direction::North,
             None,
             0,
@@ -1705,10 +1797,10 @@ mod tests {
             &mut det_rng(),
         );
 
-        // (10, 9) replaced with our slot product (plant 1).
+        // (10, 9) replaced with our Seed (plant 1).
         match &cell_at(&chunks, chunks_x, 10, 9).occupant {
-            Occupant::Sprout { plant, .. } => assert_eq!(*plant, 1),
-            other => panic!("expected own-plant Sprout, got {other:?}"),
+            Occupant::Seed { plant, .. } => assert_eq!(*plant, 1),
+            other => panic!("expected own-plant Seed, got {other:?}"),
         }
         // Foreign stem at (10, 8) lost its South child + connection bit.
         match &cell_at(&chunks, chunks_x, 10, 8).occupant {
