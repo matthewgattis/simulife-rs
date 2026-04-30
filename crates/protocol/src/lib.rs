@@ -25,7 +25,18 @@ pub enum Direction {
     West,
 }
 
+/// Initial genome size for fresh sprouts. Genomes mutate in size over
+/// generations (insert/delete events at copy time), bounded by
+/// `GENOME_MIN` and `GENOME_MAX`.
 pub const GENOME_LEN: usize = 32;
+pub const GENOME_MIN: usize = 1;
+pub const GENOME_MAX: usize = 64;
+
+/// Initial per-genome mutation rate. Each lineage's actual rate
+/// drifts under selection pressure (mutation_rate is itself
+/// mutable per-copy).
+pub const DEFAULT_MUTATION_RATE: f32 = 0.01;
+pub const MUTATION_RATE_MAX: f32 = 0.2;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotProduct {
@@ -58,9 +69,13 @@ impl Default for Gene {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Genome {
     pub genes: Vec<Gene>,
+    /// Per-genome mutation rate. Mutates with each copy, so a lineage
+    /// can evolve toward stability or chaos under selection. Bounded
+    /// by [0.0, MUTATION_RATE_MAX].
+    pub mutation_rate: f32,
 }
 
 impl Genome {
@@ -78,7 +93,10 @@ impl Genome {
         while genes.len() < GENOME_LEN {
             genes.push(Gene::default());
         }
-        Self { genes }
+        Self {
+            genes,
+            mutation_rate: DEFAULT_MUTATION_RATE,
+        }
     }
 }
 

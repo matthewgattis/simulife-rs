@@ -115,8 +115,13 @@ pub fn place_random_sprout_grid(
                         2 => Direction::South,
                         _ => Direction::West,
                     };
-                    let genome =
-                        crate::sim::mutate_genome(&Genome::default_vine(), 1.0, rng);
+                    let mut starter = Genome::default_vine();
+                    starter.mutation_rate = 1.0;
+                    let mut genome = crate::sim::mutate_genome(&starter, rng);
+                    // Restore the standard initial mutation rate so all
+                    // fresh sprouts start at the same rate; only the
+                    // gene contents differ between them.
+                    genome.mutation_rate = protocol::DEFAULT_MUTATION_RATE;
                     // Clan: which 2D box this sprout starts in. Encoded
                     // row-major: clan = box_y * BOXES_PER_DIMENSION + box_x.
                     let bx = (x / box_w) as u32;
