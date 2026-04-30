@@ -1255,17 +1255,22 @@ enum EdibleStatus {
     Blocked,
 }
 
-fn edible_for(occ: &Occupant, _eater_plant: u32) -> EdibleStatus {
-    // Same-plant cells aren't protected — only Roots and Stems are
-    // inviolate (eating them would orphan the tree they hold up). The
-    // caller decides which slot products can actually consume an Edible:
-    // currently Seeds only.
+fn edible_for(occ: &Occupant, eater_plant: u32) -> EdibleStatus {
+    // Roots and Stems are always inviolate (eating them would orphan the
+    // tree they hold up). Same-plant cells are also blocked — a sprout
+    // cannot cannibalise its own lineage. The caller further narrows
+    // which slot products can actually consume an Edible (currently
+    // Seeds only).
     match occ {
         Occupant::Empty => EdibleStatus::Empty,
-        Occupant::Leaf { energy, .. }
-        | Occupant::Antenna { energy, .. }
-        | Occupant::Sprout { energy, .. }
-        | Occupant::Seed { energy, .. } => EdibleStatus::Edible(*energy),
+        Occupant::Leaf { plant, energy, .. }
+        | Occupant::Antenna { plant, energy, .. }
+        | Occupant::Sprout { plant, energy, .. }
+        | Occupant::Seed { plant, energy, .. }
+            if *plant != eater_plant =>
+        {
+            EdibleStatus::Edible(*energy)
+        }
         _ => EdibleStatus::Blocked,
     }
 }
@@ -1684,10 +1689,11 @@ mod tests {
     }
 
     #[test]
-    fn growth_seed_slot_eats_own_plant_cells_too() {
-        // Same-plant eating isn't blocked — when the slot is a Seed, even
-        // an own-plant cell gets consumed. Useful for confirming the
-        // "Seeds only" rule doesn't accidentally re-add a same-plant guard.
+    fn growth_seed_slot_skips_own_plant_cells() {
+        // Same-plant cells are protected from eating — even Seed slots
+        // refuse to consume an own-plant Leaf. The sprout's only
+        // viable target is its front (the leaf), and since that's
+        // blocked, no slots are viable: the sprout dies in place.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
@@ -1726,10 +1732,18 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Eaten cell is replaced with our Seed.
+        // Front cell still the own-plant leaf, energy intact.
+        match cell_at(&chunks, chunks_x, 10, 9).occupant {
+            Occupant::Leaf { plant, energy, .. } => {
+                assert_eq!(plant, 1, "own-plant leaf preserved");
+                assert_eq!(energy, 50);
+            }
+            ref other => panic!("expected own leaf untouched, got {other:?}"),
+        }
+        // No viable slots: the sprout died in place.
         assert!(matches!(
-            cell_at(&chunks, chunks_x, 10, 9).occupant,
-            Occupant::Seed { .. }
+            cell_at(&chunks, chunks_x, 10, 10).occupant,
+            Occupant::Empty
         ));
     }
 
