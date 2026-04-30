@@ -1200,23 +1200,23 @@ fn attempt_growth(
 enum EdibleStatus {
     /// Cell is Empty — grow normally, no energy harvested.
     Empty,
-    /// Cell is a foreign edible cell — replace it and harvest its energy.
+    /// Cell is an edible cell — replace it and harvest its energy.
     Edible(Energy),
-    /// Cell is one of: own-plant, Root, Stem, OOB. Cannot grow into it.
+    /// Cell is Root or Stem (always inviolate). Cannot grow into it.
     Blocked,
 }
 
-fn edible_for(occ: &Occupant, eater_plant: u32) -> EdibleStatus {
+fn edible_for(occ: &Occupant, _eater_plant: u32) -> EdibleStatus {
+    // Same-plant cells are no longer protected from eating — sprouts may
+    // cannibalise their own lineage. Roots and Stems remain inviolate
+    // because they aren't terminal cells (eating them would orphan the
+    // tree they hold up); everything else is fair game.
     match occ {
         Occupant::Empty => EdibleStatus::Empty,
-        Occupant::Leaf { plant, energy, .. }
-        | Occupant::Antenna { plant, energy, .. }
-        | Occupant::Sprout { plant, energy, .. }
-        | Occupant::Seed { plant, energy, .. }
-            if *plant != eater_plant =>
-        {
-            EdibleStatus::Edible(*energy)
-        }
+        Occupant::Leaf { energy, .. }
+        | Occupant::Antenna { energy, .. }
+        | Occupant::Sprout { energy, .. }
+        | Occupant::Seed { energy, .. } => EdibleStatus::Edible(*energy),
         _ => EdibleStatus::Blocked,
     }
 }
@@ -1549,12 +1549,15 @@ mod tests {
     }
 
     #[test]
-    fn growth_skips_own_plant_cells() {
+    fn growth_eats_own_plant_cells_too() {
+        // Same-plant eating is allowed — sprouts cannibalise their own
+        // lineage. The previous "skips own plant" rule was removed to see
+        // whether self-consumption is a useful evolutionary lever.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
 
-        // Block the front with an own-plant leaf — cannot eat your own.
+        // Front cell holds an own-plant leaf with 50 energy.
         place(
             &mut chunks,
             chunks_x,
@@ -1589,22 +1592,11 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Front (own leaf) untouched; sides grow normally.
-        match cell_at(&chunks, chunks_x, 10, 9).occupant {
-            Occupant::Leaf { plant, energy, .. } => {
-                assert_eq!(plant, 1);
-                assert_eq!(energy, 50, "own leaf still intact");
-            }
-            ref other => panic!("expected own leaf preserved, got {other:?}"),
-        }
-        // Sides got the leaves.
+        // Front leaf got eaten and replaced with the eater's slot product
+        // (a Sprout for default vine).
         assert!(matches!(
-            cell_at(&chunks, chunks_x, 9, 10).occupant,
-            Occupant::Leaf { .. }
-        ));
-        assert!(matches!(
-            cell_at(&chunks, chunks_x, 11, 10).occupant,
-            Occupant::Leaf { .. }
+            cell_at(&chunks, chunks_x, 10, 9).occupant,
+            Occupant::Sprout { .. }
         ));
     }
 
