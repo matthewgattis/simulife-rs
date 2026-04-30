@@ -32,7 +32,7 @@ const SOIL_ENERGY_REGULATION: u16 = 1;
 /// disconnects: parent stem drops the children-bit pointing at the seed,
 /// and the seed clears its own parent. The seed then lives off its
 /// reserves (upkeep ticks it down) until starvation or germination.
-const SEED_DROPOFF_THRESHOLD: Energy = 100;
+const SEED_DROPOFF_THRESHOLD: Energy = 120;
 
 /// When a cell's soil organic exceeds this, the soil is toxic. Every
 /// occupant except a Root dies. Picked above the 0..=255 range build_world
@@ -67,9 +67,9 @@ const ANTENNA_PULL_KERNEL: [[u16; 3]; 3] = [
     [1, 2, 1],
 ];
 const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [
-    [0, 1, 0],
     [1, 2, 1],
-    [0, 1, 0],
+    [2, 4, 2],
+    [1, 2, 1],
 ];
 
 pub struct SimState {
@@ -265,11 +265,14 @@ fn mutate_world(
     let max_y = chunks_y as i32 * edge;
 
     // Phase 1: photosynthesis (per-cell, in-place).
-    for chunk in chunks.iter_mut() {
-        for cell in chunk.cells.iter_mut() {
-            if cell.sunlit {
-                if let Occupant::Leaf { energy, .. } = &mut cell.occupant {
-                    *energy = energy.saturating_add(LEAF_PHOTOSYNTHESIS);
+    {
+        let _span = tracing::info_span!("phase_photo").entered();
+        for chunk in chunks.iter_mut() {
+            for cell in chunk.cells.iter_mut() {
+                if cell.sunlit {
+                    if let Occupant::Leaf { energy, .. } = &mut cell.occupant {
+                        *energy = energy.saturating_add(LEAF_PHOTOSYNTHESIS);
+                    }
                 }
             }
         }
@@ -278,37 +281,43 @@ fn mutate_world(
     // Phase 1.5: soil energy regulation. Each cell drifts its soil_energy
     // toward SOIL_ENERGY_REST by SOIL_ENERGY_REGULATION per tick. Runs
     // before soil pulls so antennae deplete a freshened soil each tick.
-    for chunk in chunks.iter_mut() {
-        for cell in chunk.cells.iter_mut() {
-            if cell.soil_energy < SOIL_ENERGY_REST {
-                cell.soil_energy = (cell.soil_energy + SOIL_ENERGY_REGULATION)
-                    .min(SOIL_ENERGY_REST);
-            } else if cell.soil_energy > SOIL_ENERGY_REST {
-                cell.soil_energy = cell
-                    .soil_energy
-                    .saturating_sub(SOIL_ENERGY_REGULATION)
-                    .max(SOIL_ENERGY_REST);
+    {
+        let _span = tracing::info_span!("phase_soil_regulation").entered();
+        for chunk in chunks.iter_mut() {
+            for cell in chunk.cells.iter_mut() {
+                if cell.soil_energy < SOIL_ENERGY_REST {
+                    cell.soil_energy = (cell.soil_energy + SOIL_ENERGY_REGULATION)
+                        .min(SOIL_ENERGY_REST);
+                } else if cell.soil_energy > SOIL_ENERGY_REST {
+                    cell.soil_energy = cell
+                        .soil_energy
+                        .saturating_sub(SOIL_ENERGY_REGULATION)
+                        .max(SOIL_ENERGY_REST);
+                }
             }
         }
     }
 
     // Phase 2: soil pulls. Serial — multiple roots near the same soil cell
     // each take their share in iteration order until that cell is empty.
-    for cy in 0..chunks_y {
-        for cx in 0..chunks_x {
-            for ly in 0..(CHUNK_EDGE as usize) {
-                for lx in 0..(CHUNK_EDGE as usize) {
-                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
-                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-                    let field = match &chunks[chunk_idx].cells[cell_idx].occupant {
-                        Occupant::Root { .. } => Some(SoilField::Organic),
-                        Occupant::Antenna { .. } => Some(SoilField::Energy),
-                        _ => None,
-                    };
-                    if let Some(field) = field {
-                        let wx = cx as i32 * edge + lx as i32;
-                        let wy = cy as i32 * edge + ly as i32;
-                        apply_soil_pull(chunks, chunks_x, wx, wy, max_x, max_y, field);
+    {
+        let _span = tracing::info_span!("phase_soil_pulls").entered();
+        for cy in 0..chunks_y {
+            for cx in 0..chunks_x {
+                for ly in 0..(CHUNK_EDGE as usize) {
+                    for lx in 0..(CHUNK_EDGE as usize) {
+                        let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                        let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                        let field = match &chunks[chunk_idx].cells[cell_idx].occupant {
+                            Occupant::Root { .. } => Some(SoilField::Organic),
+                            Occupant::Antenna { .. } => Some(SoilField::Energy),
+                            _ => None,
+                        };
+                        if let Some(field) = field {
+                            let wx = cx as i32 * edge + lx as i32;
+                            let wy = cy as i32 * edge + ly as i32;
+                            apply_soil_pull(chunks, chunks_x, wx, wy, max_x, max_y, field);
+                        }
                     }
                 }
             }
@@ -316,11 +325,14 @@ fn mutate_world(
     }
 
     // Phase 3: upkeep (per-cell, in-place).
-    for chunk in chunks.iter_mut() {
-        for cell in chunk.cells.iter_mut() {
-            if let Some(e) = occupant_energy(&cell.occupant) {
-                let cost = upkeep_for(&cell.occupant);
-                set_occupant_energy(&mut cell.occupant, e.saturating_sub(cost));
+    {
+        let _span = tracing::info_span!("phase_upkeep").entered();
+        for chunk in chunks.iter_mut() {
+            for cell in chunk.cells.iter_mut() {
+                if let Some(e) = occupant_energy(&cell.occupant) {
+                    let cost = upkeep_for(&cell.occupant);
+                    set_occupant_energy(&mut cell.occupant, e.saturating_sub(cost));
+                }
             }
         }
     }
@@ -341,6 +353,7 @@ fn mutate_world(
     // the entire cascade. Each pass is monotonic (only drops bits) so
     // convergence is guaranteed; cycles (which game rules already
     // shouldn't produce) leave their bits intact and the loop exits.
+    let _phase_prune = tracing::info_span!("phase_prune").entered();
     let total_cells = chunks.len() * CHUNK_AREA;
     let bits = [
         STEM_CONNECT_NORTH,
@@ -348,6 +361,7 @@ fn mutate_world(
         STEM_CONNECT_SOUTH,
         STEM_CONNECT_WEST,
     ];
+    let mut prune_passes: u32 = 0;
     loop {
         let mut pruned_children: Vec<Option<u8>> = vec![None; total_cells];
         let mut any_change = false;
@@ -393,6 +407,7 @@ fn mutate_world(
         if !any_change {
             break;
         }
+        prune_passes += 1;
         for cy in 0..chunks_y {
             for cx in 0..chunks_x {
                 for ly in 0..(CHUNK_EDGE as usize) {
@@ -416,11 +431,14 @@ fn mutate_world(
             }
         }
     }
+    drop(_phase_prune);
+    tracing::event!(tracing::Level::INFO, prune_passes, "phase_prune_done");
 
     // Phase 5: directed push. Production cells push surplus to parent, stems
     // split surplus across children, sprouts/seeds are terminal sinks. Build
     // a delta array from the current state, then apply atomically — removes
     // any order dependency between cells in the same generation.
+    let _phase_push = tracing::info_span!("phase_push").entered();
     let total_cells = chunks.len() * CHUNK_AREA;
     let mut deltas: Vec<i32> = vec![0; total_cells];
     for cy in 0..chunks_y {
@@ -486,6 +504,7 @@ fn mutate_world(
             }
         }
     }
+    drop(_phase_push);
 
     // Phase 5.5: seed germination. A Seed becomes a Sprout in place (and
     // tries to grow this same tick in phase 6) if either:
@@ -493,6 +512,7 @@ fn mutate_world(
     //   - it has accumulated SEED_DROPOFF_THRESHOLD energy.
     // In the threshold case the parent stem is still alive — clear its
     // children-bit pointing at the now-departing seed.
+    let _phase_germ = tracing::info_span!("phase_germination").entered();
     let mut germinations: Vec<(i32, i32, Option<(i32, i32, u8)>)> = Vec::new();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
@@ -555,6 +575,7 @@ fn mutate_world(
             }
         }
     }
+    let germination_count = germinations.len() as u64;
     for (sx, sy, parent_clear) in germinations {
         let (clan, energy, facing, genome) =
             match cell_at_mut(chunks, chunks_x, sx, sy) {
@@ -595,9 +616,17 @@ fn mutate_world(
             }
         }
     }
+    drop(_phase_germ);
+    tracing::event!(
+        tracing::Level::INFO,
+        germinations = germination_count,
+        "phase_germination_done"
+    );
 
     // Phase 6: growth — sprouts execute their current gene if energy covers
     // the slot costs and all desired targets are Empty.
+    let _phase_growth = tracing::info_span!("phase_growth").entered();
+    let mut growth_attempts: u64 = 0;
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
@@ -629,6 +658,7 @@ fn mutate_world(
                     {
                         let wx = cx as i32 * edge + lx as i32;
                         let wy = cy as i32 * edge + ly as i32;
+                        growth_attempts += 1;
                         attempt_growth(
                             chunks,
                             chunks_x,
@@ -650,6 +680,12 @@ fn mutate_world(
             }
         }
     }
+    drop(_phase_growth);
+    tracing::event!(
+        tracing::Level::INFO,
+        growth_attempts,
+        "phase_growth_done"
+    );
 
     // Phase 7: death — collect cells that should die this tick. Reasons:
     //   - energy_dead: occupant.energy is 0
@@ -661,7 +697,9 @@ fn mutate_world(
     //                 immune to organic, Antenna is immune to energy)
     // Apply: deposit organic per kernel weight + distribute the dying
     // cell's own energy across the kernel, then replace cell with Empty.
+    let _phase_death = tracing::info_span!("phase_death").entered();
     let mut dying: Vec<(i32, i32, Energy)> = Vec::new();
+    let death_count: u64;
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
@@ -684,6 +722,7 @@ fn mutate_world(
             }
         }
     }
+    death_count = dying.len() as u64;
     for (wx, wy, energy) in dying {
         deposit_kernel(
             chunks,
@@ -729,6 +768,60 @@ fn mutate_world(
             cell.occupant = Occupant::Empty;
         }
     }
+    drop(_phase_death);
+    tracing::event!(tracing::Level::INFO, deaths = death_count, "phase_death_done");
+
+    // Per-tick summary event with occupant census so we can correlate
+    // tick duration against world fullness over the run.
+    let mut occupants: u64 = 0;
+    let mut leaves: u64 = 0;
+    let mut roots: u64 = 0;
+    let mut antennas: u64 = 0;
+    let mut stems: u64 = 0;
+    let mut sprouts: u64 = 0;
+    let mut seeds: u64 = 0;
+    for chunk in chunks.iter() {
+        for cell in chunk.cells.iter() {
+            match cell.occupant {
+                Occupant::Empty => {}
+                Occupant::Leaf { .. } => {
+                    leaves += 1;
+                    occupants += 1;
+                }
+                Occupant::Root { .. } => {
+                    roots += 1;
+                    occupants += 1;
+                }
+                Occupant::Antenna { .. } => {
+                    antennas += 1;
+                    occupants += 1;
+                }
+                Occupant::Stem { .. } => {
+                    stems += 1;
+                    occupants += 1;
+                }
+                Occupant::Sprout { .. } => {
+                    sprouts += 1;
+                    occupants += 1;
+                }
+                Occupant::Seed { .. } => {
+                    seeds += 1;
+                    occupants += 1;
+                }
+            }
+        }
+    }
+    tracing::event!(
+        tracing::Level::INFO,
+        occupants,
+        leaves,
+        roots,
+        antennas,
+        stems,
+        sprouts,
+        seeds,
+        "tick_census"
+    );
 }
 
 /// True iff the soil's chemistry is fatal for this occupant.
@@ -2727,13 +2820,13 @@ mod tests {
             cell_at(&chunks, chunks_x, 10, 10).occupant,
             Occupant::Empty
         ));
-        // DEATH_DEPOSIT_KERNEL center weight = 2.
-        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 2);
-        // Cardinals weight 1.
-        assert!(cell_at(&chunks, chunks_x, 9, 10).organic >= 1);
-        assert!(cell_at(&chunks, chunks_x, 11, 10).organic >= 1);
-        // Corners weight 0 — kernel is cardinal-only.
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).organic, 0);
+        // DEATH_DEPOSIT_KERNEL center weight = 4.
+        assert!(cell_at(&chunks, chunks_x, 10, 10).organic >= 4);
+        // Cardinals weight 2.
+        assert!(cell_at(&chunks, chunks_x, 9, 10).organic >= 2);
+        assert!(cell_at(&chunks, chunks_x, 11, 10).organic >= 2);
+        // Corners weight 1.
+        assert!(cell_at(&chunks, chunks_x, 9, 9).organic >= 1);
     }
 
     #[test]
@@ -2943,18 +3036,19 @@ mod tests {
 
         mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
 
-        // DEATH_DEPOSIT_KERNEL is cardinal-only, sum=6 → per_unit=50/6=8.
-        // Center weight=2 → +16 energy. Cardinals weight=1 → +8. Corners
-        // weight=0 → no death deposit. Soil regulation adds +1 everywhere
-        // (all cells started below the rest level).
+        // Leaf pays UPKEEP_DEFAULT=2 first → dies with 48 energy.
+        // DEATH_DEPOSIT_KERNEL sum=16 → per_unit=48/16=3.
+        // Center weight=4 → +12 energy. Cardinals weight=2 → +6. Corners
+        // weight=1 → +3. Soil regulation adds +1 everywhere (all cells
+        // started below the rest level).
         let cell_at_idx =
             |x: i32, y: i32| -> usize { (y as usize) * (CHUNK_EDGE as usize) + x as usize };
         let center_idx = cell_at_idx(10, 10);
         let north_idx = cell_at_idx(10, 9);
         let nw_idx = cell_at_idx(9, 9);
-        assert_eq!(chunks[0].cells[center_idx].soil_energy, before[center_idx] + 1 + 16);
-        assert_eq!(chunks[0].cells[north_idx].soil_energy, before[north_idx] + 1 + 8);
-        assert_eq!(chunks[0].cells[nw_idx].soil_energy, before[nw_idx] + 1);
+        assert_eq!(chunks[0].cells[center_idx].soil_energy, before[center_idx] + 1 + 12);
+        assert_eq!(chunks[0].cells[north_idx].soil_energy, before[north_idx] + 1 + 6);
+        assert_eq!(chunks[0].cells[nw_idx].soil_energy, before[nw_idx] + 1 + 3);
     }
 
     #[test]
