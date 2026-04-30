@@ -99,7 +99,7 @@ enum SimAction {
     Wait,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum SoilField {
     Organic,
     Energy,
@@ -298,10 +298,37 @@ fn mutate_world(
         }
     }
 
-    // Phase 2: soil pulls. Serial — multiple roots near the same soil cell
-    // each take their share in iteration order until that cell is empty.
+    // Phase 2: soil pulls.
+    //
+    // Order-independent fair-share: when multiple pullers are within 3×3
+    // of the same soil cell, the cell's contents are split between them
+    // in proportion to their kernel weights, instead of "first puller in
+    // iteration order grabs all available."
+    //
+    // Three passes:
+    //   1. Demand pass — each puller writes its kernel weights to the
+    //      `demand[neighbor]` buffer with `+=`. After this pass, each
+    //      cell knows the total amount pullers want to take from it.
+    //   2. Gain pass — each puller reads the source state of its 3×3
+    //      soil neighbors plus the demand buffer, computes its fair
+    //      share `(my_kernel_weight * actual_loss / total_demand)`, and
+    //      writes only its own gain.
+    //   3. Apply pass — each soil cell subtracts `min(available, demand)`
+    //      from itself; each puller adds its gain to its energy.
+    //
+    // Integer-divided shares may leave a few units in the soil due to
+    // floor rounding — that's acceptable and erring on the conservative
+    // side of mass conservation.
     {
         let _span = tracing::info_span!("phase_soil_pulls").entered();
+        let total_cells = chunks.len() * CHUNK_AREA;
+        // u8 is sufficient: max demand per cell is bounded by 9
+        // pullers × max kernel weight (4) = 36.
+        let mut organic_demand: Vec<u8> = vec![0; total_cells];
+        let mut energy_demand: Vec<u8> = vec![0; total_cells];
+        let mut pullers: Vec<(i32, i32, SoilField)> = Vec::new();
+
+        // Pass 1: collect pullers and accumulate per-cell demand.
         for cy in 0..chunks_y {
             for cx in 0..chunks_x {
                 for ly in 0..(CHUNK_EDGE as usize) {
@@ -309,16 +336,107 @@ fn mutate_world(
                         let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
                         let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
                         let field = match &chunks[chunk_idx].cells[cell_idx].occupant {
-                            Occupant::Root { .. } => Some(SoilField::Organic),
-                            Occupant::Antenna { .. } => Some(SoilField::Energy),
-                            _ => None,
+                            Occupant::Root { .. } => SoilField::Organic,
+                            Occupant::Antenna { .. } => SoilField::Energy,
+                            _ => continue,
                         };
-                        if let Some(field) = field {
-                            let wx = cx as i32 * edge + lx as i32;
-                            let wy = cy as i32 * edge + ly as i32;
-                            apply_soil_pull(chunks, chunks_x, wx, wy, max_x, max_y, field);
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        let kernel = match field {
+                            SoilField::Organic => &ROOT_PULL_KERNEL,
+                            SoilField::Energy => &ANTENNA_PULL_KERNEL,
+                        };
+                        pullers.push((wx, wy, field));
+                        for dy in -1..=1i32 {
+                            for dx in -1..=1i32 {
+                                let weight = kernel[(dy + 1) as usize][(dx + 1) as usize];
+                                if weight == 0 { continue; }
+                                let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
+                                let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
+                                let idx = linear_idx(chunks_x, nx, ny);
+                                let buf = match field {
+                                    SoilField::Organic => &mut organic_demand,
+                                    SoilField::Energy => &mut energy_demand,
+                                };
+                                buf[idx] = buf[idx].saturating_add(weight as u8);
+                            }
                         }
                     }
+                }
+            }
+        }
+
+        // Pass 2: each puller computes its fair-share gain across its
+        // 3×3 soil neighbors. Reads only; no writes yet.
+        let mut puller_gains: Vec<(i32, i32, u32)> = Vec::with_capacity(pullers.len());
+        for (pwx, pwy, field) in &pullers {
+            let kernel = match field {
+                SoilField::Organic => &ROOT_PULL_KERNEL,
+                SoilField::Energy => &ANTENNA_PULL_KERNEL,
+            };
+            let mut gain: u32 = 0;
+            for dy in -1..=1i32 {
+                for dx in -1..=1i32 {
+                    let weight = kernel[(dy + 1) as usize][(dx + 1) as usize] as u32;
+                    if weight == 0 { continue; }
+                    let Some(nx) = in_bounds(pwx + dx, max_x) else { continue; };
+                    let Some(ny) = in_bounds(pwy + dy, max_y) else { continue; };
+                    let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
+                        + (nx / edge) as usize;
+                    let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                        + (nx % edge) as usize;
+                    let neighbor = &chunks[n_chunk_idx].cells[n_cell_idx];
+                    let avail = match field {
+                        SoilField::Organic => neighbor.organic as u32,
+                        SoilField::Energy => neighbor.soil_energy as u32,
+                    };
+                    let idx = linear_idx(chunks_x, nx, ny);
+                    let total_demand = match field {
+                        SoilField::Organic => organic_demand[idx] as u32,
+                        SoilField::Energy => energy_demand[idx] as u32,
+                    };
+                    if total_demand == 0 { continue; }
+                    let actual_loss = avail.min(total_demand);
+                    gain += weight * actual_loss / total_demand;
+                }
+            }
+            puller_gains.push((*pwx, *pwy, gain));
+        }
+
+        // Pass 3a: apply soil losses (each cell subtracts its own loss).
+        for cy in 0..chunks_y {
+            for cx in 0..chunks_x {
+                for ly in 0..(CHUNK_EDGE as usize) {
+                    for lx in 0..(CHUNK_EDGE as usize) {
+                        let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                        let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                        let wx = cx as i32 * edge + lx as i32;
+                        let wy = cy as i32 * edge + ly as i32;
+                        let idx = linear_idx(chunks_x, wx, wy);
+                        let cell = &mut chunks[chunk_idx].cells[cell_idx];
+                        let od = organic_demand[idx] as u32;
+                        if od > 0 {
+                            let loss = (cell.organic as u32).min(od) as u16;
+                            cell.organic -= loss;
+                        }
+                        let ed = energy_demand[idx] as u32;
+                        if ed > 0 {
+                            let loss = (cell.soil_energy as u32).min(ed) as u16;
+                            cell.soil_energy -= loss;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 3b: apply puller gains (each puller writes only itself).
+        for (pwx, pwy, gain) in puller_gains {
+            if gain == 0 { continue; }
+            if let Some(cell) = cell_at_mut(chunks, chunks_x, pwx, pwy) {
+                if let Some(e) = occupant_energy(&cell.occupant) {
+                    let new_e =
+                        (e as u32 + gain).min(Energy::MAX as u32) as Energy;
+                    set_occupant_energy(&mut cell.occupant, new_e);
                 }
             }
         }
@@ -942,53 +1060,6 @@ fn linear_idx(chunks_x: u32, wx: i32, wy: i32) -> usize {
 /// regions stay isolated, but the world edge is also a wall.
 fn in_bounds(c: i32, max: i32) -> Option<i32> {
     if c < 0 || c >= max { None } else { Some(c) }
-}
-
-fn apply_soil_pull(
-    chunks: &mut [Chunk],
-    chunks_x: u32,
-    wx: i32,
-    wy: i32,
-    max_x: i32,
-    max_y: i32,
-    field: SoilField,
-) {
-    let kernel = match field {
-        SoilField::Organic => &ROOT_PULL_KERNEL,
-        SoilField::Energy => &ANTENNA_PULL_KERNEL,
-    };
-    let mut total_pulled: u32 = 0;
-    for dy in -1..=1i32 {
-        for dx in -1..=1i32 {
-            let want = kernel[(dy + 1) as usize][(dx + 1) as usize];
-            if want == 0 {
-                continue;
-            }
-            let Some(nx) = in_bounds(wx + dx, max_x) else { continue; };
-            let Some(ny) = in_bounds(wy + dy, max_y) else { continue; };
-            if let Some(cell) = cell_at_mut(chunks, chunks_x, nx, ny) {
-                let avail = match field {
-                    SoilField::Organic => cell.organic,
-                    SoilField::Energy => cell.soil_energy,
-                };
-                let actual = avail.min(want);
-                match field {
-                    SoilField::Organic => cell.organic -= actual,
-                    SoilField::Energy => cell.soil_energy -= actual,
-                }
-                total_pulled += actual as u32;
-            }
-        }
-    }
-    if total_pulled > 0 {
-        if let Some(cell) = cell_at_mut(chunks, chunks_x, wx, wy) {
-            if let Some(e) = occupant_energy(&cell.occupant) {
-                let new_e =
-                    (e as u32 + total_pulled).min(Energy::MAX as u32) as Energy;
-                set_occupant_energy(&mut cell.occupant, new_e);
-            }
-        }
-    }
 }
 
 fn deposit_kernel(
@@ -2605,6 +2676,99 @@ mod tests {
         assert_eq!(cell_at(&chunks, chunks_x, 10, 9).soil_energy, 98);
         assert_eq!(cell_at(&chunks, chunks_x, 10, 11).soil_energy, 98);
         assert_eq!(cell_at(&chunks, chunks_x, 9, 9).soil_energy, 99);
+    }
+
+    #[test]
+    fn phase_soil_pulls_split_fairly_under_contention() {
+        // Two roots at (10, 10) and (12, 10) both demand 2 organic from
+        // the contested cell at (11, 10). With only 1 unit there, the
+        // old "iterate-and-take" logic gave the entire unit to the
+        // first-iterated root (left) and 0 to the second (right). The
+        // new fair-share logic gives both roots equal share (0 each
+        // here, by floor of weight × loss / total_demand = 2 × 1 / 4),
+        // and the cell drops by 1 unit total.
+        //
+        // The mirror-image setup means the only mechanism that could
+        // produce asymmetric energy between the two roots is the soil
+        // pull. Death deposits and any other phase effects are
+        // symmetric across the two halves of the world.
+        let chunks_x = 1u32;
+        let mut chunks = empty_world(chunks_x, 1);
+        chunks[0].cells[10 * (CHUNK_EDGE as usize) + 11].organic = 1;
+        // Stems above each root so the roots have alive parents during
+        // phase 2. (The stems orphan-die later in the tick, but that's
+        // symmetric so it doesn't perturb the left-vs-right comparison.)
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            9,
+            Occupant::Stem {
+                plant: 1,
+                clan: 0,
+                energy: 100,
+                connections: STEM_CONNECT_SOUTH,
+                parent: None,
+                children: 0,
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            12,
+            9,
+            Occupant::Stem {
+                plant: 2,
+                clan: 0,
+                energy: 100,
+                connections: STEM_CONNECT_SOUTH,
+                parent: None,
+                children: 0,
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            10,
+            10,
+            Occupant::Root {
+                plant: 1,
+                clan: 0,
+                energy: 100,
+                parent: Some(Direction::North),
+            },
+        );
+        place(
+            &mut chunks,
+            chunks_x,
+            12,
+            10,
+            Occupant::Root {
+                plant: 2,
+                clan: 0,
+                energy: 100,
+                parent: Some(Direction::North),
+            },
+        );
+
+        mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
+
+        // The crucial assertion: the two symmetric roots end with equal
+        // energy. Under the old "iteration order grabs first" rule the
+        // left root pulled the contested cell's 1 unit and the right
+        // root got 0, so they'd be unequal.
+        let left = match cell_at(&chunks, chunks_x, 10, 10).occupant {
+            Occupant::Root { energy, .. } => energy,
+            ref other => panic!("expected root at (10,10), got {other:?}"),
+        };
+        let right = match cell_at(&chunks, chunks_x, 12, 10).occupant {
+            Occupant::Root { energy, .. } => energy,
+            ref other => panic!("expected root at (12,10), got {other:?}"),
+        };
+        assert_eq!(
+            left, right,
+            "fair-share split: symmetric roots must end with equal energy"
+        );
     }
 
     #[test]
