@@ -56,8 +56,8 @@ pub fn load_world(path: &Path) -> Result<WorldSnapshot> {
 
 pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
     let snapshot = WorldSnapshot {
-        chunks_x: state.chunks_x,
-        chunks_y: state.chunks_y,
+        chunks_x: state.chunks_x.load(Ordering::Relaxed),
+        chunks_y: state.chunks_y.load(Ordering::Relaxed),
         next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
         current_tick: state.current_tick.load(Ordering::Relaxed),
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
@@ -80,18 +80,17 @@ pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
 
 pub fn load_or_build(
     world_file: Option<&Path>,
-    world_width: u32,
-    world_height: u32,
+    initial_params: &protocol::WorldGenParams,
 ) -> Result<WorldSnapshot> {
     if let Some(path) = world_file {
         if path.exists() {
             return load_world(path);
         }
     }
-    let chunks = world::build_world(world_width, world_height);
+    let chunks = world::build_world(initial_params);
     Ok(WorldSnapshot {
-        chunks_x: world_width,
-        chunks_y: world_height,
+        chunks_x: initial_params.chunks_x,
+        chunks_y: initial_params.chunks_y,
         next_plant_id: 1,
         current_tick: 0,
         chunks,
@@ -200,8 +199,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
         let seed = snap.seed.unwrap_or(0);
         SimState {
-            chunks_x: snap.chunks_x,
-            chunks_y: snap.chunks_y,
+            chunks_x: AtomicU32::new(snap.chunks_x),
+            chunks_y: AtomicU32::new(snap.chunks_y),
             world: Mutex::new(snap.chunks.clone()),
             tick_tx: tx,
             next_plant_id: AtomicU32::new(snap.next_plant_id),
@@ -218,6 +217,8 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| rand_chacha::ChaCha12Rng::seed_from_u64(seed)),
             ),
+            params: Mutex::new(protocol::SimParams::default()),
+            world_gen_params: Mutex::new(protocol::WorldGenParams::default()),
         }
     }
 
@@ -309,8 +310,13 @@ mod tests {
 
     #[test]
     fn load_or_build_returns_default_when_path_missing() {
+        let p2 = protocol::WorldGenParams {
+            chunks_x: 2,
+            chunks_y: 2,
+            ..protocol::WorldGenParams::default()
+        };
         // No path provided → build from defaults.
-        let snap = load_or_build(None, 2, 2).expect("build default");
+        let snap = load_or_build(None, &p2).expect("build default");
         assert_eq!(snap.chunks_x, 2);
         assert_eq!(snap.chunks_y, 2);
         assert_eq!(snap.next_plant_id, 1);
@@ -319,7 +325,12 @@ mod tests {
         // Path that doesn't exist → also build, not error.
         let nowhere = unique_tmp("doesnotexist");
         cleanup(&nowhere);
-        let snap = load_or_build(Some(&nowhere), 1, 1).expect("missing path");
+        let p1 = protocol::WorldGenParams {
+            chunks_x: 1,
+            chunks_y: 1,
+            ..protocol::WorldGenParams::default()
+        };
+        let snap = load_or_build(Some(&nowhere), &p1).expect("missing path");
         assert_eq!(snap.chunks_x, 1);
         assert_eq!(snap.next_plant_id, 1);
     }

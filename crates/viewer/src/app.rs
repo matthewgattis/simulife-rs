@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use protocol::{CHUNK_EDGE, ClientMessage, WireChunk};
+use protocol::{CHUNK_EDGE, ClientMessage, SimParams, WireChunk, WorldGenParams};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 use winit::{
@@ -38,6 +38,8 @@ pub enum NetworkStatus {
         tick_rate_limited: bool,
         tick: u64,
         seed: u64,
+        sim_params: SimParams,
+        world_gen_params: WorldGenParams,
     },
 }
 
@@ -59,6 +61,9 @@ pub struct RegenDialog {
     /// The seed text the user is editing. Accepts decimal or `0x`-prefixed
     /// hex; parsing happens at submit time.
     pub seed_text: String,
+    /// World-gen knobs to apply on Generate. Populated from the
+    /// server's last `Welcome` when the dialog opens.
+    pub params: WorldGenParams,
 }
 
 impl Camera {
@@ -92,7 +97,13 @@ pub struct App {
     sim_tick_hz: u32,
     sim_tick_rate_limited: bool,
     sim_tick: u64,
+    sim_params: SimParams,
+    world_gen_params: WorldGenParams,
     centered_once: bool,
+    /// When false, draw_ui is skipped entirely so the world fills the
+    /// whole window with no overlay (toggle with H). The context menu
+    /// and regen dialog still render so the user can dismiss them.
+    ui_visible: bool,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
     context_menu: Option<ContextMenu>,
@@ -129,7 +140,10 @@ impl App {
             sim_tick_hz: 10,
             sim_tick_rate_limited: false,
             sim_tick: 0,
+            sim_params: SimParams::default(),
+            world_gen_params: WorldGenParams::default(),
             centered_once: false,
+            ui_visible: true,
             dragging: false,
             last_cursor: None,
             context_menu: None,
@@ -198,6 +212,8 @@ impl ApplicationHandler<UserEvent> for App {
                     tick_hz,
                     tick_rate_limited,
                     tick,
+                    sim_params,
+                    world_gen_params,
                     ..
                 } = &status
                 {
@@ -213,6 +229,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sim_tick_hz = *tick_hz;
                     self.sim_tick_rate_limited = *tick_rate_limited;
                     self.sim_tick = *tick;
+                    self.sim_params = *sim_params;
+                    self.world_gen_params = *world_gen_params;
                 }
                 self.network = status;
             }
@@ -365,16 +383,35 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Key::Character(c) if matches!(c.as_str(), "1" | "2" | "3" | "4" | "5") => {
                     // Layer toggles, in panel order: 1=Organic, 2=Energy,
-                    // 3=Occupants, 4=Clan colors, 5=Mutation rate.
-                    let bit = match c.as_str() {
-                        "1" => LAYER_ORGANIC,
-                        "2" => LAYER_ENERGY,
-                        "3" => LAYER_FG,
-                        "4" => LAYER_CLAN,
-                        "5" => LAYER_MUTATION_RATE,
+                    // 3=Occupants. Keys 4 and 5 are radio-style — the
+                    // tint they enable replaces the other tint
+                    // (Clan/Mutation rate are mutually exclusive in UI).
+                    match c.as_str() {
+                        "1" => self.layer_flags ^= LAYER_ORGANIC,
+                        "2" => self.layer_flags ^= LAYER_ENERGY,
+                        "3" => self.layer_flags ^= LAYER_FG,
+                        "4" => {
+                            if (self.layer_flags & LAYER_CLAN) != 0 {
+                                self.layer_flags &= !LAYER_CLAN;
+                            } else {
+                                self.layer_flags = (self.layer_flags & !LAYER_MUTATION_RATE)
+                                    | LAYER_CLAN;
+                            }
+                        }
+                        "5" => {
+                            if (self.layer_flags & LAYER_MUTATION_RATE) != 0 {
+                                self.layer_flags &= !LAYER_MUTATION_RATE;
+                            } else {
+                                self.layer_flags =
+                                    (self.layer_flags & !LAYER_CLAN) | LAYER_MUTATION_RATE;
+                            }
+                        }
                         _ => unreachable!(),
-                    };
-                    self.layer_flags ^= bit;
+                    }
+                    state.window().request_redraw();
+                }
+                Key::Character(c) if matches!(c.as_str(), "h" | "H") => {
+                    self.ui_visible = !self.ui_visible;
                     state.window().request_redraw();
                 }
                 _ => {}
@@ -400,9 +437,12 @@ impl ApplicationHandler<UserEvent> for App {
                     &mut self.sim_tick_hz,
                     &mut self.sim_tick_rate_limited,
                     self.sim_tick,
+                    &mut self.sim_params,
+                    &self.world_gen_params,
                     self.last_cursor,
                     &mut self.context_menu,
                     &mut self.regen_dialog,
+                    self.ui_visible,
                     &self.outgoing,
                 );
                 // egui tells us when it next wants a frame (animation,

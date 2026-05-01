@@ -61,27 +61,40 @@ async fn run_session(
     info!(remote = %conn.remote_address(), "connected");
 
     let welcome = request(&conn, &ClientMessage::Hello).await?;
-    let (world_chunks_x, world_chunks_y, paused, tick_hz, tick_rate_limited, tick, seed) =
-        match welcome {
-            ServerMessage::Welcome {
-                world_chunks_x,
-                world_chunks_y,
-                paused,
-                tick_hz,
-                tick_rate_limited,
-                tick,
-                seed,
-            } => (
-                world_chunks_x,
-                world_chunks_y,
-                paused,
-                tick_hz,
-                tick_rate_limited,
-                tick,
-                seed,
-            ),
-            other => bail!("unexpected first message: {other:?}"),
-        };
+    let (
+        world_chunks_x,
+        world_chunks_y,
+        paused,
+        tick_hz,
+        tick_rate_limited,
+        tick,
+        seed,
+        sim_params,
+        world_gen_params,
+    ) = match welcome {
+        ServerMessage::Welcome {
+            world_chunks_x,
+            world_chunks_y,
+            paused,
+            tick_hz,
+            tick_rate_limited,
+            tick,
+            seed,
+            sim_params,
+            world_gen_params,
+        } => (
+            world_chunks_x,
+            world_chunks_y,
+            paused,
+            tick_hz,
+            tick_rate_limited,
+            tick,
+            seed,
+            sim_params,
+            world_gen_params,
+        ),
+        other => bail!("unexpected first message: {other:?}"),
+    };
     let _ = proxy.send_event(UserEvent::Network(NetworkStatus::Connected {
         world_chunks_x,
         world_chunks_y,
@@ -90,6 +103,8 @@ async fn run_session(
         tick_rate_limited,
         tick,
         seed,
+        sim_params,
+        world_gen_params,
     }));
 
     let batch = request(&conn, &ClientMessage::Subscribe).await?;
@@ -166,6 +181,8 @@ async fn run_session(
                         tick_rate_limited,
                         tick,
                         seed,
+                        sim_params,
+                        world_gen_params,
                     } => {
                         // Server pushes a fresh Welcome after a regenerate
                         // so connected viewers refresh seed/tick state.
@@ -179,6 +196,8 @@ async fn run_session(
                                 tick_rate_limited,
                                 tick,
                                 seed,
+                                sim_params,
+                                world_gen_params,
                             },
                         ));
                     }

@@ -89,16 +89,23 @@ fn rect_sdf(uv: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
 }
 
 fn soil_color(cell: Cell, show_organic: bool, show_energy: bool) -> vec3<f32> {
-    let brown = vec3<f32>(0.8, 0.6, 0.4);
-    let blue = vec3<f32>(0.4, 0.6, 1.0);
-    var color = vec3<f32>(1.0, 1.0, 1.0);
+    // Dark-mode palette: empty soil sits near the clear color so the
+    // canvas reads as background; organic/energy add saturated tints
+    // on top so plant cells and rich soil pop against the darkness.
+    let base = vec3<f32>(0.10, 0.11, 0.14);
+    let brown = vec3<f32>(0.55, 0.40, 0.25);
+    let blue = vec3<f32>(0.20, 0.45, 0.75);
+    var color = base;
     if (show_organic) {
         color = mix(color, brown, f32(cell.organic) / 400.0);
     }
     if (show_energy) {
         color = mix(color, blue, f32(cell.soil_energy) / 1000.0);
     }
-    return color * select(0.8, 1.0, cell.sunlit != 0u);
+    // Shadow zones are dimmer than sunlit so the lit playfield is
+    // visually obvious. Wider gap than the original (0.8) since the
+    // dark base needs more dimming to read as shadow.
+    return color * select(0.55, 1.0, cell.sunlit != 0u);
 }
 
 fn occupant_color(cell: Cell) -> vec3<f32> {
@@ -111,35 +118,53 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-// Mutation-rate gradient: blue → cyan → green → yellow → red.
-// `q` is the quantized rate in [0, 255]. Uses a 4-stop ramp through
-// the perceptual middle so distinctions between low rates aren't lost
-// at the dark-blue end. Also gamma-corrects the input via `pow(t, 0.5)`
-// so the default rate (~5% of the [0, MUTATION_RATE_MAX] range) lands
-// near the gradient's middle instead of buried at the cold end.
+// Mutation-rate gradient: blue → cyan → green → yellow → red. Uses a
+// log2 scale centered on DEFAULT_MUTATION_RATE so the typical
+// initial-population rate lands at green (t=0.5). Each 2× drift away
+// from default moves the color one quarter of the gradient. Lets you
+// distinguish "fast lineage" (yellow/red) from "slow lineage"
+// (cyan/blue) at a glance even when most of the world hovers near the
+// default. `q` is the rate in 0..255 mapping linearly to
+// 0..MUTATION_RATE_MAX; 0.01/0.2 = 0.05 is the normalized default.
 fn mutation_rate_color(q: u32) -> vec3<f32> {
     let raw = clamp(f32(q) / 255.0, 0.0, 1.0);
-    let t = pow(raw, 0.5);
+    // Floor below q=1 so log2 stays finite. Anything that low is
+    // effectively zero rate and clamps to t=0 below anyway.
+    let safe = max(raw, 1.0 / 255.0);
+    let default_norm: f32 = 0.04;
+    // Half-width of the log2 axis the gradient covers, in octaves on
+    // each side of default. With ±4.5 octaves the rate range
+    // (default×0.044 .. default×22.6) maps to the full ramp; the
+    // useful cap MUTATION_RATE_MAX is at log2(20) ≈ +4.32 octaves.
+    let half_range: f32 = 4.5;
+    let t = clamp(0.5 + log2(safe / default_norm) / (2.0 * half_range), 0.0, 1.0);
+
     let blue = vec3<f32>(0.20, 0.40, 0.95);
     let cyan = vec3<f32>(0.20, 0.85, 0.95);
+    let green = vec3<f32>(0.30, 0.85, 0.30);
     let yellow = vec3<f32>(0.95, 0.85, 0.20);
     let red = vec3<f32>(0.95, 0.25, 0.25);
-    if (t < 0.33) {
-        return mix(blue, cyan, t / 0.33);
-    } else if (t < 0.66) {
-        return mix(cyan, yellow, (t - 0.33) / 0.33);
+    if (t < 0.25) {
+        return mix(blue, cyan, t / 0.25);
+    } else if (t < 0.50) {
+        return mix(cyan, green, (t - 0.25) / 0.25);
+    } else if (t < 0.75) {
+        return mix(green, yellow, (t - 0.50) / 0.25);
     } else {
-        return mix(yellow, red, (t - 0.66) / 0.34);
+        return mix(yellow, red, (t - 0.75) / 0.25);
     }
 }
 
-// Distinct palette for clans 0..3 (top-left, top-right, bottom-left,
-// bottom-right). Beyond 4 clans we just hash the id into HSL hue space.
+// Distinct palette for the 6 boxes in a 3×2 layout, row-major:
+// 0 top-left, 1 top-mid, 2 top-right, 3 bottom-left, 4 bottom-mid,
+// 5 bottom-right. Beyond 6 clans we hash the id into HSL hue space.
 fn clan_color(clan: u32) -> vec3<f32> {
     if (clan == 0u) { return vec3<f32>(0.95, 0.30, 0.30); } // red
     if (clan == 1u) { return vec3<f32>(0.95, 0.80, 0.20); } // amber
     if (clan == 2u) { return vec3<f32>(0.30, 0.85, 0.45); } // green
     if (clan == 3u) { return vec3<f32>(0.45, 0.55, 0.95); } // blue
+    if (clan == 4u) { return vec3<f32>(0.80, 0.40, 0.95); } // purple
+    if (clan == 5u) { return vec3<f32>(0.95, 0.55, 0.20); } // orange
     let h = f32(clan) * 0.6180339;
     let frac = h - floor(h);
     return vec3<f32>(

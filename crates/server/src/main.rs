@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -45,9 +45,9 @@ struct Args {
     #[arg(long, requires = "cert_path")]
     key_path: Option<PathBuf>,
 
-    /// World size in chunks (X axis). Default 24 = 2 boxes wide × 12
+    /// World size in chunks (X axis). Default 36 = 3 boxes wide × 12
     /// chunks per box (each box matches the original single-box size).
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 36)]
     world_width: u32,
 
     /// World size in chunks (Y axis). Default 24 = 2 boxes tall × 12.
@@ -100,11 +100,14 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("install default rustls crypto provider");
 
-    let mut initial = persist::load_or_build(
-        args.world_file.as_deref(),
-        args.world_width,
-        args.world_height,
-    )?;
+    // Seed initial WorldGenParams from CLI args (only chunks_x/y are
+    // CLI-tunable; everything else takes the protocol default).
+    let initial_world_gen = protocol::WorldGenParams {
+        chunks_x: args.world_width,
+        chunks_y: args.world_height,
+        ..protocol::WorldGenParams::default()
+    };
+    let mut initial = persist::load_or_build(args.world_file.as_deref(), &initial_world_gen)?;
     // Loaded snapshots carry their own seed/RNG; only the CLI flag (or a
     // freshly-drawn random) takes effect for newly-built worlds.
     let fresh_world = initial.seed.is_none();
@@ -116,11 +119,17 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| ChaCha12Rng::seed_from_u64(seed));
     info!(seed, "world seed");
+    // Snapshots may carry different chunks_x/y than the CLI args — the
+    // SimState uses whatever is in the snapshot.
+    let world_gen_params = protocol::WorldGenParams {
+        chunks_x: initial.chunks_x,
+        chunks_y: initial.chunks_y,
+        ..initial_world_gen
+    };
     if fresh_world {
         let count = world::place_random_sprout_grid(
             &mut initial.chunks,
-            initial.chunks_x,
-            initial.chunks_y,
+            &world_gen_params,
             &mut rng,
         );
         initial.next_plant_id = count + 1;
@@ -128,8 +137,8 @@ async fn main() -> Result<()> {
     }
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
-        chunks_x: initial.chunks_x,
-        chunks_y: initial.chunks_y,
+        chunks_x: AtomicU32::new(initial.chunks_x),
+        chunks_y: AtomicU32::new(initial.chunks_y),
         world: std::sync::Mutex::new(initial.chunks),
         tick_tx,
         next_plant_id: AtomicU32::new(initial.next_plant_id),
@@ -142,12 +151,14 @@ async fn main() -> Result<()> {
         }),
         seed: AtomicU64::new(seed),
         rng: std::sync::Mutex::new(rng),
+        params: std::sync::Mutex::new(protocol::SimParams::default()),
+        world_gen_params: std::sync::Mutex::new(world_gen_params),
     });
 
     info!(
-        chunks_x = state.chunks_x,
-        chunks_y = state.chunks_y,
-        cells = (state.chunks_x as usize) * (state.chunks_y as usize) * CHUNK_AREA,
+        chunks_x = state.chunks_x.load(Ordering::Relaxed),
+        chunks_y = state.chunks_y.load(Ordering::Relaxed),
+        cells = (state.chunks_x.load(Ordering::Relaxed) as usize) * (state.chunks_y.load(Ordering::Relaxed) as usize) * CHUNK_AREA,
         "world ready"
     );
 

@@ -17,14 +17,18 @@ fn broadcast_sim_status(state: &SimState) {
         let ctrl = state.control.lock().expect("control poisoned");
         (ctrl.paused, ctrl.tick_hz, ctrl.tick_rate_limited)
     };
+    let sim_params = *state.params.lock().expect("params poisoned");
+    let world_gen_params = *state.world_gen_params.lock().expect("wgp poisoned");
     let welcome = ServerMessage::Welcome {
-        world_chunks_x: state.chunks_x,
-        world_chunks_y: state.chunks_y,
+        world_chunks_x: state.chunks_x.load(Ordering::Relaxed),
+        world_chunks_y: state.chunks_y.load(Ordering::Relaxed),
         paused,
         tick_hz,
         tick_rate_limited,
         tick: state.current_tick.load(Ordering::Relaxed),
         seed: state.seed.load(Ordering::Relaxed),
+        sim_params,
+        world_gen_params,
     };
     if let Ok(bytes) = protocol::encode_server_message(&welcome) {
         let _ = state.tick_tx.send(Arc::new(bytes));
@@ -131,8 +135,16 @@ async fn handle_client_uni(mut recv: quinn::RecvStream, state: Arc<SimState>) ->
             info!(tick_rate_limited = limited, "tick rate limit toggled");
             broadcast_sim_status(&state);
         }
-        ClientMessage::RegenerateWorld { seed } => {
-            sim::regenerate_world(&state, seed);
+        ClientMessage::RegenerateWorld { seed, params } => {
+            sim::regenerate_world(&state, seed, params);
+        }
+        ClientMessage::SetSimParams(params) => {
+            {
+                let mut p = state.params.lock().expect("params poisoned");
+                *p = params;
+            }
+            info!("sim params updated");
+            broadcast_sim_status(&state);
         }
         other => warn!(?other, "unexpected message on client uni stream"),
     }
@@ -172,14 +184,18 @@ async fn handle_stream(
                 let ctrl = state.control.lock().expect("control poisoned");
                 (ctrl.paused, ctrl.tick_hz, ctrl.tick_rate_limited)
             };
+            let sim_params = *state.params.lock().expect("params poisoned");
+            let world_gen_params = *state.world_gen_params.lock().expect("wgp poisoned");
             Some(ServerMessage::Welcome {
-                world_chunks_x: state.chunks_x,
-                world_chunks_y: state.chunks_y,
+                world_chunks_x: state.chunks_x.load(Ordering::Relaxed),
+                world_chunks_y: state.chunks_y.load(Ordering::Relaxed),
                 paused,
                 tick_hz,
                 tick_rate_limited,
                 tick: state.current_tick.load(Ordering::Relaxed),
                 seed: state.seed.load(Ordering::Relaxed),
+                sim_params,
+                world_gen_params,
             })
         }
         ClientMessage::Subscribe => {
@@ -198,6 +214,7 @@ async fn handle_stream(
         | ClientMessage::Step
         | ClientMessage::SetTickHz(_)
         | ClientMessage::SetTickRateLimited(_)
+        | ClientMessage::SetSimParams(_)
         | ClientMessage::RegenerateWorld { .. } => {
             warn!("control / spawn message arrived on bidi stream; expected on uni");
             None

@@ -3,7 +3,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use anyhow::Result;
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, ChunkCoord, ClientMessage, Direction, STEM_CONNECT_EAST,
-    STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, WireCell, WireChunk, WireOccupant,
+    STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, SimParams, WireCell, WireChunk,
+    WireOccupant, WorldGenParams,
 };
 use rand::Rng;
 use tokio::sync::mpsc::UnboundedSender;
@@ -163,9 +164,12 @@ impl RenderState {
         sim_tick_hz: &mut u32,
         sim_tick_rate_limited: &mut bool,
         sim_tick: u64,
+        sim_params: &mut SimParams,
+        world_gen_params: &WorldGenParams,
         cursor_px: Option<glam::Vec2>,
         context_menu: &mut Option<ContextMenu>,
         regen_dialog: &mut Option<RegenDialog>,
+        ui_visible: bool,
         outgoing: &UnboundedSender<ClientMessage>,
     ) -> Duration {
         let _render_span = tracing::info_span!("render_frame").entered();
@@ -197,21 +201,25 @@ impl RenderState {
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(
-                ctx,
-                network,
-                server_addr,
-                chunks.len(),
-                cursor_world,
-                hovered_cell,
-                layer_flags,
-                sim_paused,
-                sim_tick_hz,
-                sim_tick_rate_limited,
-                sim_tick,
-                regen_dialog,
-                outgoing,
-            );
+            if ui_visible {
+                draw_ui(
+                    ctx,
+                    network,
+                    server_addr,
+                    chunks.len(),
+                    cursor_world,
+                    hovered_cell,
+                    layer_flags,
+                    sim_paused,
+                    sim_tick_hz,
+                    sim_tick_rate_limited,
+                    sim_tick,
+                    sim_params,
+                    world_gen_params,
+                    regen_dialog,
+                    outgoing,
+                );
+            }
             draw_context_menu(ctx, context_menu, chunks, outgoing);
             draw_regen_dialog(ctx, regen_dialog, outgoing);
         });
@@ -832,6 +840,8 @@ fn draw_ui(
     sim_tick_hz: &mut u32,
     sim_tick_rate_limited: &mut bool,
     sim_tick: u64,
+    sim_params: &mut SimParams,
+    world_gen_params: &WorldGenParams,
     regen_dialog: &mut Option<RegenDialog>,
     outgoing: &UnboundedSender<ClientMessage>,
 ) {
@@ -865,6 +875,7 @@ fn draw_ui(
                         if ui.button("Regenerate...").clicked() {
                             *regen_dialog = Some(RegenDialog {
                                 seed_text: format!("{seed:#018x}"),
+                                params: *world_gen_params,
                             });
                         }
                     });
@@ -873,81 +884,177 @@ fn draw_ui(
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
             ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
+            ui.label("H = hide UI");
             ui.separator();
-            ui.label("Sim:");
-            ui.label(format!("Tick: {sim_tick}"));
+            egui::CollapsingHeader::new("Sim")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label(format!("Tick: {sim_tick}"));
+                    ui.horizontal(|ui| {
+                        let label = if *sim_paused { "Resume" } else { "Pause" };
+                        if ui.button(label).clicked() {
+                            // Server is authoritative — request the toggle and wait
+                            // for the broadcast Welcome to update *sim_paused.
+                            let _ = outgoing.send(ClientMessage::SetPaused(!*sim_paused));
+                        }
+                        if ui.button("Step").clicked() {
+                            // Step always pauses — server treats it that way.
+                            let _ = outgoing.send(ClientMessage::Step);
+                        }
+                    });
+                    // Tick-rate limit toggle. When unchecked the server runs as
+                    // fast as it can; the Hz slider only matters when this is
+                    // checked.
+                    let mut limited = *sim_tick_rate_limited;
+                    if ui.checkbox(&mut limited, "Limit tick rate").changed() {
+                        let _ = outgoing.send(ClientMessage::SetTickRateLimited(limited));
+                    }
+                    let mut hz = *sim_tick_hz;
+                    let slider_resp = ui.add_enabled(
+                        *sim_tick_rate_limited,
+                        egui::Slider::new(&mut hz, 1..=1000)
+                            .text("Hz")
+                            .logarithmic(true),
+                    );
+                    if slider_resp.changed() {
+                        // Server is authoritative — send a request; the slider
+                        // snaps back to *sim_tick_hz next frame, then updates when
+                        // the server broadcasts the new tick_hz.
+                        let _ = outgoing.send(ClientMessage::SetTickHz(hz));
+                    }
+                });
+            egui::CollapsingHeader::new("Layers")
+                .default_open(true)
+                .show(ui, |ui| {
+                    let mut organic = (*layer_flags & LAYER_ORGANIC) != 0;
+                    let mut energy = (*layer_flags & LAYER_ENERGY) != 0;
+                    let mut fg = (*layer_flags & LAYER_FG) != 0;
+                    if ui.checkbox(&mut organic, "Organic [1]").changed() {
+                        *layer_flags = (*layer_flags & !LAYER_ORGANIC)
+                            | (if organic { LAYER_ORGANIC } else { 0 });
+                    }
+                    if ui.checkbox(&mut energy, "Energy [2]").changed() {
+                        *layer_flags = (*layer_flags & !LAYER_ENERGY)
+                            | (if energy { LAYER_ENERGY } else { 0 });
+                    }
+                    if ui.checkbox(&mut fg, "Occupants [3]").changed() {
+                        *layer_flags =
+                            (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
+                    }
+                    // Occupant tint is a radio: Default / Clan / Mutation rate
+                    // are three mutually-exclusive ways to color the same
+                    // pixels, so the UI shouldn't let both flags be set at
+                    // once. The shader can still handle either bit being on
+                    // independently — this is purely a UX constraint.
+                    ui.label("Occupant tint:");
+                    let mode: u8 = if (*layer_flags & LAYER_MUTATION_RATE) != 0 {
+                        2
+                    } else if (*layer_flags & LAYER_CLAN) != 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    let mut new_mode = mode;
+                    ui.radio_value(&mut new_mode, 0u8, "Default");
+                    ui.radio_value(&mut new_mode, 1u8, "Clan [4]");
+                    ui.radio_value(&mut new_mode, 2u8, "Mutation rate [5]");
+                    if new_mode != mode {
+                        *layer_flags &= !(LAYER_CLAN | LAYER_MUTATION_RATE);
+                        match new_mode {
+                            1 => *layer_flags |= LAYER_CLAN,
+                            2 => *layer_flags |= LAYER_MUTATION_RATE,
+                            _ => {}
+                        }
+                    }
+                });
+            sim_params_ui(ui, sim_params, outgoing);
+            egui::CollapsingHeader::new("Cursor")
+                .default_open(true)
+                .show(ui, |ui| match cursor_world {
+                    Some(w) => {
+                        ui.label(format!("at: ({:.0}, {:.0})", w.x, w.y));
+                        if let Some((coord, cell)) = hovered_cell {
+                            ui.label(format!("Chunk: ({}, {})", coord.x, coord.y));
+                            cell_details_ui(ui, cell);
+                        } else {
+                            ui.weak("(outside world)");
+                        }
+                    }
+                    None => {
+                        ui.label("—");
+                    }
+                });
+        });
+}
+
+fn sim_params_ui(
+    ui: &mut egui::Ui,
+    params: &mut SimParams,
+    outgoing: &UnboundedSender<ClientMessage>,
+) {
+    egui::CollapsingHeader::new("Sim params")
+        .default_open(false)
+        .show(ui, |ui| {
+            let before = *params;
+            ui.add(egui::Slider::new(&mut params.leaf_photosynthesis, 0..=50).text("leaf photo"));
+            ui.add(egui::Slider::new(&mut params.upkeep_default, 0..=20).text("upkeep default"));
+            ui.add(egui::Slider::new(&mut params.upkeep_seed, 0..=20).text("upkeep seed"));
+            ui.add(egui::Slider::new(&mut params.upkeep_sprout, 0..=20).text("upkeep sprout"));
+            ui.separator();
+            ui.add(
+                egui::Slider::new(&mut params.soil_energy_rest, 0..=500).text("soil E rest"),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.soil_energy_regulation, 0..=20)
+                    .text("soil E regulation"),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.seed_dropoff_threshold, 0..=500)
+                    .text("seed dropoff"),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.soil_organic_poison, 0..=2000)
+                    .text("organic poison"),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.soil_energy_poison, 0..=5000)
+                    .text("energy poison"),
+            );
+            ui.separator();
+            ui.add(egui::Slider::new(&mut params.cost_leaf, 0..=200).text("cost leaf"));
+            ui.add(egui::Slider::new(&mut params.cost_root, 0..=200).text("cost root"));
+            ui.add(egui::Slider::new(&mut params.cost_antenna, 0..=200).text("cost antenna"));
+            ui.add(egui::Slider::new(&mut params.cost_sprout, 0..=200).text("cost sprout"));
+            ui.add(egui::Slider::new(&mut params.cost_seed, 0..=200).text("cost seed"));
+            ui.separator();
+            ui.add(
+                egui::Slider::new(&mut params.root_pull_scale, 0.0..=4.0)
+                    .text("root pull ×")
+                    .max_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.antenna_pull_scale, 0.0..=4.0)
+                    .text("antenna pull ×")
+                    .max_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.death_deposit_scale, 0.0..=4.0)
+                    .text("death deposit ×")
+                    .max_decimals(2),
+            );
+            ui.separator();
+            ui.checkbox(&mut params.world_wrap, "World wrap (toroidal)");
+            ui.separator();
             ui.horizontal(|ui| {
-                let label = if *sim_paused { "Resume" } else { "Pause" };
-                if ui.button(label).clicked() {
-                    // Server is authoritative — request the toggle and wait
-                    // for the broadcast Welcome to update *sim_paused.
-                    let _ = outgoing.send(ClientMessage::SetPaused(!*sim_paused));
-                }
-                if ui.button("Step").clicked() {
-                    // Step always pauses — server treats it that way.
-                    let _ = outgoing.send(ClientMessage::Step);
+                if ui.button("Reset to defaults").clicked() {
+                    *params = SimParams::default();
                 }
             });
-            // Tick-rate limit toggle. When unchecked the server runs as
-            // fast as it can; the Hz slider only matters when this is
-            // checked.
-            let mut limited = *sim_tick_rate_limited;
-            if ui.checkbox(&mut limited, "Limit tick rate").changed() {
-                let _ = outgoing.send(ClientMessage::SetTickRateLimited(limited));
-            }
-            let mut hz = *sim_tick_hz;
-            let slider_resp = ui.add_enabled(
-                *sim_tick_rate_limited,
-                egui::Slider::new(&mut hz, 1..=1000)
-                    .text("Hz")
-                    .logarithmic(true),
-            );
-            if slider_resp.changed() {
-                // Server is authoritative — send a request; the slider
-                // snaps back to *sim_tick_hz next frame, then updates when
-                // the server broadcasts the new tick_hz.
-                let _ = outgoing.send(ClientMessage::SetTickHz(hz));
-            }
-            ui.separator();
-            ui.label("Layers:");
-            let mut organic = (*layer_flags & LAYER_ORGANIC) != 0;
-            let mut energy = (*layer_flags & LAYER_ENERGY) != 0;
-            let mut fg = (*layer_flags & LAYER_FG) != 0;
-            let mut clan = (*layer_flags & LAYER_CLAN) != 0;
-            let mut mutrate = (*layer_flags & LAYER_MUTATION_RATE) != 0;
-            if ui.checkbox(&mut organic, "Organic [1]").changed() {
-                *layer_flags = (*layer_flags & !LAYER_ORGANIC)
-                    | (if organic { LAYER_ORGANIC } else { 0 });
-            }
-            if ui.checkbox(&mut energy, "Energy [2]").changed() {
-                *layer_flags = (*layer_flags & !LAYER_ENERGY)
-                    | (if energy { LAYER_ENERGY } else { 0 });
-            }
-            if ui.checkbox(&mut fg, "Occupants [3]").changed() {
-                *layer_flags = (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
-            }
-            if ui.checkbox(&mut clan, "Clan colors [4]").changed() {
-                *layer_flags = (*layer_flags & !LAYER_CLAN)
-                    | (if clan { LAYER_CLAN } else { 0 });
-            }
-            if ui.checkbox(&mut mutrate, "Mutation rate [5]").changed() {
-                *layer_flags = (*layer_flags & !LAYER_MUTATION_RATE)
-                    | (if mutrate { LAYER_MUTATION_RATE } else { 0 });
-            }
-            ui.separator();
-            match cursor_world {
-                Some(w) => {
-                    ui.label(format!("Cursor: ({:.0}, {:.0})", w.x, w.y));
-                    if let Some((coord, cell)) = hovered_cell {
-                        ui.label(format!("Chunk: ({}, {})", coord.x, coord.y));
-                        cell_details_ui(ui, cell);
-                    } else {
-                        ui.weak("(outside world)");
-                    }
-                }
-                None => {
-                    ui.label("Cursor: —");
-                }
+            // Server is authoritative — every change ships the full
+            // struct. The Welcome it broadcasts back will overwrite our
+            // local mirror, so we don't need to optimistically commit.
+            if *params != before {
+                let _ = outgoing.send(ClientMessage::SetSimParams(*params));
             }
         });
 }
@@ -1030,6 +1137,38 @@ fn draw_regen_dialog(
                 ui.colored_label(egui::Color32::LIGHT_RED, "Cannot parse as u64.");
             }
             ui.separator();
+            ui.label("World layout:");
+            let p = &mut dialog.params;
+            ui.add(egui::Slider::new(&mut p.chunks_x, 1..=128).text("chunks x"));
+            ui.add(egui::Slider::new(&mut p.chunks_y, 1..=128).text("chunks y"));
+            ui.add(egui::Slider::new(&mut p.boxes_x, 1..=8).text("boxes x"));
+            ui.add(egui::Slider::new(&mut p.boxes_y, 1..=8).text("boxes y"));
+            ui.add(
+                egui::Slider::new(&mut p.sunlit_margin_frac, 0.0..=0.49)
+                    .text("sunlit margin frac")
+                    .max_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.toxic_border_thickness, 0..=8)
+                    .text("toxic border thickness"),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.toxic_border_organic, 0..=2000)
+                    .text("toxic border organic"),
+            );
+            ui.add(egui::Slider::new(&mut p.default_organic, 0..=400).text("default organic"));
+            ui.add(
+                egui::Slider::new(&mut p.sprout_grid_spacing, 1..=64).text("sprout spacing"),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.initial_mutation_rate_octaves, 0.0..=6.0)
+                    .text("initial mut-rate octaves")
+                    .max_decimals(1),
+            );
+            if ui.button("Reset world layout to defaults").clicked() {
+                dialog.params = WorldGenParams::default();
+            }
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(parsed.is_some(), egui::Button::new("Generate"))
@@ -1047,7 +1186,10 @@ fn draw_regen_dialog(
         dialog.seed_text = format!("{:#018x}", rand::thread_rng().r#gen::<u64>());
     } else if submit {
         if let Some(seed) = parsed {
-            let _ = outgoing.send(ClientMessage::RegenerateWorld { seed });
+            let _ = outgoing.send(ClientMessage::RegenerateWorld {
+                seed,
+                params: dialog.params,
+            });
             close = true;
         }
     }
@@ -1069,14 +1211,19 @@ fn cell_details_ui(ui: &mut egui::Ui, cell: &WireCell) {
     ui.label(format!("organic: {}", cell.organic));
     ui.label(format!("soil_energy: {}", cell.soil_energy));
     ui.label(format!("sunlit: {}", cell.sunlit));
-    let rate = protocol::dequantize_mutation_rate(cell.lineage_mutation_rate);
-    ui.label(format!(
-        "lineage rate: {:.4} (q={})",
-        rate, cell.lineage_mutation_rate
-    ));
     ui.separator();
     ui.label(format!("occupant: {}", occupant_kind_label(&cell.occupant)));
     occupant_details_ui(ui, &cell.occupant);
+    // Mutation rate is stamped on every plant cell from its lineage's
+    // genome.mutation_rate, so it's only meaningful when something
+    // occupies the cell. Suppress it for Empty.
+    if !matches!(cell.occupant, WireOccupant::Empty) {
+        let rate = protocol::dequantize_mutation_rate(cell.lineage_mutation_rate);
+        ui.label(format!(
+            "  mutation rate: {:.4} (q={})",
+            rate, cell.lineage_mutation_rate
+        ));
+    }
 }
 
 fn occupant_kind_label(occ: &WireOccupant) -> &'static str {

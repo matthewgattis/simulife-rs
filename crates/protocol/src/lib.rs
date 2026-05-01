@@ -35,8 +35,118 @@ pub const GENOME_MAX: usize = 64;
 /// Initial per-genome mutation rate. Each lineage's actual rate
 /// drifts under selection pressure (mutation_rate is itself
 /// mutable per-copy).
-pub const DEFAULT_MUTATION_RATE: f32 = 0.01;
+pub const DEFAULT_MUTATION_RATE: f32 = 0.04;
 pub const MUTATION_RATE_MAX: f32 = 0.2;
+
+/// Live-tunable simulation scalars. The server owns the authoritative
+/// copy in `SimState.params`; the viewer mirrors it via `Welcome` and
+/// edits via `ClientMessage::SetSimParams`. Kernel scales are float
+/// multipliers applied to fixed bell-curve base kernels — the shape
+/// stays a 3×3 [[1,2,1],[2,4,2],[1,2,1]] bell, the scale just dials
+/// magnitude up or down (1.0 = stock).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct SimParams {
+    pub leaf_photosynthesis: u16,
+    pub upkeep_default: u16,
+    pub upkeep_seed: u16,
+    pub upkeep_sprout: u16,
+    pub soil_energy_rest: u16,
+    pub soil_energy_regulation: u16,
+    pub seed_dropoff_threshold: u16,
+    pub soil_organic_poison: u16,
+    pub soil_energy_poison: u16,
+    pub cost_leaf: u16,
+    pub cost_root: u16,
+    pub cost_antenna: u16,
+    pub cost_sprout: u16,
+    pub cost_seed: u16,
+    pub root_pull_scale: f32,
+    pub antenna_pull_scale: f32,
+    pub death_deposit_scale: f32,
+    /// When true, world edges wrap (toroidal — opposite edges are
+    /// neighbors). When false, edges are hard walls. Live-tunable; the
+    /// world geometry doesn't change, only the neighbor lookup rule.
+    pub world_wrap: bool,
+}
+
+/// World-generation knobs. Applied at world-build time only — changing
+/// these has no effect until the user regenerates. Bundled in
+/// `ClientMessage::RegenerateWorld` and broadcast back via `Welcome` so
+/// viewers can populate their regen dialog with the values currently in
+/// effect.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct WorldGenParams {
+    /// World size in chunks. Total cells = chunks_x * chunks_y *
+    /// CHUNK_AREA. Defaults match the CLI defaults at first connect.
+    pub chunks_x: u32,
+    pub chunks_y: u32,
+    /// Number of "boxes" laid out in a `boxes_x × boxes_y` grid. Each
+    /// box has its own toxic border + sunlit interior; total clan
+    /// count = boxes_x * boxes_y.
+    pub boxes_x: u32,
+    pub boxes_y: u32,
+    /// Per-box sunlit inset (fraction of each box edge). 0.0 = whole
+    /// box lit; 0.5 = nothing lit.
+    pub sunlit_margin_frac: f32,
+    /// Spacing between initial sprouts. Smaller = denser starting
+    /// population.
+    pub sprout_grid_spacing: u32,
+    /// Toxic-border thickness in cells. 0 disables the border (no
+    /// box separation).
+    pub toxic_border_thickness: u32,
+    /// Organic seeded into toxic-border cells. Above
+    /// `SimParams::soil_organic_poison` to act as a wall.
+    pub toxic_border_organic: u16,
+    /// Organic seeded into ordinary cells (everywhere outside the
+    /// toxic borders).
+    pub default_organic: u16,
+    /// Half-width of the log2 spread used to draw initial sprout
+    /// mutation rates around DEFAULT. 0 = uniform DEFAULT, 3 = ±3
+    /// octaves (rate × 1/8 .. × 8).
+    pub initial_mutation_rate_octaves: f32,
+}
+
+impl Default for WorldGenParams {
+    fn default() -> Self {
+        Self {
+            chunks_x: 36,
+            chunks_y: 24,
+            boxes_x: 3,
+            boxes_y: 2,
+            sunlit_margin_frac: 0.10,
+            sprout_grid_spacing: 6,
+            toxic_border_thickness: 2,
+            toxic_border_organic: 1000,
+            default_organic: 40,
+            initial_mutation_rate_octaves: 3.0,
+        }
+    }
+}
+
+impl Default for SimParams {
+    fn default() -> Self {
+        Self {
+            leaf_photosynthesis: 10,
+            upkeep_default: 2,
+            upkeep_seed: 1,
+            upkeep_sprout: 5,
+            soil_energy_rest: 100,
+            soil_energy_regulation: 1,
+            seed_dropoff_threshold: 180,
+            soil_organic_poison: 400,
+            soil_energy_poison: 1000,
+            cost_leaf: 30,
+            cost_root: 30,
+            cost_antenna: 30,
+            cost_sprout: 60,
+            cost_seed: 90,
+            root_pull_scale: 1.0,
+            antenna_pull_scale: 1.0,
+            death_deposit_scale: 1.0,
+            world_wrap: true,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotProduct {
@@ -367,7 +477,11 @@ impl From<&Chunk> for WireChunk {
 pub enum ClientMessage {
     Hello,
     Subscribe,
-    SpawnSprout { x: i32, y: i32, facing: Direction },
+    SpawnSprout {
+        x: i32,
+        y: i32,
+        facing: Direction,
+    },
     SetPaused(bool),
     Step,
     SetTickHz(u32),
@@ -375,7 +489,18 @@ pub enum ClientMessage {
     /// server runs as fast as it can; when true it sleeps between
     /// ticks to honor the requested rate.
     SetTickRateLimited(bool),
-    RegenerateWorld { seed: u64 },
+    /// Replace the server's live tunable scalars wholesale. Server
+    /// rebroadcasts a fresh `Welcome` so any other connected viewers
+    /// pick up the new values.
+    SetSimParams(SimParams),
+    /// Rebuild the world from scratch with the given seed and
+    /// generation params. World dims, box layout, sunlight, etc. all
+    /// take effect on the new build. Server broadcasts a fresh
+    /// `Welcome` so viewers refresh their mirror.
+    RegenerateWorld {
+        seed: u64,
+        params: WorldGenParams,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -388,6 +513,8 @@ pub enum ServerMessage {
         tick_rate_limited: bool,
         tick: u64,
         seed: u64,
+        sim_params: SimParams,
+        world_gen_params: WorldGenParams,
     },
     ChunkBatch {
         tick: u64,
@@ -536,6 +663,8 @@ mod tests {
             tick_rate_limited: false,
             tick: 42,
             seed: 0xCAFE_BABE_DEAD_BEEF,
+            sim_params: SimParams::default(),
+            world_gen_params: WorldGenParams::default(),
         };
         let bytes = rmp_serde::to_vec(&msg).expect("encode");
         let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("decode");
@@ -548,6 +677,8 @@ mod tests {
                 tick_rate_limited,
                 tick,
                 seed,
+                sim_params: _,
+                world_gen_params: _,
             } => {
                 assert_eq!(world_chunks_x, 16);
                 assert_eq!(world_chunks_y, 16);
@@ -583,6 +714,7 @@ mod tests {
         assert_client_msg_roundtrips(ClientMessage::SetTickHz(60));
         assert_client_msg_roundtrips(ClientMessage::RegenerateWorld {
             seed: 0xDEAD_BEEF_CAFE_BABE,
+            params: WorldGenParams::default(),
         });
     }
 
