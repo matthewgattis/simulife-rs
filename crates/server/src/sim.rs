@@ -10,7 +10,8 @@ use rand::SeedableRng;
 
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ClanId, Direction, Energy, GENOME_MAX, GENOME_MIN, Gene,
-    Genome, MUTATION_RATE_MAX, Occupant, STEM_CONNECT_EAST, STEM_CONNECT_NORTH, STEM_CONNECT_SOUTH,
+    Genome, MUTATION_RATE_MAX, MUTATION_RATE_MIN, Occupant, STEM_CONNECT_EAST, STEM_CONNECT_NORTH,
+    STEM_CONNECT_SOUTH,
     STEM_CONNECT_WEST, ServerMessage, SimParams, SlotProduct, WorldGenParams,
 };
 use rand::Rng;
@@ -240,8 +241,7 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     // we can compute it from (x, y) the same way world::place_random does.
     let mut chunks = state.world.lock().expect("sim lock poisoned");
     let genome = Genome::default_vine();
-    let rate_q = protocol::quantize_mutation_rate(genome.mutation_rate);
-    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = rate_q;
+    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = genome.mutation_rate;
     chunks[chunk_idx].cells[cell_idx].occupant = Occupant::Sprout {
         plant,
         clan: 0,
@@ -1531,8 +1531,7 @@ fn phase_growth_pull(
             rng,
         ) {
             let cell = &mut chunks[bid.dst_chunk_idx].cells[bid.dst_cell_idx];
-            cell.lineage_mutation_rate =
-                protocol::quantize_mutation_rate(sprout.genome.mutation_rate);
+            cell.lineage_mutation_rate = sprout.genome.mutation_rate;
             cell.occupant = occ;
         }
     }
@@ -1660,7 +1659,7 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
     if rng.r#gen::<f32>() < rate {
         rate *= rng.gen_range(0.7..1.3);
     }
-    rate = rate.clamp(0.0, MUTATION_RATE_MAX);
+    rate = rate.clamp(MUTATION_RATE_MIN, MUTATION_RATE_MAX);
     let insert_rate = rate * 0.1;
     let delete_rate = rate * 0.1;
 
@@ -1882,7 +1881,7 @@ mod tests {
                         organic: 0,
                         soil_energy: 0,
                         sunlit: false,
-                        lineage_mutation_rate: 0,
+                        lineage_mutation_rate: 0.0,
                         occupant: Occupant::Empty,
                     })
                     .collect();
@@ -2735,12 +2734,21 @@ mod tests {
     }
 
     #[test]
-    fn mutate_genome_at_rate_zero_clones_exactly() {
+    fn mutate_genome_clamps_rate_above_min() {
+        // Rates below MUTATION_RATE_MIN should be lifted to MIN on the
+        // next copy, so no lineage gets stuck at the absorbing zero.
         let mut g = Genome::default_vine();
         g.mutation_rate = 0.0;
         let copied = mutate_genome(&g, &mut det_rng());
-        assert_eq!(copied.genes, g.genes);
-        assert_eq!(copied.mutation_rate, 0.0, "rate stays put with no rolls");
+        assert!(
+            copied.mutation_rate >= MUTATION_RATE_MIN,
+            "rate {} fell below floor",
+            copied.mutation_rate
+        );
+        // Genes still don't mutate at the (now floored) tiny rate, with
+        // overwhelming probability — but we can't assert exact equality
+        // because the floor is non-zero. Just confirm length unchanged.
+        assert_eq!(copied.genes.len(), g.genes.len());
     }
 
     #[test]
@@ -2774,7 +2782,7 @@ mod tests {
                 g.genes.len()
             );
             assert!(
-                g.mutation_rate >= 0.0 && g.mutation_rate <= MUTATION_RATE_MAX,
+                g.mutation_rate >= MUTATION_RATE_MIN && g.mutation_rate <= MUTATION_RATE_MAX,
                 "rate {} out of bounds",
                 g.mutation_rate
             );

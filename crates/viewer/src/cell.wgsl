@@ -19,7 +19,7 @@ struct Cell {
     facing: u32,
     connections: u32,
     clan: u32,
-    mutation_rate: u32,
+    mutation_rate: f32,
     _pad0: u32,
     _pad1: u32,
 }
@@ -121,23 +121,19 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
 // Mutation-rate gradient: blue → cyan → green → yellow → red. Uses a
 // log2 scale centered on DEFAULT_MUTATION_RATE so the typical
 // initial-population rate lands at green (t=0.5). Each 2× drift away
-// from default moves the color one quarter of the gradient. Lets you
-// distinguish "fast lineage" (yellow/red) from "slow lineage"
-// (cyan/blue) at a glance even when most of the world hovers near the
-// default. `q` is the rate in 0..255 mapping linearly to
-// 0..MUTATION_RATE_MAX; 0.01/0.2 = 0.05 is the normalized default.
-fn mutation_rate_color(q: u32) -> vec3<f32> {
-    let raw = clamp(f32(q) / 255.0, 0.0, 1.0);
-    // Floor below q=1 so log2 stays finite. Anything that low is
-    // effectively zero rate and clamps to t=0 below anyway.
-    let safe = max(raw, 1.0 / 255.0);
-    let default_norm: f32 = 0.04;
+// from default moves the color one quarter of the gradient. Takes the
+// raw f32 rate (no quantization) — wire format already carries f32 so
+// we color directly.
+fn mutation_rate_color(rate: f32) -> vec3<f32> {
+    // Floor at MUTATION_RATE_MIN (0.0005) so log2 stays finite —
+    // matches the server-side clamp in mutate_genome.
+    let safe = max(rate, 0.0005);
+    let default_rate: f32 = 0.04;
     // Half-width of the log2 axis the gradient covers, in octaves on
-    // each side of default. With ±4.5 octaves the rate range
-    // (default×0.044 .. default×22.6) maps to the full ramp; the
-    // useful cap MUTATION_RATE_MAX is at log2(20) ≈ +4.32 octaves.
+    // each side of DEFAULT. ±4.5 octaves reaches MUTATION_RATE_MAX
+    // (log2(0.2/0.04) ≈ 2.32) plus margin below the floor.
     let half_range: f32 = 4.5;
-    let t = clamp(0.5 + log2(safe / default_norm) / (2.0 * half_range), 0.0, 1.0);
+    let t = clamp(0.5 + log2(safe / default_rate) / (2.0 * half_range), 0.0, 1.0);
 
     let blue = vec3<f32>(0.20, 0.40, 0.95);
     let cyan = vec3<f32>(0.20, 0.85, 0.95);

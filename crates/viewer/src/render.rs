@@ -332,10 +332,10 @@ struct GpuCell {
     facing: u32,
     connections: u32,
     clan: u32,
-    /// Quantized mutation_rate: 0..255 maps to 0.0..MUTATION_RATE_MAX.
-    /// Set on every plant-cell write; stale on Empty cells (shader
-    /// only reads it when LAYER_MUTATION_RATE is on AND kind != EMPTY).
-    mutation_rate: u32,
+    /// Lineage mutation_rate (f32). Set on every plant-cell write;
+    /// stale on Empty cells (shader only reads it when
+    /// LAYER_MUTATION_RATE is on AND kind != EMPTY).
+    mutation_rate: f32,
     _pad: [u32; 2],
 }
 
@@ -771,7 +771,7 @@ fn to_gpu_cell(cell: &WireCell) -> GpuCell {
         facing,
         connections,
         clan,
-        mutation_rate: u32::from(cell.lineage_mutation_rate),
+        mutation_rate: cell.lineage_mutation_rate,
         _pad: [0; 2],
     }
 }
@@ -1158,6 +1158,10 @@ fn draw_regen_dialog(
             );
             ui.add(egui::Slider::new(&mut p.default_organic, 0..=400).text("default organic"));
             ui.add(
+                egui::Slider::new(&mut p.default_soil_energy, 0..=2000)
+                    .text("default soil energy"),
+            );
+            ui.add(
                 egui::Slider::new(&mut p.sprout_grid_spacing, 1..=64).text("sprout spacing"),
             );
             ui.add(
@@ -1218,11 +1222,7 @@ fn cell_details_ui(ui: &mut egui::Ui, cell: &WireCell) {
     // genome.mutation_rate, so it's only meaningful when something
     // occupies the cell. Suppress it for Empty.
     if !matches!(cell.occupant, WireOccupant::Empty) {
-        let rate = protocol::dequantize_mutation_rate(cell.lineage_mutation_rate);
-        ui.label(format!(
-            "  mutation rate: {:.4} (q={})",
-            rate, cell.lineage_mutation_rate
-        ));
+        ui.label(format!("  mutation rate: {:.5}", cell.lineage_mutation_rate));
     }
 }
 
@@ -1377,7 +1377,7 @@ mod tests {
                 organic: 0,
                 soil_energy: 0,
                 sunlit: false,
-                lineage_mutation_rate: 0,
+                lineage_mutation_rate: 0.0,
                 occupant: WireOccupant::Empty,
             })
             .collect();

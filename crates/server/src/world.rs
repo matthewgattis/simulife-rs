@@ -45,9 +45,9 @@ pub fn build_world(params: &WorldGenParams) -> Vec<Chunk> {
                     };
                     Cell {
                         organic,
-                        soil_energy: 100,
+                        soil_energy: params.default_soil_energy,
                         sunlit,
-                        lineage_mutation_rate: 0,
+                        lineage_mutation_rate: 0.0,
                         occupant: Occupant::Empty,
                     }
                 })
@@ -108,13 +108,14 @@ pub fn place_random_sprout_grid(
                         0.0
                     };
                     let rate = protocol::DEFAULT_MUTATION_RATE * 2f32.powf(oct);
-                    genome.mutation_rate = rate.clamp(0.0, protocol::MUTATION_RATE_MAX);
+                    genome.mutation_rate =
+                        rate.clamp(protocol::MUTATION_RATE_MIN, protocol::MUTATION_RATE_MAX);
+                    let stamp_rate = genome.mutation_rate;
                     // Clan: which 2D box this sprout starts in. Encoded
                     // row-major: clan = box_y * boxes_x + box_x.
                     let bx = (x / box_w) as u32;
                     let by = (y / box_h) as u32;
                     let clan = (by * boxes_x + bx) as protocol::ClanId;
-                    let rate_q = protocol::quantize_mutation_rate(genome.mutation_rate);
                     place_at(
                         chunks,
                         chunks_x,
@@ -131,7 +132,7 @@ pub fn place_random_sprout_grid(
                         },
                     );
                     if let Some(cell) = cell_at_mut(chunks, chunks_x, x, y) {
-                        cell.lineage_mutation_rate = rate_q;
+                        cell.lineage_mutation_rate = stamp_rate;
                     }
                 }
             }
@@ -205,6 +206,7 @@ mod tests {
             toxic_border_thickness: TOXIC_BORDER_THICKNESS,
             toxic_border_organic: TOXIC_BORDER_ORGANIC,
             default_organic: DEFAULT_ORGANIC,
+            default_soil_energy: 100,
             initial_mutation_rate_octaves: 3.0,
         }
     }

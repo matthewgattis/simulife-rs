@@ -37,6 +37,11 @@ pub const GENOME_MAX: usize = 64;
 /// mutable per-copy).
 pub const DEFAULT_MUTATION_RATE: f32 = 0.04;
 pub const MUTATION_RATE_MAX: f32 = 0.2;
+/// Hard floor for genome mutation rates. Prevents an absorbing state
+/// at zero (where the meta-mutation gate `rng < rate` can never fire
+/// again) and gives every lineage at least a tiny pressure toward
+/// change. Clamped in `mutate_genome`.
+pub const MUTATION_RATE_MIN: f32 = 0.0005;
 
 /// Live-tunable simulation scalars. The server owns the authoritative
 /// copy in `SimState.params`; the viewer mirrors it via `Welcome` and
@@ -100,6 +105,10 @@ pub struct WorldGenParams {
     /// Organic seeded into ordinary cells (everywhere outside the
     /// toxic borders).
     pub default_organic: u16,
+    /// Soil-energy seeded into every cell at world build.
+    /// `SimParams::soil_energy_regulation` then drifts cells toward
+    /// `SimParams::soil_energy_rest` each tick.
+    pub default_soil_energy: u16,
     /// Half-width of the log2 spread used to draw initial sprout
     /// mutation rates around DEFAULT. 0 = uniform DEFAULT, 3 = ±3
     /// octaves (rate × 1/8 .. × 8).
@@ -118,6 +127,7 @@ impl Default for WorldGenParams {
             toxic_border_thickness: 2,
             toxic_border_organic: 1000,
             default_organic: 40,
+            default_soil_energy: 100,
             initial_mutation_rate_octaves: 3.0,
         }
     }
@@ -271,25 +281,12 @@ pub struct Cell {
     pub organic: u16,
     pub soil_energy: u16,
     pub sunlit: bool,
-    /// Quantized mutation_rate of the lineage that occupies this cell
-    /// (0..255 → 0.0..MUTATION_RATE_MAX). Set whenever a plant cell is
-    /// written, propagated from the parent sprout's genome rate. Stale
-    /// when the cell is Empty — viewer only renders it when an
-    /// occupant is present.
-    pub lineage_mutation_rate: u8,
+    /// mutation_rate of the lineage that occupies this cell, copied
+    /// directly from the parent sprout's `genome.mutation_rate` whenever
+    /// a plant cell is written. Stale when the cell is Empty — viewer
+    /// only renders it when an occupant is present.
+    pub lineage_mutation_rate: f32,
     pub occupant: Occupant,
-}
-
-/// Convert a real-valued mutation rate in `[0.0, MUTATION_RATE_MAX]`
-/// to a u8 for storage on Cell. Out-of-range values are clamped.
-pub fn quantize_mutation_rate(rate: f32) -> u8 {
-    let frac = (rate / MUTATION_RATE_MAX).clamp(0.0, 1.0);
-    (frac * 255.0).round() as u8
-}
-
-/// Inverse of `quantize_mutation_rate`.
-pub fn dequantize_mutation_rate(q: u8) -> f32 {
-    (q as f32 / 255.0) * MUTATION_RATE_MAX
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -354,7 +351,7 @@ pub struct WireCell {
     pub organic: u16,
     pub soil_energy: u16,
     pub sunlit: bool,
-    pub lineage_mutation_rate: u8,
+    pub lineage_mutation_rate: f32,
     pub occupant: WireOccupant,
 }
 
@@ -557,7 +554,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit,
-            lineage_mutation_rate: 0,
+            lineage_mutation_rate: 0.0,
             occupant: Occupant::Empty,
         }
     }
@@ -570,7 +567,7 @@ mod tests {
             organic: 12,
             soil_energy: 7,
             sunlit: false,
-            lineage_mutation_rate: 0,
+            lineage_mutation_rate: 0.0,
             occupant: Occupant::Sprout {
                 plant: 1,
                 clan: 0,
@@ -585,7 +582,7 @@ mod tests {
             organic: 200,
             soil_energy: 50,
             sunlit: true,
-            lineage_mutation_rate: 0,
+            lineage_mutation_rate: 0.0,
             occupant: Occupant::Seed {
                 plant: 1,
                 clan: 0,
@@ -599,7 +596,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit: true,
-            lineage_mutation_rate: 0,
+            lineage_mutation_rate: 0.0,
             occupant: Occupant::Leaf {
                 plant: 1,
                 clan: 0,
@@ -723,7 +720,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit: false,
-            lineage_mutation_rate: 0,
+            lineage_mutation_rate: 0.0,
             occupant: occ,
         };
         let bytes = rmp_serde::to_vec(&cell).expect("encode");
@@ -866,7 +863,7 @@ mod tests {
             organic: 0,
             soil_energy: 0,
             sunlit,
-            lineage_mutation_rate: 0,
+            lineage_mutation_rate: 0.0,
             occupant: WireOccupant::Empty,
         }
     }
