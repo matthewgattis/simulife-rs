@@ -25,7 +25,7 @@ const UPKEEP_SPROUT: Energy = 4;
 
 /// Soil energy "rest level". Each tick every cell's soil_energy drifts by
 /// SOIL_ENERGY_REGULATION toward this value.
-const SOIL_ENERGY_REST: u16 = 100;
+const SOIL_ENERGY_REST: u16 = 10;
 const SOIL_ENERGY_REGULATION: u16 = 1;
 
 /// Once a seed has accumulated this much energy from its parent stem, it
@@ -51,7 +51,7 @@ const COST_SPROUT: Energy = 20;
 const COST_LEAF: Energy = 5;
 const COST_ROOT: Energy = 5;
 const COST_ANTENNA: Energy = 5;
-const COST_SEED: Energy = 60;
+const COST_SEED: Energy = 40;
 
 /// Per-field probability of mutating a single field at any copy site.
 
@@ -66,9 +66,9 @@ const ANTENNA_PULL_KERNEL: [[u16; 3]; 3] = [
     [1, 2, 1],
 ];
 const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [
-    [1, 2, 1],
     [2, 4, 2],
-    [1, 2, 1],
+    [4, 8, 4],
+    [2, 4, 2],
 ];
 
 pub struct SimState {
@@ -134,41 +134,54 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
         }
 
         let tick = state.current_tick.load(Ordering::Relaxed) + 1;
-        let _tick_span = tracing::info_span!("tick", tick).entered();
+        // Span guards must drop before the yield_now below — entered()
+        // guards aren't Send across an await. Scope the whole tick body
+        // in a block so all spans drop at the closing brace.
+        {
+            let _tick_span = tracing::info_span!("tick", tick).entered();
 
-        let snapshot_chunks: Vec<protocol::WireChunk> = {
-            let mut chunks = state.world.lock().expect("sim lock poisoned");
-            let mut rng = state.rng.lock().expect("rng lock poisoned");
-            let _mutate = tracing::info_span!("mutate_world").entered();
-            mutate_world(
-                &mut chunks,
-                state.chunks_x,
-                state.chunks_y,
-                &state.next_plant_id,
-                &mut *rng,
-            );
-            drop(_mutate);
-            // Build the wire view directly from the locked world. Avoids
-            // cloning the full Chunks (with their Box<Genome>s) just to
-            // serialize a stripped version.
-            let _wire = tracing::info_span!("to_wire_chunks").entered();
-            chunks.iter().map(protocol::WireChunk::from).collect()
-        };
-        state.current_tick.store(tick, Ordering::Relaxed);
+            let snapshot_chunks: Vec<protocol::WireChunk> = {
+                let mut chunks = state.world.lock().expect("sim lock poisoned");
+                let mut rng = state.rng.lock().expect("rng lock poisoned");
+                let _mutate = tracing::info_span!("mutate_world").entered();
+                mutate_world(
+                    &mut chunks,
+                    state.chunks_x,
+                    state.chunks_y,
+                    &state.next_plant_id,
+                    &mut *rng,
+                );
+                drop(_mutate);
+                // Build the wire view directly from the locked world.
+                // Avoids cloning the full Chunks (with their
+                // Box<Genome>s) just to serialize a stripped version.
+                let _wire = tracing::info_span!("to_wire_chunks").entered();
+                chunks.iter().map(protocol::WireChunk::from).collect()
+            };
+            state.current_tick.store(tick, Ordering::Relaxed);
 
-        let msg = ServerMessage::ChunkBatch {
-            tick,
-            chunks: snapshot_chunks,
-        };
-        let encode = tracing::info_span!("encode_msg").entered();
-        match protocol::encode_server_message(&msg) {
-            Ok(bytes) => {
-                drop(encode);
-                let _ = tracing::info_span!("broadcast", bytes = bytes.len()).entered();
-                let _ = state.tick_tx.send(Arc::new(bytes));
+            let msg = ServerMessage::ChunkBatch {
+                tick,
+                chunks: snapshot_chunks,
+            };
+            let encode = tracing::info_span!("encode_msg").entered();
+            match protocol::encode_server_message(&msg) {
+                Ok(bytes) => {
+                    drop(encode);
+                    let _ = tracing::info_span!("broadcast", bytes = bytes.len()).entered();
+                    let _ = state.tick_tx.send(Arc::new(bytes));
+                }
+                Err(e) => error!("serialize tick failed: {e:#}"),
             }
-            Err(e) => error!("serialize tick failed: {e:#}"),
         }
+
+        // When tick_rate_limited is off there's no `.await` in this
+        // iteration; without an explicit yield the cooperative tokio
+        // scheduler can starve other tasks (notably the ctrl_c signal
+        // handler and the QUIC accept loop). One yield_now per tick is
+        // enough — it's effectively free when the runtime has nothing
+        // else queued.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -469,6 +482,7 @@ fn mutate_world(
         phase_prune_pull(chunks, chunks_x, chunks_y, max_x, max_y);
     drop(_phase_prune);
     tracing::event!(
+        target: "phase",
         tracing::Level::INFO,
         prune_changes = prune_change_count,
         "phase_prune_done"
@@ -658,6 +672,7 @@ fn mutate_world(
     }
     drop(_phase_germ);
     tracing::event!(
+        target: "phase",
         tracing::Level::INFO,
         germinations = germination_count,
         "phase_germination_done"
@@ -670,6 +685,7 @@ fn mutate_world(
         phase_growth_pull(chunks, chunks_x, chunks_y, max_x, max_y, rng);
     drop(_phase_growth);
     tracing::event!(
+        target: "phase",
         tracing::Level::INFO,
         growth_attempts,
         "phase_growth_done"
@@ -756,7 +772,9 @@ fn mutate_world(
         }
     }
     drop(_phase_death);
-    tracing::event!(tracing::Level::INFO, deaths = death_count, "phase_death_done");
+    tracing::event!(
+        target: "phase",
+        tracing::Level::INFO, deaths = death_count, "phase_death_done");
 
     // Per-tick summary event with occupant census so we can correlate
     // tick duration against world fullness over the run.
@@ -799,6 +817,7 @@ fn mutate_world(
         }
     }
     tracing::event!(
+        target: "phase",
         tracing::Level::INFO,
         occupants,
         leaves,
@@ -1995,11 +2014,12 @@ mod tests {
 
         phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &mut det_rng());
 
-        // Pool: 40 own + 50 harvested = 90. Cost = COST_SEED (60). Stem = 30.
+        // Pool: 40 own + 50 harvested = 90. Subtract COST_SEED.
+        let expected = 90u32.saturating_sub(COST_SEED as u32) as Energy;
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Stem { plant, energy, .. } => {
                 assert_eq!(plant, 1, "stem belongs to eater plant");
-                assert_eq!(energy, 30, "pool minus cost");
+                assert_eq!(energy, expected, "pool minus cost");
             }
             ref other => panic!("expected stem, got {other:?}"),
         }
@@ -2910,13 +2930,17 @@ mod tests {
 
         mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
 
-        // Full 3x3 kernel (sum 16): center 4, cardinals 2, corners 1.
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).soil_energy, 96);
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).soil_energy, 98);
-        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).soil_energy, 98);
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).soil_energy, 98);
-        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).soil_energy, 98);
-        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).soil_energy, 99);
+        // Phase 1.5 regulation drifts each cell by SOIL_ENERGY_REGULATION
+        // (100 is above SOIL_ENERGY_REST so it drifts down by 1 first).
+        // Then antenna pull subtracts the full 3x3 kernel: center 4,
+        // cardinals 2, corners 1.
+        let pre = 100 - SOIL_ENERGY_REGULATION;
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 10).soil_energy, pre - 4);
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 10).soil_energy, pre - 2);
+        assert_eq!(cell_at(&chunks, chunks_x, 11, 10).soil_energy, pre - 2);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 9).soil_energy, pre - 2);
+        assert_eq!(cell_at(&chunks, chunks_x, 10, 11).soil_energy, pre - 2);
+        assert_eq!(cell_at(&chunks, chunks_x, 9, 9).soil_energy, pre - 1);
     }
 
     #[test]
@@ -3258,18 +3282,22 @@ mod tests {
     fn phase_soil_regulation_drifts_toward_rest() {
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
-        // Three sample cells: below, at, above the rest level.
         let edge = CHUNK_EDGE as usize;
-        chunks[0].cells[0].soil_energy = 50; // below
-        chunks[0].cells[1].soil_energy = SOIL_ENERGY_REST; // at rest
-        chunks[0].cells[2].soil_energy = 200; // above
+        // Three sample cells: below, at, above the rest level. Use
+        // values relative to SOIL_ENERGY_REST so the test holds across
+        // tuning changes.
+        let below = SOIL_ENERGY_REST.saturating_sub(5);
+        let above = SOIL_ENERGY_REST + 50;
+        chunks[0].cells[0].soil_energy = below;
+        chunks[0].cells[1].soil_energy = SOIL_ENERGY_REST;
+        chunks[0].cells[2].soil_energy = above;
         // No occupants, so other phases are no-ops.
 
         mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
 
-        assert_eq!(chunks[0].cells[0].soil_energy, 50 + SOIL_ENERGY_REGULATION);
+        assert_eq!(chunks[0].cells[0].soil_energy, below + SOIL_ENERGY_REGULATION);
         assert_eq!(chunks[0].cells[1].soil_energy, SOIL_ENERGY_REST);
-        assert_eq!(chunks[0].cells[2].soil_energy, 200 - SOIL_ENERGY_REGULATION);
+        assert_eq!(chunks[0].cells[2].soil_energy, above - SOIL_ENERGY_REGULATION);
         let _ = edge;
     }
 
@@ -3415,19 +3443,36 @@ mod tests {
 
         mutate_world(&mut chunks, 1, 1, &AtomicU32::new(1), &mut det_rng());
 
-        // Leaf pays UPKEEP_DEFAULT=2 first → dies with 48 energy.
-        // DEATH_DEPOSIT_KERNEL sum=16 → per_unit=48/16=3.
-        // Center weight=4 → +12 energy. Cardinals weight=2 → +6. Corners
-        // weight=1 → +3. Soil regulation adds +1 everywhere (all cells
-        // started below the rest level).
+        // Leaf pays UPKEEP_DEFAULT first → dies with the remainder.
+        // The death kernel splits that energy across the 3x3 in
+        // proportion to its weights. We compute the expected center /
+        // cardinal / corner contributions from the actual kernel so
+        // this stays robust to tuning changes.
+        let kernel = DEATH_DEPOSIT_KERNEL;
+        let kernel_sum: u32 = kernel.iter().flatten().map(|&w| w as u32).sum();
+        let dying_energy = (50u32).saturating_sub(UPKEEP_DEFAULT as u32);
+        let per_unit = dying_energy / kernel_sum.max(1);
+        let center_w = kernel[1][1] as u32;
+        let card_w = kernel[1][0] as u32;
+        let corner_w = kernel[0][0] as u32;
         let cell_at_idx =
             |x: i32, y: i32| -> usize { (y as usize) * (CHUNK_EDGE as usize) + x as usize };
         let center_idx = cell_at_idx(10, 10);
         let north_idx = cell_at_idx(10, 9);
         let nw_idx = cell_at_idx(9, 9);
-        assert_eq!(chunks[0].cells[center_idx].soil_energy, before[center_idx] + 1 + 12);
-        assert_eq!(chunks[0].cells[north_idx].soil_energy, before[north_idx] + 1 + 6);
-        assert_eq!(chunks[0].cells[nw_idx].soil_energy, before[nw_idx] + 1 + 3);
+        let drift = SOIL_ENERGY_REGULATION as u32;
+        assert_eq!(
+            chunks[0].cells[center_idx].soil_energy as u32,
+            before[center_idx] as u32 + drift + per_unit * center_w
+        );
+        assert_eq!(
+            chunks[0].cells[north_idx].soil_energy as u32,
+            before[north_idx] as u32 + drift + per_unit * card_w
+        );
+        assert_eq!(
+            chunks[0].cells[nw_idx].soil_energy as u32,
+            before[nw_idx] as u32 + drift + per_unit * corner_w
+        );
     }
 
     #[test]

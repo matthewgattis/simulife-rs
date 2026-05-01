@@ -209,17 +209,22 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(trace_chrome: Option<&std::path::Path>) -> Option<FlushGuard> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,quinn=warn"));
-    let fmt_layer = tracing_subscriber::fmt::layer();
+    use tracing_subscriber::Layer;
+    // Per-tick phase events live on target="phase" so we can keep them
+    // out of the noisy console log while still capturing them in the
+    // chrome trace when the user explicitly enables profiling.
+    let fmt_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,phase=off,quinn=warn"));
+    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(fmt_filter);
     match trace_chrome {
         Some(path) => {
             let (chrome_layer, guard) = ChromeLayerBuilder::new()
                 .file(path)
                 .include_args(true)
                 .build();
+            let chrome_filter = EnvFilter::new("info,phase=info,quinn=warn");
+            let chrome_layer = chrome_layer.with_filter(chrome_filter);
             tracing_subscriber::registry()
-                .with(filter)
                 .with(fmt_layer)
                 .with(chrome_layer)
                 .init();
@@ -227,10 +232,7 @@ fn init_tracing(trace_chrome: Option<&std::path::Path>) -> Option<FlushGuard> {
             Some(guard)
         }
         None => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt_layer)
-                .init();
+            tracing_subscriber::registry().with(fmt_layer).init();
             None
         }
     }

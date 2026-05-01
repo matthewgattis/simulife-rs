@@ -1069,31 +1069,55 @@ fn cell_details_ui(ui: &mut egui::Ui, cell: &WireCell) {
     ui.label(format!("organic: {}", cell.organic));
     ui.label(format!("soil_energy: {}", cell.soil_energy));
     ui.label(format!("sunlit: {}", cell.sunlit));
-    ui.label(format!("occupant: {}", occupant_label(&cell.occupant)));
+    let rate = protocol::dequantize_mutation_rate(cell.lineage_mutation_rate);
+    ui.label(format!(
+        "lineage rate: {:.4} (q={})",
+        rate, cell.lineage_mutation_rate
+    ));
+    ui.separator();
+    ui.label(format!("occupant: {}", occupant_kind_label(&cell.occupant)));
+    occupant_details_ui(ui, &cell.occupant);
 }
 
-fn occupant_label(occ: &WireOccupant) -> String {
+fn occupant_kind_label(occ: &WireOccupant) -> &'static str {
     match occ {
-        WireOccupant::Empty => "empty".to_string(),
+        WireOccupant::Empty => "empty",
+        WireOccupant::Leaf { .. } => "leaf",
+        WireOccupant::Root { .. } => "root",
+        WireOccupant::Stem { .. } => "stem",
+        WireOccupant::Antenna { .. } => "antenna",
+        WireOccupant::Sprout { .. } => "sprout",
+        WireOccupant::Seed { .. } => "seed",
+    }
+}
+
+fn occupant_details_ui(ui: &mut egui::Ui, occ: &WireOccupant) {
+    match occ {
+        WireOccupant::Empty => {}
         WireOccupant::Leaf {
             plant,
             clan,
             energy,
             facing,
             parent,
-        } => format!(
-            "leaf (plant {plant}, clan {clan}, energy {energy}, facing {facing:?}, parent {})",
-            parent_label(*parent)
-        ),
+        } => {
+            ui.label(format!("  plant: {plant}"));
+            ui.label(format!("  clan: {clan}"));
+            ui.label(format!("  energy: {energy}"));
+            ui.label(format!("  facing: {facing:?}"));
+            ui.label(format!("  parent: {}", parent_label(*parent)));
+        }
         WireOccupant::Root {
             plant,
             clan,
             energy,
             parent,
-        } => format!(
-            "root (plant {plant}, clan {clan}, energy {energy}, parent {})",
-            parent_label(*parent)
-        ),
+        } => {
+            ui.label(format!("  plant: {plant}"));
+            ui.label(format!("  clan: {clan}"));
+            ui.label(format!("  energy: {energy}"));
+            ui.label(format!("  parent: {}", parent_label(*parent)));
+        }
         WireOccupant::Stem {
             plant,
             clan,
@@ -1101,21 +1125,28 @@ fn occupant_label(occ: &WireOccupant) -> String {
             connections,
             parent,
             children,
-        } => format!(
-            "stem (plant {plant}, clan {clan}, energy {energy}, conn {}, parent {}, kids {})",
-            connections_label(*connections),
-            parent_label(*parent),
-            connections_label(*children)
-        ),
+        } => {
+            ui.label(format!("  plant: {plant}"));
+            ui.label(format!("  clan: {clan}"));
+            ui.label(format!("  energy: {energy}"));
+            ui.label(format!("  parent: {}", parent_label(*parent)));
+            ui.label(format!("  children: {}", connections_label(*children)));
+            ui.label(format!(
+                "  connections: {}",
+                connections_label(*connections)
+            ));
+        }
         WireOccupant::Antenna {
             plant,
             clan,
             energy,
             parent,
-        } => format!(
-            "antenna (plant {plant}, clan {clan}, energy {energy}, parent {})",
-            parent_label(*parent)
-        ),
+        } => {
+            ui.label(format!("  plant: {plant}"));
+            ui.label(format!("  clan: {clan}"));
+            ui.label(format!("  energy: {energy}"));
+            ui.label(format!("  parent: {}", parent_label(*parent)));
+        }
         WireOccupant::Sprout {
             plant,
             clan,
@@ -1124,11 +1155,14 @@ fn occupant_label(occ: &WireOccupant) -> String {
             parent,
             current_gene,
             ..
-        } => format!(
-            "sprout (plant {plant}, clan {clan}, energy {energy}, facing {facing:?}, parent {}, gene {})",
-            parent_label(*parent),
-            current_gene
-        ),
+        } => {
+            ui.label(format!("  plant: {plant}"));
+            ui.label(format!("  clan: {clan}"));
+            ui.label(format!("  energy: {energy}"));
+            ui.label(format!("  facing: {facing:?}"));
+            ui.label(format!("  parent: {}", parent_label(*parent)));
+            ui.label(format!("  current_gene: {current_gene}"));
+        }
         WireOccupant::Seed {
             plant,
             clan,
@@ -1136,10 +1170,13 @@ fn occupant_label(occ: &WireOccupant) -> String {
             facing,
             parent,
             ..
-        } => format!(
-            "seed (plant {plant}, clan {clan}, energy {energy}, facing {facing:?}, parent {})",
-            parent_label(*parent)
-        ),
+        } => {
+            ui.label(format!("  plant: {plant}"));
+            ui.label(format!("  clan: {clan}"));
+            ui.label(format!("  energy: {energy}"));
+            ui.label(format!("  facing: {facing:?}"));
+            ui.label(format!("  parent: {}", parent_label(*parent)));
+        }
     }
 }
 
@@ -1243,40 +1280,40 @@ mod tests {
     }
 
     #[test]
-    fn occupant_label_includes_kind_for_each_variant() {
-        assert_eq!(occupant_label(&WireOccupant::Empty), "empty");
-
-        let leaf = WireOccupant::Leaf {
-            plant: 1,
-            clan: 0,
-            energy: 50,
-            facing: Direction::North,
-            parent: Some(Direction::South),
-        };
-        assert!(occupant_label(&leaf).starts_with("leaf"));
-
-        let stem = WireOccupant::Stem {
-            plant: 1,
-            clan: 0,
-            energy: 0,
-            connections: STEM_CONNECT_NORTH,
-            parent: None,
-            children: STEM_CONNECT_SOUTH,
-        };
-        let s = occupant_label(&stem);
-        assert!(s.starts_with("stem"));
-        assert!(s.contains("conn N"));
-        assert!(s.contains("kids S"));
-
-        let sprout = WireOccupant::Sprout {
-            plant: 1,
-            clan: 0,
-            energy: 0,
-            facing: Direction::North,
-            parent: None,
-            current_gene: 7,
-        };
-        assert!(occupant_label(&sprout).contains("gene 7"));
+    fn occupant_kind_label_per_variant() {
+        assert_eq!(occupant_kind_label(&WireOccupant::Empty), "empty");
+        assert_eq!(
+            occupant_kind_label(&WireOccupant::Leaf {
+                plant: 1,
+                clan: 0,
+                energy: 50,
+                facing: Direction::North,
+                parent: Some(Direction::South),
+            }),
+            "leaf"
+        );
+        assert_eq!(
+            occupant_kind_label(&WireOccupant::Stem {
+                plant: 1,
+                clan: 0,
+                energy: 0,
+                connections: STEM_CONNECT_NORTH,
+                parent: None,
+                children: STEM_CONNECT_SOUTH,
+            }),
+            "stem"
+        );
+        assert_eq!(
+            occupant_kind_label(&WireOccupant::Sprout {
+                plant: 1,
+                clan: 0,
+                energy: 0,
+                facing: Direction::North,
+                parent: None,
+                current_gene: 7,
+            }),
+            "sprout"
+        );
     }
 
     #[test]

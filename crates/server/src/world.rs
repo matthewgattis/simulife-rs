@@ -5,7 +5,7 @@ use rand::Rng;
 
 /// Inset (per side, as fraction of each box's dimension) where sunlight
 /// switches off. 0.10 → central 80% × 80% lit per box, dark frame around.
-const SUNLIT_MARGIN_FRAC: f32 = 0.10;
+const SUNLIT_MARGIN_FRAC: f32 = 0.20;
 
 /// Spacing between initial sprouts in `place_random_sprout_grid`. Tight
 /// enough to seed thousands of competing lineages — most random genomes

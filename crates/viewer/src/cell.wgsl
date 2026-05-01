@@ -111,13 +111,26 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-// Mutation-rate gradient: blue (low / stable) → red (high / chaotic).
-// `q` is the quantized rate in [0, 255].
+// Mutation-rate gradient: blue → cyan → green → yellow → red.
+// `q` is the quantized rate in [0, 255]. Uses a 4-stop ramp through
+// the perceptual middle so distinctions between low rates aren't lost
+// at the dark-blue end. Also gamma-corrects the input via `pow(t, 0.5)`
+// so the default rate (~5% of the [0, MUTATION_RATE_MAX] range) lands
+// near the gradient's middle instead of buried at the cold end.
 fn mutation_rate_color(q: u32) -> vec3<f32> {
-    let t = clamp(f32(q) / 255.0, 0.0, 1.0);
-    let cold = vec3<f32>(0.30, 0.55, 0.95); // blue
-    let warm = vec3<f32>(0.95, 0.30, 0.30); // red
-    return mix(cold, warm, t);
+    let raw = clamp(f32(q) / 255.0, 0.0, 1.0);
+    let t = pow(raw, 0.5);
+    let blue = vec3<f32>(0.20, 0.40, 0.95);
+    let cyan = vec3<f32>(0.20, 0.85, 0.95);
+    let yellow = vec3<f32>(0.95, 0.85, 0.20);
+    let red = vec3<f32>(0.95, 0.25, 0.25);
+    if (t < 0.33) {
+        return mix(blue, cyan, t / 0.33);
+    } else if (t < 0.66) {
+        return mix(cyan, yellow, (t - 0.33) / 0.33);
+    } else {
+        return mix(yellow, red, (t - 0.66) / 0.34);
+    }
 }
 
 // Distinct palette for clans 0..3 (top-left, top-right, bottom-left,
