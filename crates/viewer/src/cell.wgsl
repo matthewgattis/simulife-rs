@@ -127,8 +127,8 @@ fn occupant_color(cell: Cell) -> vec3<f32> {
 fn mutation_rate_color(rate: f32) -> vec3<f32> {
     // Floor at MUTATION_RATE_MIN (0.0005) so log2 stays finite —
     // matches the server-side clamp in mutate_genome.
-    let safe = max(rate, 0.0005);
-    let default_rate: f32 = 0.04;
+    let safe = max(rate, 0.01);
+    let default_rate: f32 = 0.05;
     // Half-width of the log2 axis the gradient covers, in octaves on
     // each side of DEFAULT. ±4.5 octaves reaches MUTATION_RATE_MAX
     // (log2(0.2/0.04) ≈ 2.32) plus margin below the floor.

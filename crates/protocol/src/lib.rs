@@ -35,13 +35,13 @@ pub const GENOME_MAX: usize = 64;
 /// Initial per-genome mutation rate. Each lineage's actual rate
 /// drifts under selection pressure (mutation_rate is itself
 /// mutable per-copy).
-pub const DEFAULT_MUTATION_RATE: f32 = 0.04;
+pub const DEFAULT_MUTATION_RATE: f32 = 0.05;
 pub const MUTATION_RATE_MAX: f32 = 0.2;
 /// Hard floor for genome mutation rates. Prevents an absorbing state
 /// at zero (where the meta-mutation gate `rng < rate` can never fire
 /// again) and gives every lineage at least a tiny pressure toward
 /// change. Clamped in `mutate_genome`.
-pub const MUTATION_RATE_MIN: f32 = 0.0005;
+pub const MUTATION_RATE_MIN: f32 = 0.01;
 
 /// Live-tunable simulation scalars. The server owns the authoritative
 /// copy in `SimState.params`; the viewer mirrors it via `Welcome` and

@@ -11,8 +11,7 @@ use rand::SeedableRng;
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ClanId, Direction, Energy, GENOME_MAX, GENOME_MIN, Gene,
     Genome, MUTATION_RATE_MAX, MUTATION_RATE_MIN, Occupant, STEM_CONNECT_EAST, STEM_CONNECT_NORTH,
-    STEM_CONNECT_SOUTH,
-    STEM_CONNECT_WEST, ServerMessage, SimParams, SlotProduct, WorldGenParams,
+    STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, ServerMessage, SimParams, SlotProduct, WorldGenParams,
 };
 use rand::Rng;
 use rand_chacha::ChaCha12Rng;
@@ -34,7 +33,6 @@ fn scaled_kernel(scale: f32) -> [[u16; 3]; 3] {
     }
     out
 }
-
 
 pub struct SimState {
     /// World dims in chunks. Atomic so `regenerate_world` can resize
@@ -172,8 +170,7 @@ pub fn regenerate_world(state: &SimState, seed: u64, params: WorldGenParams) {
 
     let mut new_chunks = crate::world::build_world(&params);
     let mut new_rng = ChaCha12Rng::seed_from_u64(seed);
-    let count =
-        crate::world::place_random_sprout_grid(&mut new_chunks, &params, &mut new_rng);
+    let count = crate::world::place_random_sprout_grid(&mut new_chunks, &params, &mut new_rng);
 
     {
         let mut world = state.world.lock().expect("sim lock poisoned");
@@ -232,7 +229,8 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     let cy = y / edge;
     let lx = (x % edge) as usize;
     let ly = (y % edge) as usize;
-    let chunk_idx = (cy as usize) * (state.chunks_x.load(Ordering::Relaxed) as usize) + (cx as usize);
+    let chunk_idx =
+        (cy as usize) * (state.chunks_x.load(Ordering::Relaxed) as usize) + (cx as usize);
     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
 
     let plant = state.next_plant_id.fetch_add(1, Ordering::Relaxed);
@@ -586,7 +584,10 @@ fn mutate_world(
                         Some(dir) => {
                             let (dx, dy) = direction_to_delta(dir);
                             // OOB → parent gone, treat as dead.
-                            match (in_bounds(wx + dx, max_x, wrap), in_bounds(wy + dy, max_y, wrap)) {
+                            match (
+                                in_bounds(wx + dx, max_x, wrap),
+                                in_bounds(wy + dy, max_y, wrap),
+                            ) {
                                 (Some(nx), Some(ny)) => {
                                     let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
                                         + (nx / edge) as usize;
@@ -1277,17 +1278,19 @@ fn phase_prune_pull(
                         let dir = bit_to_dir(bit);
                         let same_as_parent = Some(dir) == parent_dir;
                         let (dx, dy) = direction_to_delta(dir);
-                        let neighbor_occ =
-                            match (in_bounds(wx + dx, max_x, wrap), in_bounds(wy + dy, max_y, wrap)) {
-                                (Some(nx), Some(ny)) => {
-                                    let n_chunk_idx = (ny / edge) as usize * chunks_x as usize
-                                        + (nx / edge) as usize;
-                                    let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
-                                        + (nx % edge) as usize;
-                                    Some(&chunks[n_chunk_idx].cells[n_cell_idx].occupant)
-                                }
-                                _ => None,
-                            };
+                        let neighbor_occ = match (
+                            in_bounds(wx + dx, max_x, wrap),
+                            in_bounds(wy + dy, max_y, wrap),
+                        ) {
+                            (Some(nx), Some(ny)) => {
+                                let n_chunk_idx =
+                                    (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
+                                let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
+                                    + (nx % edge) as usize;
+                                Some(&chunks[n_chunk_idx].cells[n_cell_idx].occupant)
+                            }
+                            _ => None,
+                        };
                         if in_children {
                             if let Some(n) = neighbor_occ {
                                 if is_valid_child(n, parent_plant) {
@@ -1657,7 +1660,7 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
     // rate gets normalized on its first copy.
     let mut rate = g.mutation_rate;
     if rng.r#gen::<f32>() < rate {
-        rate *= rng.gen_range(0.7..1.3);
+        rate *= rng.gen_range(0.5..1.5);
     }
     rate = rate.clamp(MUTATION_RATE_MIN, MUTATION_RATE_MAX);
     let insert_rate = rate * 0.1;
@@ -1958,7 +1961,16 @@ mod tests {
         let (sprout, genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -1990,7 +2002,16 @@ mod tests {
         let (sprout, genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 0, sprout);
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         // Center cell: stem with no children (front was OOB).
         match &cell_at(&chunks, chunks_x, 10, 0).occupant {
@@ -2030,7 +2051,16 @@ mod tests {
         let (sprout, genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -2067,7 +2097,16 @@ mod tests {
         let (sprout, genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         // Pool: 40 own + 50 harvested = 90. Subtract COST_SEED.
         let expected = 90u32.saturating_sub(COST_SEED as u32) as Energy;
@@ -2138,7 +2177,16 @@ mod tests {
             },
         );
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         // Foreign leaf intact.
         match cell_at(&chunks, chunks_x, 10, 9).occupant {
@@ -2177,7 +2225,16 @@ mod tests {
         let (sprout, genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         // Front cell still the own-plant leaf, energy intact.
         match cell_at(&chunks, chunks_x, 10, 9).occupant {
@@ -2246,7 +2303,16 @@ mod tests {
         // foreign cell and drops the foreign stem's child + connection
         // bits naturally. (In the live sim this happens one tick later;
         // here we run it in-line for a tight assertion.)
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
         phase_prune_pull(&mut chunks, chunks_x, 1, max, max, true);
 
         // (10, 9) replaced with our Seed (plant 1).
@@ -2287,7 +2353,16 @@ mod tests {
         let (sprout, genome) = vine_sprout(5);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
-        phase_growth_pull(&mut chunks, chunks_x, 1, max, max, &test_params(), &DEATH_DEPOSIT_KERNEL, &mut det_rng());
+        phase_growth_pull(
+            &mut chunks,
+            chunks_x,
+            1,
+            max,
+            max,
+            &test_params(),
+            &DEATH_DEPOSIT_KERNEL,
+            &mut det_rng(),
+        );
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -2536,8 +2611,9 @@ mod tests {
             max,
             max,
             5,
-            5
-        , true));
+            5,
+            true
+        ));
 
         // Stem with children present → not orphan.
         let stem_kid = Occupant::Stem {
@@ -2549,8 +2625,8 @@ mod tests {
             children: STEM_CONNECT_NORTH,
         };
         assert!(!cell_has_no_push_target(
-            &stem_kid, &chunks, chunks_x, max, max, 5, 5
-        , true));
+            &stem_kid, &chunks, chunks_x, max, max, 5, 5, true
+        ));
 
         // Leaf whose parent direction points at an Empty cell → orphan.
         let leaf = Occupant::Leaf {
@@ -2561,8 +2637,8 @@ mod tests {
             parent: Some(Direction::South),
         };
         assert!(cell_has_no_push_target(
-            &leaf, &chunks, chunks_x, max, max, 5, 5
-        , true));
+            &leaf, &chunks, chunks_x, max, max, 5, 5, true
+        ));
 
         // Same leaf, but place a stem in the parent direction → not orphan.
         place(
@@ -2580,8 +2656,8 @@ mod tests {
             },
         );
         assert!(!cell_has_no_push_target(
-            &leaf, &chunks, chunks_x, max, max, 5, 5
-        , true));
+            &leaf, &chunks, chunks_x, max, max, 5, 5, true
+        ));
 
         // Leaf at top edge with parent=North → OOB, orphan.
         let leaf_top = Occupant::Leaf {
@@ -2592,8 +2668,8 @@ mod tests {
             parent: Some(Direction::North),
         };
         assert!(cell_has_no_push_target(
-            &leaf_top, &chunks, chunks_x, max, max, 5, 0
-        , true));
+            &leaf_top, &chunks, chunks_x, max, max, 5, 0, true
+        ));
 
         // Sprout / seed / empty are not subject to orphan death.
         assert!(!cell_has_no_push_target(
@@ -2603,8 +2679,9 @@ mod tests {
             max,
             max,
             0,
-            0
-        , true));
+            0,
+            true
+        ));
     }
 
     #[test]
@@ -2612,7 +2689,10 @@ mod tests {
         assert_eq!(slot_cost(&test_params(), SlotProduct::Nothing), 0);
         assert_eq!(slot_cost(&test_params(), SlotProduct::Leaf), COST_LEAF);
         assert_eq!(slot_cost(&test_params(), SlotProduct::Root), COST_ROOT);
-        assert_eq!(slot_cost(&test_params(), SlotProduct::Antenna), COST_ANTENNA);
+        assert_eq!(
+            slot_cost(&test_params(), SlotProduct::Antenna),
+            COST_ANTENNA
+        );
         assert_eq!(slot_cost(&test_params(), SlotProduct::Seed), COST_SEED);
         assert_eq!(slot_cost(&test_params(), SlotProduct::Sprout), COST_SPROUT);
     }
@@ -2623,7 +2703,9 @@ mod tests {
         // direction; the new cell's `parent` field should point the OPPOSITE
         // way (back at the producing sprout).
         let parent_genome = Genome::default_vine();
-        let leaf = make_slot_occupant(&test_params(), SlotProduct::Leaf,
+        let leaf = make_slot_occupant(
+            &test_params(),
+            SlotProduct::Leaf,
             7,
             0,
             Direction::East,
@@ -2649,7 +2731,9 @@ mod tests {
             _ => panic!("expected leaf"),
         }
 
-        let nothing = make_slot_occupant(&test_params(), SlotProduct::Nothing,
+        let nothing = make_slot_occupant(
+            &test_params(),
+            SlotProduct::Nothing,
             1,
             0,
             Direction::North,
@@ -2660,7 +2744,9 @@ mod tests {
         );
         assert!(nothing.is_none());
 
-        let sprout = make_slot_occupant(&test_params(), SlotProduct::Sprout,
+        let sprout = make_slot_occupant(
+            &test_params(),
+            SlotProduct::Sprout,
             5,
             0,
             Direction::North,
@@ -2894,7 +2980,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
         let _ = edge;
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
@@ -2957,7 +3050,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Center weight 4.
         assert_eq!(cell_at(&chunks, chunks_x, 10, 10).organic, 96);
@@ -3019,7 +3119,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Phase 1.5 regulation drifts each cell by SOIL_ENERGY_REGULATION
         // (100 is above SOIL_ENERGY_REST so it drifts down by 1 first).
@@ -3107,7 +3214,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // The crucial assertion: the two symmetric roots end with equal
         // energy. Under the old "iteration order grabs first" rule the
@@ -3165,7 +3279,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
@@ -3215,7 +3336,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         match &cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Stem { children, .. } => {
@@ -3276,7 +3404,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
@@ -3308,7 +3443,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -3361,7 +3503,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         assert!(matches!(
             cell_at(&chunks, chunks_x, 10, 10).occupant,
@@ -3384,7 +3533,14 @@ mod tests {
         chunks[0].cells[2].soil_energy = above;
         // No occupants, so other phases are no-ops.
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         assert_eq!(
             chunks[0].cells[0].soil_energy,
@@ -3406,7 +3562,14 @@ mod tests {
         chunks[0].cells[0].soil_energy = SOIL_ENERGY_REST - 1;
         chunks[0].cells[1].soil_energy = SOIL_ENERGY_REST + 1;
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         assert_eq!(chunks[0].cells[0].soil_energy, SOIL_ENERGY_REST);
         assert_eq!(chunks[0].cells[1].soil_energy, SOIL_ENERGY_REST);
@@ -3465,7 +3628,14 @@ mod tests {
         let mut chunks = empty_world(chunks_x, 1);
         place_seed_dropoff_fixture(&mut chunks, SEED_DROPOFF_THRESHOLD);
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Cell where the seed was is no longer a Seed — it germinated into
         // a Sprout, which then ran phase 6 growth in the same tick. With
@@ -3498,7 +3668,14 @@ mod tests {
         // it stays under the dropoff threshold.
         place_seed_dropoff_fixture(&mut chunks, 30);
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         match &cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Seed { parent, .. } => assert_eq!(*parent, Some(Direction::South)),
@@ -3538,7 +3715,14 @@ mod tests {
         // worrying about phase 1.5 regulation.
         let before: Vec<u16> = chunks[0].cells.iter().map(|c| c.soil_energy).collect();
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Leaf pays UPKEEP_DEFAULT first → dies with the remainder.
         // The death kernel splits that energy across the 3x3 in
@@ -3612,7 +3796,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Leaf died from organic poisoning.
         assert!(matches!(
@@ -3661,7 +3852,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Leaf died from energy poisoning.
         assert!(matches!(
@@ -3748,7 +3946,14 @@ mod tests {
         // Tick 1: only the tip C sees an Empty neighbor → drops its N bit.
         // B and A still see the chain intact during the compute pass and
         // keep their bits.
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
         assert_eq!(
             snap(&chunks),
             [
@@ -3761,7 +3966,14 @@ mod tests {
 
         // Tick 2: B now sees C with children=0 → drops its N bit. A still
         // sees B with N (B's update happens in this tick's apply pass).
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
         assert_eq!(
             snap(&chunks),
             [(true, STEM_CONNECT_NORTH), (true, 0), (true, 0)],
@@ -3811,7 +4023,14 @@ mod tests {
             },
         );
 
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(1), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(1),
+            &mut det_rng(),
+        );
 
         // Stem died.
         assert!(matches!(
@@ -3856,7 +4075,14 @@ mod tests {
 
         // Counter starts at 100 so we can distinguish the fresh id from
         // the seed's previous plant id (7).
-        mutate_world(&mut chunks, 1, 1, &test_params(), &AtomicU32::new(100), &mut det_rng());
+        mutate_world(
+            &mut chunks,
+            1,
+            1,
+            &test_params(),
+            &AtomicU32::new(100),
+            &mut det_rng(),
+        );
 
         match &cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Sprout {
