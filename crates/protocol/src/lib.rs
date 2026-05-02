@@ -30,7 +30,7 @@ pub enum Direction {
 /// `GENOME_MIN` and `GENOME_MAX`.
 pub const GENOME_LEN: usize = 32;
 pub const GENOME_MIN: usize = 1;
-pub const GENOME_MAX: usize = 64;
+pub const GENOME_MAX: usize = 128;
 
 /// Initial per-genome mutation rate. Each lineage's actual rate
 /// drifts under selection pressure (mutation_rate is itself
@@ -126,8 +126,8 @@ impl Default for WorldGenParams {
             sprout_grid_spacing: 6,
             toxic_border_thickness: 2,
             toxic_border_organic: 1000,
-            default_organic: 40,
-            default_soil_energy: 100,
+            default_organic: 0,
+            default_soil_energy: 10,
             initial_mutation_rate_octaves: 3.0,
         }
     }
@@ -136,13 +136,13 @@ impl Default for WorldGenParams {
 impl Default for SimParams {
     fn default() -> Self {
         Self {
-            leaf_photosynthesis: 10,
+            leaf_photosynthesis: 20,
             upkeep_default: 2,
             upkeep_seed: 1,
             upkeep_sprout: 5,
-            soil_energy_rest: 100,
+            soil_energy_rest: 10,
             soil_energy_regulation: 1,
-            seed_dropoff_threshold: 180,
+            seed_dropoff_threshold: 500,
             soil_organic_poison: 400,
             soil_energy_poison: 1000,
             cost_leaf: 30,

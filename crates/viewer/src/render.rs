@@ -42,10 +42,7 @@ pub struct RenderState {
     chunk_renderer: ChunkRenderer,
 }
 
-fn make_msaa_view(
-    device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
-) -> wgpu::TextureView {
+fn make_msaa_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("msaa color"),
         size: wgpu::Extent3d {
@@ -390,42 +387,41 @@ impl ChunkRenderer {
             mapped_at_creation: false,
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cell bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cell bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let bind_group = make_bind_group(
             device,
@@ -595,13 +591,8 @@ impl ChunkRenderer {
                 let wy = cy * edge + ly;
                 let mut gc = to_gpu_cell(cell);
                 if let WireOccupant::Stem { connections, .. } = &cell.occupant {
-                    gc.connections = effective_stem_connections(
-                        *connections,
-                        chunks,
-                        &chunk_lookup,
-                        wx,
-                        wy,
-                    );
+                    gc.connections =
+                        effective_stem_connections(*connections, chunks, &chunk_lookup, wx, wy);
                 }
                 gpu_cells.push(gc);
             }
@@ -699,7 +690,10 @@ fn to_gpu_cell(cell: &WireCell) -> GpuCell {
             0,
         ),
         WireOccupant::Root {
-            plant, clan, energy, ..
+            plant,
+            clan,
+            energy,
+            ..
         } => (
             GPU_KIND_ROOT,
             *plant,
@@ -723,7 +717,10 @@ fn to_gpu_cell(cell: &WireCell) -> GpuCell {
             u32::from(*connections),
         ),
         WireOccupant::Antenna {
-            plant, clan, energy, ..
+            plant,
+            clan,
+            energy,
+            ..
         } => (
             GPU_KIND_ANTENNA,
             *plant,
@@ -867,9 +864,7 @@ fn draw_ui(
                 } => {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
                     ui.label(format!("Server: {server_addr}"));
-                    ui.label(format!(
-                        "World: {world_chunks_x} × {world_chunks_y} chunks"
-                    ));
+                    ui.label(format!("World: {world_chunks_x} × {world_chunks_y} chunks"));
                     ui.horizontal(|ui| {
                         ui.label(format!("Seed: {seed:#018x}"));
                         if ui.button("Regenerate...").clicked() {
@@ -938,8 +933,7 @@ fn draw_ui(
                             | (if energy { LAYER_ENERGY } else { 0 });
                     }
                     if ui.checkbox(&mut fg, "Occupants [3]").changed() {
-                        *layer_flags =
-                            (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
+                        *layer_flags = (*layer_flags & !LAYER_FG) | (if fg { LAYER_FG } else { 0 });
                     }
                     // Occupant tint is a radio: Default / Clan / Mutation rate
                     // are three mutually-exclusive ways to color the same
@@ -1001,24 +995,20 @@ fn sim_params_ui(
             ui.add(egui::Slider::new(&mut params.upkeep_seed, 0..=20).text("upkeep seed"));
             ui.add(egui::Slider::new(&mut params.upkeep_sprout, 0..=20).text("upkeep sprout"));
             ui.separator();
-            ui.add(
-                egui::Slider::new(&mut params.soil_energy_rest, 0..=500).text("soil E rest"),
-            );
+            ui.add(egui::Slider::new(&mut params.soil_energy_rest, 0..=1500).text("soil E rest"));
             ui.add(
                 egui::Slider::new(&mut params.soil_energy_regulation, 0..=20)
                     .text("soil E regulation"),
             );
             ui.add(
-                egui::Slider::new(&mut params.seed_dropoff_threshold, 0..=500)
+                egui::Slider::new(&mut params.seed_dropoff_threshold, 0..=2000)
                     .text("seed dropoff"),
             );
             ui.add(
-                egui::Slider::new(&mut params.soil_organic_poison, 0..=2000)
-                    .text("organic poison"),
+                egui::Slider::new(&mut params.soil_organic_poison, 0..=2000).text("organic poison"),
             );
             ui.add(
-                egui::Slider::new(&mut params.soil_energy_poison, 0..=5000)
-                    .text("energy poison"),
+                egui::Slider::new(&mut params.soil_energy_poison, 0..=5000).text("energy poison"),
             );
             ui.separator();
             ui.add(egui::Slider::new(&mut params.cost_leaf, 0..=200).text("cost leaf"));
@@ -1158,12 +1148,9 @@ fn draw_regen_dialog(
             );
             ui.add(egui::Slider::new(&mut p.default_organic, 0..=400).text("default organic"));
             ui.add(
-                egui::Slider::new(&mut p.default_soil_energy, 0..=2000)
-                    .text("default soil energy"),
+                egui::Slider::new(&mut p.default_soil_energy, 0..=2000).text("default soil energy"),
             );
-            ui.add(
-                egui::Slider::new(&mut p.sprout_grid_spacing, 1..=64).text("sprout spacing"),
-            );
+            ui.add(egui::Slider::new(&mut p.sprout_grid_spacing, 1..=64).text("sprout spacing"));
             ui.add(
                 egui::Slider::new(&mut p.initial_mutation_rate_octaves, 0.0..=6.0)
                     .text("initial mut-rate octaves")
@@ -1222,7 +1209,10 @@ fn cell_details_ui(ui: &mut egui::Ui, cell: &WireCell) {
     // genome.mutation_rate, so it's only meaningful when something
     // occupies the cell. Suppress it for Empty.
     if !matches!(cell.occupant, WireOccupant::Empty) {
-        ui.label(format!("  mutation rate: {:.5}", cell.lineage_mutation_rate));
+        ui.label(format!(
+            "  mutation rate: {:.5}",
+            cell.lineage_mutation_rate
+        ));
     }
 }
 
