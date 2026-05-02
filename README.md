@@ -29,10 +29,12 @@ The server starts paused so you can attach a viewer first; press the **Resume** 
 
 | flag | default | purpose |
 |---|---|---|
-| `--world-width` / `--world-height` | 12 | world size in chunks (each chunk = 32×32 cells) |
-| `--tick-hz` | 10 | simulation rate |
+| `--world-width` | 36 | world size in chunks along X (each chunk = 32×32 cells) |
+| `--world-height` | 24 | world size in chunks along Y |
+| `--tick-hz` | 10 | simulation rate (only honored when "Limit tick rate" is on) |
 | `--seed` | random | u64 world seed; loaded snapshots override |
 | `--world-file` | (none) | load/save snapshot path; auto-saves while running |
+| `--autosave-secs` | 30 | seconds between auto-saves; 0 disables |
 | `--start-running` | off | skip the default paused state |
 | `--trace-chrome <path>` | (none) | record a Chrome-trace JSON profile |
 | `--profile-duration-secs <n>` | (none) | graceful exit after `n` seconds (flushes trace) |
@@ -79,15 +81,43 @@ Each tick runs phases in order:
 
 ## Profiling
 
-Both binaries can record Chrome-trace JSON. Capture without manual intervention:
+Both binaries can record a Chrome-trace JSON. Each captured span / event becomes a timeline bar at `chrome://tracing` or [ui.perfetto.dev](https://ui.perfetto.dev).
+
+### Coverage
+
+**Server** (per-tick, in `mutate_world`): `tick` → `mutate_world` → `phase_photo`, `phase_soil_regulation`, `phase_soil_pulls`, `phase_upkeep`, `phase_prune`, `phase_drainage`, `phase_push`, `phase_germination`, `phase_growth`, `phase_death`. Each phase ends with a per-tick event on `target="phase"` carrying counts (e.g. `phase_prune_done { prune_changes }`, `phase_death_done { deaths }`, `tick_census { occupants, leaves, ... }`).
+
+The console fmt layer uses `EnvFilter::new("info,phase=off,quinn=warn")` by default, so the phase events stay out of stdout. The chrome layer overrides to `phase=info` so they're recorded in the trace file. Bottom line: phase events show up in the trace but not on stdout — exactly when you want them.
+
+**Viewer**: `render_frame`, `tick_apply { tick }`, `upload_chunks`, `read` (network), `decode { bytes }`. `--tick-metrics` adds `info!` log lines per applied tick (assign / upload / total µs) — independent of chrome trace.
+
+### Capture
 
 ```sh
-./target/release/server --start-running --trace-chrome /tmp/server.json --profile-duration-secs 10 &
-./target/release/viewer --trace-chrome /tmp/viewer.json --profile-duration-secs 8
-scripts/analyze-trace.sh /tmp/server.json
+mkdir -p traces
+./target/release/server --start-running \
+  --trace-chrome traces/server.json --profile-duration-secs 10 &
+./target/release/viewer \
+  --trace-chrome traces/viewer.json --profile-duration-secs 8 \
+  --tick-metrics
+wait
 ```
 
-Open the JSON in `chrome://tracing` or [ui.perfetto.dev](https://ui.perfetto.dev) for the timeline view.
+`--profile-duration-secs <n>` is what makes this hands-off — both binaries gracefully exit after `n` seconds, which flushes the chrome layer's buffered events to disk. Without it the trace JSON would be truncated.
+
+Open `traces/server.json` (or `viewer.json`) in `chrome://tracing` / Perfetto. Or summarize from the CLI:
+
+```sh
+scripts/analyze-trace.sh traces/server.json
+```
+
+That prints per-span `count / total / avg / p50 / p95 / max` in microseconds, sorted by total — the fastest way to spot which phase is dominating.
+
+### Tips
+
+- The viewer's `--profile-duration-secs` should be a few seconds *less* than the server's so the viewer shuts down first; otherwise the viewer keeps trying to read from a closed connection during shutdown and the last second of trace is mostly idle.
+- Phase events don't fire while the sim is paused, so `--start-running` is essential for server profiling.
+- `EnvFilter` honors `RUST_LOG`. To see phase events live on stdout (e.g. `RUST_LOG="info,phase=info,quinn=warn"`), set it before launching.
 
 ## Tests
 
