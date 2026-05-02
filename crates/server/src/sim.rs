@@ -874,16 +874,19 @@ fn push_targets(occ: &Occupant) -> Vec<Direction> {
         Occupant::Leaf { parent, .. }
         | Occupant::Root { parent, .. }
         | Occupant::Antenna { parent, .. } => parent.iter().copied().collect(),
-        // Productive stems push to descendants. Dead-end stems (no
-        // children) don't push at all — their energy gets drained by
-        // their own parent stem in `phase_drainage`. This breaks the
-        // parent↔dead-end mutual flow that used to keep doomed plants
-        // alive on circulating energy.
-        Occupant::Stem { children, .. } => {
+        // Stems push to descendants if they have any, else fall back to
+        // pushing up to parent (so a leaf-bearing branch's energy still
+        // reaches the trunk). Mutual parent↔child flow is prevented by
+        // `phase_drainage` dropping the parent's `children` bit at any
+        // dead-end child — the parent then doesn't push down to it, but
+        // the dead-end's own up-push still works.
+        Occupant::Stem {
+            children, parent, ..
+        } => {
             if *children != 0 {
                 bitmask_to_dirs(*children)
             } else {
-                Vec::new()
+                parent.iter().copied().collect()
             }
         }
     }
@@ -2713,10 +2716,11 @@ mod tests {
             parent: Some(Direction::South),
             children: 0,
         };
-        assert!(
-            push_targets(&stem_no_kids).is_empty(),
-            "dead-end stems don't push up — phase_drainage handles them"
-        );
+        // Dead-end stems with a parent fall back to pushing up to it
+        // (leaf-only branch energy still reaches the trunk).
+        // Phase_drainage prevents mutual parent↔child flow by dropping
+        // the parent's bit at the dead-end.
+        assert_eq!(push_targets(&stem_no_kids), vec![Direction::South]);
 
         let sprout = Occupant::Sprout {
             plant: 1,
