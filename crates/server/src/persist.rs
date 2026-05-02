@@ -270,6 +270,7 @@ mod tests {
             ),
             params: Mutex::new(protocol::SimParams::default()),
             world_gen_params: Mutex::new(protocol::WorldGenParams::default()),
+            latest_snapshot: crate::sim::LatestSnapshot::new(),
         }
     }
 

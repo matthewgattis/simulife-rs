@@ -57,6 +57,61 @@ pub struct SimState {
     /// `regenerate_world` runs; broadcast in `Welcome` so viewers can
     /// populate the regen dialog with the values currently in effect.
     pub world_gen_params: std::sync::Mutex<WorldGenParams>,
+    /// Latest tick snapshot waiting to be encoded + broadcast. The sim
+    /// loop publishes here instead of encoding inline; a dedicated
+    /// `run_encode_loop` task takes from the slot, runs msgpack+zstd,
+    /// and pushes bytes to `tick_tx`. Drop-old semantics — if encode
+    /// can't keep up, intermediate snapshots are dropped (sim never
+    /// blocks on encode).
+    pub latest_snapshot: LatestSnapshot,
+}
+
+/// Single-slot "drop old, keep latest" handoff between the sim loop
+/// (producer) and the encode loop (consumer). Sim's `publish` is
+/// non-blocking and overwrites any unread snapshot; encoder's `take`
+/// awaits the next publish and consumes the value.
+pub struct LatestSnapshot {
+    inner: std::sync::Mutex<Option<(u64, Vec<protocol::WireChunk>)>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LatestSnapshot {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn publish(&self, value: (u64, Vec<protocol::WireChunk>)) {
+        // Replaces any unread snapshot — old `Vec` drops here. Sim
+        // never waits.
+        *self.inner.lock().expect("snapshot poisoned") = Some(value);
+        self.notify.notify_one();
+    }
+
+    pub async fn take(&self) -> (u64, Vec<protocol::WireChunk>) {
+        loop {
+            // Register the wait BEFORE checking the slot so a publish
+            // that races between check and await still wakes us.
+            let notified = self.notify.notified();
+            if let Some(v) = self
+                .inner
+                .lock()
+                .expect("snapshot poisoned")
+                .take()
+            {
+                return v;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Default for LatestSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
@@ -136,19 +191,12 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
             };
             state.current_tick.store(tick, Ordering::Relaxed);
 
-            let msg = ServerMessage::ChunkBatch {
-                tick,
-                chunks: snapshot_chunks,
-            };
-            let encode = tracing::info_span!("encode_msg").entered();
-            match protocol::encode_server_message(&msg) {
-                Ok(bytes) => {
-                    drop(encode);
-                    let _ = tracing::info_span!("broadcast", bytes = bytes.len()).entered();
-                    let _ = state.tick_tx.send(Arc::new(bytes));
-                }
-                Err(e) => error!("serialize tick failed: {e:#}"),
-            }
+            // Hand the snapshot off to the encode loop. publish() is
+            // non-blocking: if the encoder hasn't drained the previous
+            // tick yet, it gets dropped here and the new one takes its
+            // place. Sim throughput is no longer gated on zstd time.
+            let _publish = tracing::info_span!("publish_snapshot").entered();
+            state.latest_snapshot.publish((tick, snapshot_chunks));
         }
 
         // When tick_rate_limited is off there's no `.await` in this
@@ -158,6 +206,30 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
         // enough — it's effectively free when the runtime has nothing
         // else queued.
         tokio::task::yield_now().await;
+    }
+}
+
+/// Long-lived task that takes the most recent snapshot the sim loop
+/// has published, encodes it (msgpack + zstd), and broadcasts the
+/// bytes to subscribed viewers. Runs on its own tokio task so encode
+/// time doesn't gate sim throughput. Snapshots that arrive while a
+/// previous one is still being encoded get dropped via the slot's
+/// publish-overwrite semantic.
+pub async fn run_encode_loop(state: Arc<SimState>) {
+    loop {
+        let (tick, chunks) = state.latest_snapshot.take().await;
+        let _tick_span = tracing::info_span!("encode_tick", tick).entered();
+        let msg = ServerMessage::ChunkBatch { tick, chunks };
+        let encode = tracing::info_span!("encode_msg").entered();
+        match protocol::encode_server_message(&msg) {
+            Ok(bytes) => {
+                drop(encode);
+                let _broadcast =
+                    tracing::info_span!("broadcast", bytes = bytes.len()).entered();
+                let _ = state.tick_tx.send(Arc::new(bytes));
+            }
+            Err(e) => error!("serialize tick failed: {e:#}"),
+        }
     }
 }
 
@@ -1992,6 +2064,7 @@ mod tests {
     // change in `SimParams::default()`, mirror them here. Encoded as
     // consts (not `SimParams::default().field`) so existing test code
     // that uses them in array indices and arithmetic compiles unchanged.
+    const LEAF_PHOTOSYNTHESIS: Energy = 20;
     const COST_SPROUT: Energy = 60;
     const COST_LEAF: Energy = 30;
     const COST_ROOT: Energy = 30;
@@ -2000,9 +2073,9 @@ mod tests {
     const UPKEEP_DEFAULT: Energy = 2;
     const UPKEEP_SEED: Energy = 1;
     const UPKEEP_SPROUT: Energy = 5;
-    const SOIL_ENERGY_REST: u16 = 100;
+    const SOIL_ENERGY_REST: u16 = 10;
     const SOIL_ENERGY_REGULATION: u16 = 1;
-    const SEED_DROPOFF_THRESHOLD: Energy = 180;
+    const SEED_DROPOFF_THRESHOLD: Energy = 500;
     const SOIL_ORGANIC_POISON: u16 = 400;
     const SOIL_ENERGY_POISON: u16 = 1000;
     const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [[1, 2, 1], [2, 4, 2], [1, 2, 1]];
@@ -3088,11 +3161,9 @@ mod tests {
     #[test]
     fn phase_photosynthesis_credits_sunlit_leaves() {
         // Leaf (sunlit, e=10) → sprout sink (e=0). One tick should funnel
-        // photo+pre-existing energy into the sprout.
-        //   photo:  leaf 10→20  (LEAF_PHOTOSYNTHESIS = 10)
-        //   upkeep: leaf 20→18, sprout 0→0  (UPKEEP_DEFAULT=2, SPROUT=4)
-        //   push:   leaf surplus 16 → sprout
-        //   final:  leaf 2, sprout 16
+        // photo+pre-existing energy into the sprout. Numbers below are
+        // derived from LEAF_PHOTOSYNTHESIS / UPKEEP_DEFAULT so the test
+        // tracks tuning changes automatically.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let edge = CHUNK_EDGE as i32;
@@ -3137,12 +3208,16 @@ mod tests {
         );
         let _ = edge;
 
+        // After photo+upkeep+push: leaf retains its upkeep buffer
+        // (UPKEEP_DEFAULT), sprout receives the rest.
+        let leaf_post = 10 + LEAF_PHOTOSYNTHESIS - UPKEEP_DEFAULT;
+        let pushed = leaf_post - UPKEEP_DEFAULT;
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
-            Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, UPKEEP_DEFAULT),
             ref other => panic!("leaf gone: {other:?}"),
         }
         match &cell_at(&chunks, chunks_x, 10, 11).occupant {
-            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 16),
+            Occupant::Sprout { energy, .. } => assert_eq!(*energy, pushed),
             other => panic!("sprout gone: {other:?}"),
         }
     }

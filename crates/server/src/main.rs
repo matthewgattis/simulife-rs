@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
         rng: std::sync::Mutex::new(rng),
         params: std::sync::Mutex::new(sim_params),
         world_gen_params: std::sync::Mutex::new(world_gen_params),
+        latest_snapshot: sim::LatestSnapshot::new(),
     });
 
     info!(
@@ -190,6 +191,16 @@ async fn main() -> Result<()> {
         sim::run_sim_loop(sim_state).await;
     });
     info!(tick_hz = args.tick_hz, "sim loop started");
+
+    // Encode + broadcast runs on its own task so msgpack+zstd time
+    // doesn't gate sim throughput. Sim publishes the latest snapshot
+    // into a slot; this loop takes from it. Drop-old semantics — sim
+    // never blocks on encode.
+    let encode_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        sim::run_encode_loop(encode_state).await;
+    });
+    info!("encode loop started");
 
     let (server_config, cert_source) =
         tls::make_server_config(args.cert_path.as_deref(), args.key_path.as_deref())?;
