@@ -484,6 +484,21 @@ fn mutate_world(
         "phase_prune_done"
     );
 
+    // Phase 4b: drainage. Each productive parent stem pulls the energy
+    // out of any kin dead-end stem child (children == 0) and drops the
+    // bit pointing at it. Eliminates the parent↔dead-end mutual flow
+    // and fast-tracks the dead-end into energy_dead → death this tick.
+    let _phase_drainage = tracing::info_span!("phase_drainage").entered();
+    let drain_count =
+        phase_drainage(chunks, chunks_x, chunks_y, max_x, max_y, wrap);
+    drop(_phase_drainage);
+    tracing::event!(
+        target: "phase",
+        tracing::Level::INFO,
+        drain_count,
+        "phase_drainage_done"
+    );
+
     // Phase 5: directed push. Production cells push surplus to parent, stems
     // split surplus across children, sprouts/seeds are terminal sinks. Build
     // a delta array from the current state, then apply atomically — removes
@@ -859,16 +874,16 @@ fn push_targets(occ: &Occupant) -> Vec<Direction> {
         Occupant::Leaf { parent, .. }
         | Occupant::Root { parent, .. }
         | Occupant::Antenna { parent, .. } => parent.iter().copied().collect(),
-        // Stem with children: push to them. Stem with no children: fall back
-        // to parent (leaf-like) — happens after pruning has stripped dead /
-        // dead-end children.
-        Occupant::Stem {
-            children, parent, ..
-        } => {
+        // Productive stems push to descendants. Dead-end stems (no
+        // children) don't push at all — their energy gets drained by
+        // their own parent stem in `phase_drainage`. This breaks the
+        // parent↔dead-end mutual flow that used to keep doomed plants
+        // alive on circulating energy.
+        Occupant::Stem { children, .. } => {
             if *children != 0 {
                 bitmask_to_dirs(*children)
             } else {
-                parent.iter().copied().collect()
+                Vec::new()
             }
         }
     }
@@ -891,27 +906,43 @@ fn is_kin_or_empty(occ: &Occupant, parent_plant: u32) -> bool {
     }
 }
 
-fn is_valid_child(occ: &Occupant, parent_plant: u32) -> bool {
+/// Keep a stem's `children` bit if the neighbor is a kin Sprout, Seed,
+/// or Stem of any state (productive or dead-end). Drop only on Empty
+/// or foreign — `phase_drainage` is responsible for pruning kin
+/// dead-end stems separately, with the energy transfer.
+///
+/// Without this looseness, a foreign sprout that grew into a freshly
+/// vacated child position would silently inherit the parent's bit.
+fn is_kin_descendable(occ: &Occupant, parent_plant: u32) -> bool {
     match occ {
-        // Seeds and sprouts are terminal sinks — both legitimately receive
-        // pushed energy. Stems with at least one valid child also count;
-        // stems with no children are dead-ends and get pruned.
-        //
-        // Plant id must match: if a foreign sprout invaded what used to
-        // be one of our children (via eat), prune drops the bit so we
-        // don't keep treating that foreign cell as kin.
-        Occupant::Sprout { plant, .. } | Occupant::Seed { plant, .. } => *plant == parent_plant,
-        Occupant::Stem {
-            plant, children, ..
-        } => *plant == parent_plant && *children != 0,
+        Occupant::Sprout { plant, .. }
+        | Occupant::Seed { plant, .. }
+        | Occupant::Stem { plant, .. } => *plant == parent_plant,
         _ => false,
     }
 }
 
-/// True for cells that have nowhere to push energy: stems with no children
-/// AND a missing/empty parent, plus any production cell (leaf, root, antenna)
-/// whose parent is missing/empty. Sprouts and seeds are sinks — they don't
-/// push, so this rule doesn't apply to them.
+/// True if the neighbor is a same-plant cell that's still alive
+/// (anything except Empty). Used to decide whether a stem's `parent`
+/// reference still points at something meaningful — when the parent
+/// has died/been replaced, the ref is cleared.
+fn is_kin_alive(occ: &Occupant, parent_plant: u32) -> bool {
+    match occ {
+        Occupant::Empty => false,
+        Occupant::Sprout { plant, .. }
+        | Occupant::Seed { plant, .. }
+        | Occupant::Stem { plant, .. }
+        | Occupant::Leaf { plant, .. }
+        | Occupant::Root { plant, .. }
+        | Occupant::Antenna { plant, .. } => *plant == parent_plant,
+    }
+}
+
+/// True for cells that have nowhere to push energy. Stems with no
+/// children and no parent are dead-ends — phase_prune already cleared
+/// the parent ref if the parent died, so we just check the field.
+/// Producers (leaf/root/antenna) check the parent neighbor directly,
+/// since their parent ref isn't auto-cleared by prune.
 fn cell_has_no_push_target(
     occ: &Occupant,
     chunks: &[Chunk],
@@ -922,39 +953,35 @@ fn cell_has_no_push_target(
     wy: i32,
     wrap: bool,
 ) -> bool {
-    let parent = match occ {
+    match occ {
         Occupant::Stem {
             children, parent, ..
-        } => {
-            if *children != 0 {
-                return false;
-            }
-            *parent
-        }
+        } => *children == 0 && parent.is_none(),
         Occupant::Leaf { parent, .. }
         | Occupant::Root { parent, .. }
-        | Occupant::Antenna { parent, .. } => *parent,
-        _ => return false,
-    };
-
-    let Some(parent_dir) = parent else {
-        return true;
-    };
-    let edge = CHUNK_EDGE as i32;
-    let (dx, dy) = direction_to_delta(parent_dir);
-    // Parent direction off the world edge → no parent → orphan.
-    let Some(nx) = in_bounds(wx + dx, max_x, wrap) else {
-        return true;
-    };
-    let Some(ny) = in_bounds(wy + dy, max_y, wrap) else {
-        return true;
-    };
-    let n_chunk_idx = (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
-    let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize) + (nx % edge) as usize;
-    matches!(
-        chunks[n_chunk_idx].cells[n_cell_idx].occupant,
-        Occupant::Empty
-    )
+        | Occupant::Antenna { parent, .. } => {
+            let Some(parent_dir) = parent else {
+                return true;
+            };
+            let edge = CHUNK_EDGE as i32;
+            let (dx, dy) = direction_to_delta(*parent_dir);
+            let Some(nx) = in_bounds(wx + dx, max_x, wrap) else {
+                return true;
+            };
+            let Some(ny) = in_bounds(wy + dy, max_y, wrap) else {
+                return true;
+            };
+            let n_chunk_idx =
+                (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
+            let n_cell_idx =
+                (ny % edge) as usize * (CHUNK_EDGE as usize) + (nx % edge) as usize;
+            matches!(
+                chunks[n_chunk_idx].cells[n_cell_idx].occupant,
+                Occupant::Empty
+            )
+        }
+        _ => false,
+    }
 }
 
 fn bit_to_dir(bit: u8) -> Direction {
@@ -1244,7 +1271,7 @@ fn phase_prune_pull(
         STEM_CONNECT_SOUTH,
         STEM_CONNECT_WEST,
     ];
-    let mut prune_changes: Vec<(usize, usize, u8, u8)> = Vec::new();
+    let mut prune_changes: Vec<(usize, usize, u8, u8, Option<Direction>)> = Vec::new();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
@@ -1262,13 +1289,34 @@ fn phase_prune_pull(
                             } => (*children, *connections, *plant, *parent),
                             _ => continue,
                         };
-                    if cur_children == 0 && cur_connections == 0 {
-                        continue;
-                    }
                     let wx = cx as i32 * edge + lx as i32;
                     let wy = cy as i32 * edge + ly as i32;
                     let mut kept_children = 0u8;
                     let mut kept_connections = 0u8;
+                    let mut new_parent = parent_dir;
+                    // Helper closure to read neighbor occupant once per dir.
+                    let neighbor_at = |dir: Direction| -> Option<&Occupant> {
+                        let (dx, dy) = direction_to_delta(dir);
+                        let nx = in_bounds(wx + dx, max_x, wrap)?;
+                        let ny = in_bounds(wy + dy, max_y, wrap)?;
+                        let n_chunk_idx =
+                            (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
+                        let n_cell_idx =
+                            (ny % edge) as usize * (CHUNK_EDGE as usize) + (nx % edge) as usize;
+                        Some(&chunks[n_chunk_idx].cells[n_cell_idx].occupant)
+                    };
+                    // Clear the parent ref if the parent neighbor has
+                    // died/been replaced. Otherwise a foreign cell that
+                    // grew where our parent was could silently "adopt"
+                    // us across plant boundaries.
+                    if let Some(p_dir) = parent_dir {
+                        let alive = neighbor_at(p_dir)
+                            .map(|n| is_kin_alive(n, parent_plant))
+                            .unwrap_or(false);
+                        if !alive {
+                            new_parent = None;
+                        }
+                    }
                     for bit in bits {
                         let in_children = cur_children & bit != 0;
                         let in_connections = cur_connections & bit != 0;
@@ -1276,24 +1324,15 @@ fn phase_prune_pull(
                             continue;
                         }
                         let dir = bit_to_dir(bit);
-                        let same_as_parent = Some(dir) == parent_dir;
-                        let (dx, dy) = direction_to_delta(dir);
-                        let neighbor_occ = match (
-                            in_bounds(wx + dx, max_x, wrap),
-                            in_bounds(wy + dy, max_y, wrap),
-                        ) {
-                            (Some(nx), Some(ny)) => {
-                                let n_chunk_idx =
-                                    (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
-                                let n_cell_idx = (ny % edge) as usize * (CHUNK_EDGE as usize)
-                                    + (nx % edge) as usize;
-                                Some(&chunks[n_chunk_idx].cells[n_cell_idx].occupant)
-                            }
-                            _ => None,
-                        };
+                        let same_as_parent = Some(dir) == new_parent;
+                        let neighbor_occ = neighbor_at(dir);
                         if in_children {
+                            // Drop the bit at Empty/foreign so a new
+                            // plant that spawns there doesn't get
+                            // adopted as our child. Kin dead-end stems
+                            // are kept here and handled by phase_drainage.
                             if let Some(n) = neighbor_occ {
-                                if is_valid_child(n, parent_plant) {
+                                if is_kin_descendable(n, parent_plant) {
                                     kept_children |= bit;
                                 }
                             }
@@ -1309,26 +1348,130 @@ fn phase_prune_pull(
                             }
                         }
                     }
-                    if kept_children != cur_children || kept_connections != cur_connections {
-                        prune_changes.push((chunk_idx, cell_idx, kept_children, kept_connections));
+                    if kept_children != cur_children
+                        || kept_connections != cur_connections
+                        || new_parent != parent_dir
+                    {
+                        prune_changes.push((
+                            chunk_idx,
+                            cell_idx,
+                            kept_children,
+                            kept_connections,
+                            new_parent,
+                        ));
                     }
                 }
             }
         }
     }
     let prune_change_count = prune_changes.len() as u64;
-    for (chunk_idx, cell_idx, new_children, new_connections) in prune_changes {
+    for (chunk_idx, cell_idx, new_children, new_connections, new_parent) in prune_changes {
         if let Occupant::Stem {
             children,
             connections,
+            parent,
             ..
         } = &mut chunks[chunk_idx].cells[cell_idx].occupant
         {
             *children = new_children;
             *connections = new_connections;
+            *parent = new_parent;
         }
     }
     prune_change_count
+}
+
+/// Drain energy from dead-end stem children into their parent stem,
+/// dropping the parent's `children` bit pointing at each drained
+/// child. Returns the number of drained pairs (for tracing).
+///
+/// "Dead-end" = same-plant Stem with `children == 0`. After this phase
+/// the drained child has `energy = 0`, which `phase_death` then catches
+/// via the `energy_dead` rule. The bit drop also prevents the
+/// productive parent from re-pushing energy back into the corpse in
+/// the same tick's `phase_push`.
+fn phase_drainage(
+    chunks: &mut [Chunk],
+    chunks_x: u32,
+    chunks_y: u32,
+    max_x: i32,
+    max_y: i32,
+    wrap: bool,
+) -> u64 {
+    let edge = CHUNK_EDGE as i32;
+    let bits = [
+        STEM_CONNECT_NORTH,
+        STEM_CONNECT_EAST,
+        STEM_CONNECT_SOUTH,
+        STEM_CONNECT_WEST,
+    ];
+    // Gather (parent, child, bit) triples first; apply after, since we
+    // both read child.energy and write parent.energy/children — can't
+    // hold two &mut to chunks at once.
+    let mut drain_actions: Vec<(usize, usize, usize, usize, u8)> = Vec::new();
+    for cy in 0..chunks_y {
+        for cx in 0..chunks_x {
+            for ly in 0..(CHUNK_EDGE as usize) {
+                for lx in 0..(CHUNK_EDGE as usize) {
+                    let chunk_idx = cy as usize * chunks_x as usize + cx as usize;
+                    let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
+                    let (cur_children, parent_plant) = match &chunks[chunk_idx].cells[cell_idx]
+                        .occupant
+                    {
+                        Occupant::Stem { children, plant, .. } if *children != 0 => {
+                            (*children, *plant)
+                        }
+                        _ => continue,
+                    };
+                    let wx = cx as i32 * edge + lx as i32;
+                    let wy = cy as i32 * edge + ly as i32;
+                    for bit in bits {
+                        if cur_children & bit == 0 {
+                            continue;
+                        }
+                        let dir = bit_to_dir(bit);
+                        let (dx, dy) = direction_to_delta(dir);
+                        let Some(nx) = in_bounds(wx + dx, max_x, wrap) else {
+                            continue;
+                        };
+                        let Some(ny) = in_bounds(wy + dy, max_y, wrap) else {
+                            continue;
+                        };
+                        let n_chunk_idx =
+                            (ny / edge) as usize * chunks_x as usize + (nx / edge) as usize;
+                        let n_cell_idx =
+                            (ny % edge) as usize * (CHUNK_EDGE as usize) + (nx % edge) as usize;
+                        let drain = matches!(
+                            &chunks[n_chunk_idx].cells[n_cell_idx].occupant,
+                            Occupant::Stem { children: 0, plant, .. }
+                                if *plant == parent_plant
+                        );
+                        if drain {
+                            drain_actions.push((chunk_idx, cell_idx, n_chunk_idx, n_cell_idx, bit));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let drain_count = drain_actions.len() as u64;
+    for (p_chunk, p_cell, n_chunk, n_cell, bit) in drain_actions {
+        let drained = match &mut chunks[n_chunk].cells[n_cell].occupant {
+            Occupant::Stem { energy, .. } => {
+                let drained = *energy;
+                *energy = 0;
+                drained
+            }
+            _ => continue,
+        };
+        if let Occupant::Stem { energy, children, .. } =
+            &mut chunks[p_chunk].cells[p_cell].occupant
+        {
+            *energy = energy.saturating_add(drained);
+            *children &= !bit;
+        }
+    }
+    drain_count
 }
 
 /// Pull-pattern growth phase. Each sprout decides which destinations
@@ -2474,7 +2617,7 @@ mod tests {
     }
 
     #[test]
-    fn is_valid_child_only_for_sinks() {
+    fn is_kin_descendable_keeps_kin_sprouts_seeds_stems() {
         let sprout = Occupant::Sprout {
             plant: 1,
             clan: 0,
@@ -2515,21 +2658,18 @@ mod tests {
             genome: Box::new(Genome::default_vine()),
             parent: None,
         };
-        // Same-plant: all sinks valid.
-        assert!(is_valid_child(&sprout, 1));
-        assert!(
-            is_valid_child(&seed, 1),
-            "seeds receive energy like sprouts"
-        );
-        assert!(is_valid_child(&stem_with_kids, 1));
-        assert!(!is_valid_child(&stem_no_kids, 1));
-        assert!(!is_valid_child(&leaf, 1));
-        assert!(!is_valid_child(&Occupant::Empty, 1));
-        // Different-plant: even valid sinks are blocked. Lets prune
-        // naturally sever cells that got eaten by a foreign plant.
-        assert!(!is_valid_child(&sprout, 2));
-        assert!(!is_valid_child(&seed, 2));
-        assert!(!is_valid_child(&stem_with_kids, 2));
+        // Kin sprouts/seeds/stems are descendable; dead-end stems are
+        // also kept here (phase_drainage handles those separately).
+        assert!(is_kin_descendable(&sprout, 1));
+        assert!(is_kin_descendable(&seed, 1));
+        assert!(is_kin_descendable(&stem_with_kids, 1));
+        assert!(is_kin_descendable(&stem_no_kids, 1));
+        // Producers and Empty are not children-bit targets.
+        assert!(!is_kin_descendable(&leaf, 1));
+        assert!(!is_kin_descendable(&Occupant::Empty, 1));
+        // Different-plant: blocked even for sinks.
+        assert!(!is_kin_descendable(&sprout, 2));
+        assert!(!is_kin_descendable(&stem_with_kids, 2));
     }
 
     #[test]
@@ -2573,7 +2713,10 @@ mod tests {
             parent: Some(Direction::South),
             children: 0,
         };
-        assert_eq!(push_targets(&stem_no_kids), vec![Direction::South]);
+        assert!(
+            push_targets(&stem_no_kids).is_empty(),
+            "dead-end stems don't push up — phase_drainage handles them"
+        );
 
         let sprout = Occupant::Sprout {
             plant: 1,
@@ -3876,10 +4019,10 @@ mod tests {
     #[test]
     fn phase_prune_cascades_one_link_per_tick() {
         // Chain A → B → C with a sprout at the tip that already died (cell
-        // at sprout position is Empty). Prune is a single-pass local rule:
-        // each stem reads its 3×3 neighborhood and drops invalid bits.
-        // That means each tick advances the cascade by exactly one stem,
-        // tip-side first.
+        // at sprout position is Empty). Prune drops C's tip-bit when it
+        // sees Empty; phase_drainage then drains C's energy back into B
+        // and drops B's bit pointing at C — all in tick 1. C dies via
+        // energy_dead at end of tick 1. Then tick 2 collapses B → A.
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         // Head A (parent=None, points north at B).
@@ -3943,9 +4086,11 @@ mod tests {
             out
         };
 
-        // Tick 1: only the tip C sees an Empty neighbor → drops its N bit.
-        // B and A still see the chain intact during the compute pass and
-        // keep their bits.
+        // Tick 1: tip C sees Empty north → drops its N bit. Drainage
+        // sees C as a kin dead-end and drains it to 0; B drops its bit
+        // pointing at C in the same step. C dies via energy_dead. B
+        // still has its parent ref to A (A is alive kin), so B
+        // survives this tick as a parent-only stem.
         mutate_world(
             &mut chunks,
             1,
@@ -3956,33 +4101,9 @@ mod tests {
         );
         assert_eq!(
             snap(&chunks),
-            [
-                (true, STEM_CONNECT_NORTH),
-                (true, STEM_CONNECT_NORTH),
-                (true, 0),
-            ],
-            "after tick 1 only C should have pruned"
+            [(true, STEM_CONNECT_NORTH), (true, 0), (false, 0)],
+            "after tick 1 C should be drained + dead, B's child bit cleared"
         );
-
-        // Tick 2: B now sees C with children=0 → drops its N bit. A still
-        // sees B with N (B's update happens in this tick's apply pass).
-        mutate_world(
-            &mut chunks,
-            1,
-            1,
-            &test_params(),
-            &AtomicU32::new(1),
-            &mut det_rng(),
-        );
-        assert_eq!(
-            snap(&chunks),
-            [(true, STEM_CONNECT_NORTH), (true, 0), (true, 0)],
-            "after tick 2 B should also have pruned"
-        );
-
-        // After this point, the cascade keeps unfolding but other phases
-        // (death, energy redistribution) start firing too — that's
-        // covered by orphan/death tests, not this prune-shape test.
     }
 
     #[test]
