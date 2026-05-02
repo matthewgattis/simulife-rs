@@ -55,29 +55,35 @@ The server starts paused so you can attach a viewer first; press the **Resume** 
 - **Right-click**: cell context menu (spawn sprout, etc.)
 - **Space**: toggle pause
 - **`.`**: step one tick (also pauses)
-- **Status panel**: pause/resume, tick rate slider, layer toggles, regenerate-world dialog
+- **`1`..`3`**: toggle Organic / Energy / Occupants layers
+- **`4` / `5`**: cycle Occupant tint (default ↔ clan ↔ mutation rate)
+- **`H`**: hide/show the Status panel
+- **Status panel** (collapsibles): Sim controls, Layers, Sim params (live-tunable scalars), Cursor inspector. Click *Regenerate…* to open the world-gen dialog.
 
 ## Simulation rules (high level)
 
 Each tick runs phases in order:
 
-1. **Photosynthesis** — sunlit Leaves gain energy.
-2. **Soil regulation** — `soil_energy` drifts toward 100 by 1/tick.
-3. **Soil pulls** — Roots pull organic, Antennas pull soil energy from a 3×3 kernel.
-4. **Upkeep** — every occupant pays its fixed energy cost.
-5. **Prune** — Stems drop child bits whose neighbor isn't a valid sink.
-6. **Push** — Leaves/Antennas/Roots push surplus to parent; Stems split between children. Sprouts and Seeds are terminal sinks.
-7. **Seed germination** — Seeds become Sprouts when energy reaches threshold or the parent stem dies. The new Sprout enters the same tick's growth phase.
-8. **Growth** — Sprouts execute their current gene, spawning slot products at front/left/right. Genome is mutated on every copy. Sprouts can eat foreign Leaf/Antenna/Sprout/Seed cells (Roots and Stems are inviolate). Frustrated sprouts die in place.
-9. **Death** — zero-energy, orphaned, or poisoned cells die. Death deposits both organic (kernel weights) and the cell's own energy (distributed across the kernel, integer-divided to avoid manufacturing energy).
+1. **Photosynthesis** — sunlit Leaves gain `leaf_photosynthesis` energy.
+2. **Soil regulation** — `soil_energy` drifts toward `soil_energy_rest` by `soil_energy_regulation`/tick.
+3. **Soil pulls** — Roots pull organic, Antennas pull soil energy from a 3×3 bell kernel scaled by `root_pull_scale` / `antenna_pull_scale`.
+4. **Upkeep** — every occupant pays its fixed energy cost (separate scalars for sprouts, seeds, default).
+5. **Prune** — Stems drop child / connection bits whose neighbor is Empty or foreign. Also clears the `parent` ref when the parent neighbor died.
+6. **Drainage** — productive parent stems pull energy out of any kin Stem child with `children == 0`, dropping the bit at the same time. One-way flow; the dead-end ends the tick at energy 0 and dies via energy_dead in phase 9.
+7. **Push** — Leaves/Antennas/Roots push surplus to parent; Stems split between children. Dead-end Stems with a parent push up (drainage prevents mutual flow). Sprouts and Seeds are terminal sinks.
+8. **Seed germination** — Seeds become Sprouts when energy reaches `seed_dropoff_threshold` or the parent stem dies. The new Sprout enters the same tick's growth phase.
+9. **Growth** — Sprouts execute their current gene, spawning slot products at front/left/right. Genome is mutated on every copy (rate clamped to `[MUTATION_RATE_MIN, MUTATION_RATE_MAX]`). Sprouts can eat foreign Leaf/Antenna/Sprout/Seed cells (Roots and Stems are inviolate). Frustrated sprouts die in place.
+10. **Death** — zero-energy, stranded (no children + no parent), or poisoned cells die. Death deposits both organic (kernel weights) and the cell's own energy across a 3×3 bell kernel scaled by `death_deposit_scale`.
 
-**Soil toxicity**: when soil organic > 300, only Roots survive in that cell. When soil_energy > 200, only Antennas survive. Both poisons → nobody.
+**Soil toxicity** is governed by `soil_organic_poison` and `soil_energy_poison`. When organic exceeds the threshold, everything except Roots dies in that cell; when soil_energy exceeds, everything except Antennas dies; both poisoned → nobody.
 
-**Multi-client**: any number of viewers can connect. Sim controls (pause, tick rate, regenerate) are server-authoritative — a control change from one viewer broadcasts a fresh `Welcome` so every viewer's UI reflects the same state.
+**Live tuning**: every numeric scalar above lives on `SimParams` (live, takes effect next tick) or `WorldGenParams` (regen-time only). Both are edited from the viewer's Status panel and persisted in the world snapshot. The `world_wrap` toggle on `SimParams` switches edges between toroidal and hard-walled — also live.
+
+**Multi-client**: any number of viewers can connect. Sim controls (pause, tick rate, params, regenerate) are server-authoritative — any control change broadcasts a fresh `Welcome` so every viewer's UI mirror updates.
 
 ## Persistence
 
-`--world-file <path>` enables periodic auto-saves and a final shutdown save. The format is zstd-compressed msgpack of a `WorldSnapshot` with `seed`, full RNG state, current tick, plant id counter, and chunks. A `.bak` rotation keeps the previous good copy.
+`--world-file <path>` enables periodic auto-saves and a final shutdown save. The format is zstd-compressed msgpack of a `WorldSnapshot { version, chunks_x/y, next_plant_id, current_tick, chunks, seed, rng, sim_params, world_gen_params }`. A `.bak` rotation keeps the previous good copy. The `version` field allows non-additive schema changes; pure additions are forward-compatible via `#[serde(default)]` so older snapshots load with missing fields defaulted.
 
 ## Profiling
 

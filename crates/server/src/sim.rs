@@ -2177,7 +2177,10 @@ mod tests {
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
-        let (sprout, genome) = vine_sprout(100);
+        // Default-vine gene 0 = front:Sprout, left:Leaf, right:Leaf.
+        // Cost = COST_SPROUT + 2*COST_LEAF; give the sprout headroom.
+        let starting_energy = COST_SPROUT + 2 * COST_LEAF + 50;
+        let (sprout, _genome) = vine_sprout(starting_energy);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         phase_growth_pull(
@@ -2218,7 +2221,7 @@ mod tests {
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
-        let (sprout, genome) = vine_sprout(100);
+        let (sprout, _genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 0, sprout);
 
         phase_growth_pull(
@@ -2267,7 +2270,7 @@ mod tests {
         place(&mut chunks, chunks_x, 9, 10, blocker());
         place(&mut chunks, chunks_x, 11, 10, blocker());
 
-        let (sprout, genome) = vine_sprout(100);
+        let (sprout, _genome) = vine_sprout(100);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         phase_growth_pull(
@@ -2313,7 +2316,12 @@ mod tests {
             },
         );
 
-        let (sprout, genome) = seed_front_sprout(40);
+        // Pool must strictly exceed COST_SEED for the sprout to grow.
+        // Give it just-enough headroom so the test holds across cost
+        // tuning changes.
+        let foreign_leaf_energy: Energy = 50;
+        let own_energy = (COST_SEED + 10).saturating_sub(foreign_leaf_energy);
+        let (sprout, _genome) = seed_front_sprout(own_energy);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         phase_growth_pull(
@@ -2327,8 +2335,8 @@ mod tests {
             &mut det_rng(),
         );
 
-        // Pool: 40 own + 50 harvested = 90. Subtract COST_SEED.
-        let expected = 90u32.saturating_sub(COST_SEED as u32) as Energy;
+        let pool = own_energy + foreign_leaf_energy;
+        let expected = pool - COST_SEED;
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
             Occupant::Stem { plant, energy, .. } => {
                 assert_eq!(plant, 1, "stem belongs to eater plant");
@@ -2441,7 +2449,7 @@ mod tests {
             },
         );
 
-        let (sprout, genome) = seed_front_sprout(40);
+        let (sprout, _genome) = seed_front_sprout(40);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         phase_growth_pull(
@@ -2513,8 +2521,11 @@ mod tests {
         );
 
         // Plant 1's sprout (front=Seed) eats (10, 9). Only Seed slots can
-        // eat under the current rule.
-        let (sprout, _genome) = seed_front_sprout(40);
+        // eat under the current rule. Give it enough energy that
+        // (own + harvested) strictly exceeds COST_SEED.
+        let foreign_leaf_energy: Energy = 50;
+        let own_energy = (COST_SEED + 10).saturating_sub(foreign_leaf_energy);
+        let (sprout, _genome) = seed_front_sprout(own_energy);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         // Run growth, then run prune. With pull-pattern there's no
@@ -2569,7 +2580,7 @@ mod tests {
         let mut chunks = empty_world(chunks_x, 1);
         let max = CHUNK_EDGE as i32;
         // Vine cost = sprout(20) + leaf(5) + leaf(5) = 30. 5 is well below.
-        let (sprout, genome) = vine_sprout(5);
+        let (sprout, _genome) = vine_sprout(5);
         place(&mut chunks, chunks_x, 10, 10, sprout);
 
         phase_growth_pull(
@@ -3466,12 +3477,12 @@ mod tests {
     #[test]
     fn phase_upkeep_decreases_total_system_energy() {
         // Leaf (not sunlit) → sprout sink. No photo, no soil.
-        // Pre: leaf=4, sprout=10. Total 14.
-        // upkeep: leaf -2, sprout -4. leaf=2, sprout=6. Total 8.
-        // push: leaf cur=2, buffer=2 → no push.
-        // Post: leaf=2, sprout=6. Total 8.
+        // Both cells pay upkeep; neither has surplus to push (each
+        // sits at exactly its upkeep buffer post-deduction).
         let chunks_x = 1u32;
         let mut chunks = empty_world(chunks_x, 1);
+        let leaf_pre = UPKEEP_DEFAULT * 2;
+        let sprout_pre = UPKEEP_SPROUT * 2;
         place(
             &mut chunks,
             chunks_x,
@@ -3480,7 +3491,7 @@ mod tests {
             Occupant::Leaf {
                 plant: 1,
                 clan: 0,
-                energy: 4,
+                energy: leaf_pre,
                 facing: Direction::North,
                 parent: Some(Direction::South),
             },
@@ -3493,7 +3504,7 @@ mod tests {
             Occupant::Sprout {
                 plant: 1,
                 clan: 0,
-                energy: 10,
+                energy: sprout_pre,
                 facing: Direction::South,
                 genome: Box::new(Genome::default_vine()),
                 parent: Some(Direction::North),
@@ -3510,12 +3521,14 @@ mod tests {
             &mut det_rng(),
         );
 
+        // Leaf: pre - upkeep, then push surplus (= cur - buffer = 0
+        // after one upkeep deduction since pre = 2*UPKEEP_DEFAULT).
         match cell_at(&chunks, chunks_x, 10, 10).occupant {
-            Occupant::Leaf { energy, .. } => assert_eq!(energy, 2),
+            Occupant::Leaf { energy, .. } => assert_eq!(energy, UPKEEP_DEFAULT),
             ref other => panic!("leaf gone: {other:?}"),
         }
         match &cell_at(&chunks, chunks_x, 10, 11).occupant {
-            Occupant::Sprout { energy, .. } => assert_eq!(*energy, 6),
+            Occupant::Sprout { energy, .. } => assert_eq!(*energy, UPKEEP_SPROUT),
             other => panic!("sprout gone: {other:?}"),
         }
     }
