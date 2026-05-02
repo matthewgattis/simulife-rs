@@ -119,13 +119,18 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| ChaCha12Rng::seed_from_u64(seed));
     info!(seed, "world seed");
-    // Snapshots may carry different chunks_x/y than the CLI args — the
-    // SimState uses whatever is in the snapshot.
-    let world_gen_params = protocol::WorldGenParams {
+    // Pre-v2 snapshots don't carry world-gen params; reconstruct from
+    // the snapshot's chunks_x/y plus defaults so the runtime mirror
+    // matches the world that was actually built.
+    let world_gen_params = initial.world_gen_params.unwrap_or(protocol::WorldGenParams {
         chunks_x: initial.chunks_x,
         chunks_y: initial.chunks_y,
         ..initial_world_gen
-    };
+    });
+    // Pre-v2 snapshots don't carry sim params either; fall back to
+    // defaults. Newer snapshots restore exactly what was tuned in the
+    // session that wrote them.
+    let sim_params = initial.sim_params.unwrap_or_default();
     if fresh_world {
         let count = world::place_random_sprout_grid(
             &mut initial.chunks,
@@ -151,7 +156,7 @@ async fn main() -> Result<()> {
         }),
         seed: AtomicU64::new(seed),
         rng: std::sync::Mutex::new(rng),
-        params: std::sync::Mutex::new(protocol::SimParams::default()),
+        params: std::sync::Mutex::new(sim_params),
         world_gen_params: std::sync::Mutex::new(world_gen_params),
     });
 

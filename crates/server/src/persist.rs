@@ -4,10 +4,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use protocol::Chunk;
+use protocol::{Chunk, SimParams, WorldGenParams};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::sim::SimState;
 use crate::world;
@@ -15,8 +15,22 @@ use crate::world;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const ZSTD_LEVEL: i32 = 3;
 
+/// Bumps when `WorldSnapshot`'s shape changes in a non-additive way
+/// (i.e., a field's meaning changes, or a field is removed). Pure
+/// additions are forward-compatible via `#[serde(default)]` on the new
+/// field; older files load with the missing field defaulted. Older
+/// versions are still loadable but `load_world` warns and the caller
+/// can run a migration. Current schema:
+///   v1 — original (no version field, defaults to 0 on load).
+///   v2 — added sim_params, world_gen_params (Option, defaulted None).
+const SNAPSHOT_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 pub struct WorldSnapshot {
+    /// File-format version. Missing on pre-version snapshots, which
+    /// default to 0; we treat 0 as v1 for migration purposes.
+    #[serde(default)]
+    pub version: u32,
     pub chunks_x: u32,
     pub chunks_y: u32,
     pub next_plant_id: u32,
@@ -31,6 +45,14 @@ pub struct WorldSnapshot {
     /// rebuilds a fresh RNG from `seed` in that case.
     #[serde(default)]
     pub rng: Option<ChaCha12Rng>,
+    /// Live-tunable scalars at save time. `None` on pre-v2 snapshots —
+    /// caller falls back to `SimParams::default()`.
+    #[serde(default)]
+    pub sim_params: Option<SimParams>,
+    /// World-gen knobs that built the current world. `None` on pre-v2
+    /// snapshots — caller derives from chunks_x/chunks_y + defaults.
+    #[serde(default)]
+    pub world_gen_params: Option<WorldGenParams>,
 }
 
 pub fn load_world(path: &Path) -> Result<WorldSnapshot> {
@@ -43,6 +65,7 @@ pub fn load_world(path: &Path) -> Result<WorldSnapshot> {
     let snapshot: WorldSnapshot = rmp_serde::from_slice(&payload)?;
     info!(
         path = %path.display(),
+        version = snapshot.version,
         on_disk = raw.len(),
         decoded = payload.len(),
         chunks = snapshot.chunks.len(),
@@ -51,11 +74,25 @@ pub fn load_world(path: &Path) -> Result<WorldSnapshot> {
         next_plant_id = snapshot.next_plant_id,
         "world loaded",
     );
+    if snapshot.version > SNAPSHOT_VERSION {
+        warn!(
+            file_version = snapshot.version,
+            current_version = SNAPSHOT_VERSION,
+            "snapshot was written by a newer build; some fields may be ignored",
+        );
+    } else if snapshot.version < SNAPSHOT_VERSION {
+        info!(
+            file_version = snapshot.version,
+            current_version = SNAPSHOT_VERSION,
+            "loaded older snapshot; missing fields fall back to defaults",
+        );
+    }
     Ok(snapshot)
 }
 
 pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
     let snapshot = WorldSnapshot {
+        version: SNAPSHOT_VERSION,
         chunks_x: state.chunks_x.load(Ordering::Relaxed),
         chunks_y: state.chunks_y.load(Ordering::Relaxed),
         next_plant_id: state.next_plant_id.load(Ordering::Relaxed),
@@ -63,6 +100,13 @@ pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
         chunks: state.world.lock().expect("sim lock poisoned").clone(),
         seed: Some(state.seed.load(Ordering::Relaxed)),
         rng: Some(state.rng.lock().expect("rng lock poisoned").clone()),
+        sim_params: Some(*state.params.lock().expect("params poisoned")),
+        world_gen_params: Some(
+            *state
+                .world_gen_params
+                .lock()
+                .expect("world_gen_params poisoned"),
+        ),
     };
     let raw = rmp_serde::to_vec(&snapshot)?;
     let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd encode")?;
@@ -70,6 +114,7 @@ pub fn save_world(path: &Path, state: &SimState) -> Result<()> {
     let ratio = raw.len() as f64 / compressed.len().max(1) as f64;
     info!(
         path = %path.display(),
+        version = SNAPSHOT_VERSION,
         on_disk = compressed.len(),
         uncompressed = raw.len(),
         ratio = format!("{ratio:.1}x"),
@@ -89,6 +134,7 @@ pub fn load_or_build(
     }
     let chunks = world::build_world(initial_params);
     Ok(WorldSnapshot {
+        version: SNAPSHOT_VERSION,
         chunks_x: initial_params.chunks_x,
         chunks_y: initial_params.chunks_y,
         next_plant_id: 1,
@@ -96,6 +142,8 @@ pub fn load_or_build(
         chunks,
         seed: None,
         rng: None,
+        sim_params: None,
+        world_gen_params: Some(*initial_params),
     })
 }
 
@@ -185,6 +233,7 @@ mod tests {
             current_gene: 4,
         };
         WorldSnapshot {
+            version: SNAPSHOT_VERSION,
             chunks_x: 1,
             chunks_y: 1,
             next_plant_id: 42,
@@ -192,6 +241,8 @@ mod tests {
             chunks,
             seed: Some(0xABCD_1234),
             rng: Some(rand_chacha::ChaCha12Rng::seed_from_u64(0xABCD_1234)),
+            sim_params: Some(SimParams::default()),
+            world_gen_params: Some(WorldGenParams::default()),
         }
     }
 
