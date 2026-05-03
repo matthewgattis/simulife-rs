@@ -161,6 +161,7 @@ impl RenderState {
         sim_tick_hz: &mut u32,
         sim_tick_rate_limited: &mut bool,
         sim_tick: u64,
+        sim_tps: f32,
         sim_params: &mut SimParams,
         world_gen_params: &WorldGenParams,
         cursor_px: Option<glam::Vec2>,
@@ -211,6 +212,7 @@ impl RenderState {
                     sim_tick_hz,
                     sim_tick_rate_limited,
                     sim_tick,
+                    sim_tps,
                     sim_params,
                     world_gen_params,
                     regen_dialog,
@@ -837,6 +839,7 @@ fn draw_ui(
     sim_tick_hz: &mut u32,
     sim_tick_rate_limited: &mut bool,
     sim_tick: u64,
+    sim_tps: f32,
     sim_params: &mut SimParams,
     world_gen_params: &WorldGenParams,
     regen_dialog: &mut Option<RegenDialog>,
@@ -884,7 +887,12 @@ fn draw_ui(
             egui::CollapsingHeader::new("Sim")
                 .default_open(true)
                 .show(ui, |ui| {
-                    ui.label(format!("Tick: {sim_tick}"));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Tick: {sim_tick}"));
+                        if sim_tps.is_finite() {
+                            ui.label(format!("({sim_tps:.1} tps)"));
+                        }
+                    });
                     ui.horizontal(|ui| {
                         let label = if *sim_paused { "Resume" } else { "Pause" };
                         if ui.button(label).clicked() {

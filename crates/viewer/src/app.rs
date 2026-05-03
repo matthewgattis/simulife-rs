@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -102,6 +103,14 @@ pub struct App {
     sim_tick_hz: u32,
     sim_tick_rate_limited: bool,
     sim_tick: u64,
+    /// Rolling 1-second window of (when-received, tick-number) pairs
+    /// used to derive sim TPS. Each tick event pushes one entry;
+    /// entries older than 1 s drop off the front.
+    tps_samples: VecDeque<(Instant, u64)>,
+    /// Most recently computed TPS — refreshed at most once per second
+    /// so the UI readout doesn't flicker. NaN until enough data lands.
+    sim_tps: f32,
+    last_tps_update: Option<Instant>,
     sim_params: SimParams,
     world_gen_params: WorldGenParams,
     centered_once: bool,
@@ -145,6 +154,9 @@ impl App {
             sim_tick_hz: 10,
             sim_tick_rate_limited: false,
             sim_tick: 0,
+            tps_samples: VecDeque::new(),
+            sim_tps: f32::NAN,
+            last_tps_update: None,
             sim_params: SimParams::default(),
             world_gen_params: WorldGenParams::default(),
             centered_once: false,
@@ -160,6 +172,42 @@ impl App {
             rt,
             network_started: false,
             tick_metrics,
+        }
+    }
+}
+
+impl App {
+    /// Record one tick reception, drop expired samples, and refresh
+    /// the displayed TPS at most once per second. Computes TPS as
+    /// `(latest_tick - oldest_tick_in_window) / (latest_time -
+    /// oldest_time)` over the rolling 1-second window — robust to
+    /// drops (uses tick numbers, not sample counts) and to brief
+    /// pauses (window naturally shrinks).
+    fn record_tick(&mut self, tick: u64) {
+        let now = Instant::now();
+        self.tps_samples.push_back((now, tick));
+        let window = Duration::from_secs(1);
+        while let Some(&(t, _)) = self.tps_samples.front() {
+            if now.duration_since(t) > window {
+                self.tps_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let due = self
+            .last_tps_update
+            .map(|t| now.duration_since(t) >= window)
+            .unwrap_or(true);
+        if due {
+            if let (Some(&(t0, n0)), Some(&(t1, n1))) =
+                (self.tps_samples.front(), self.tps_samples.back())
+            {
+                let dt = t1.duration_since(t0).as_secs_f32();
+                if dt > 0.0 && n1 > n0 {
+                    self.sim_tps = (n1 - n0) as f32 / dt;
+                    self.last_tps_update = Some(now);
+                }
+            }
         }
     }
 }
@@ -257,6 +305,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|t| t.elapsed().as_micros() as u64)
                     .unwrap_or(0);
                 self.sim_tick = tick;
+                self.record_tick(tick);
                 let upload_us = if let Some(state) = self.state.as_mut() {
                     let _upload_span = tracing::info_span!("upload_chunks").entered();
                     let t = self.tick_metrics.then(Instant::now);
@@ -306,6 +355,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|t| t.elapsed().as_micros() as u64)
                     .unwrap_or(0);
                 self.sim_tick = tick;
+                self.record_tick(tick);
                 let upload_us = if let Some(state) = self.state.as_mut() {
                     let _upload_span = tracing::info_span!("upload_chunks").entered();
                     let t = self.tick_metrics.then(Instant::now);
@@ -491,6 +541,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &mut self.sim_tick_hz,
                     &mut self.sim_tick_rate_limited,
                     self.sim_tick,
+                    self.sim_tps,
                     &mut self.sim_params,
                     &self.world_gen_params,
                     self.last_cursor,
