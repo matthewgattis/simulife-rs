@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
         world_gen_params: std::sync::Mutex::new(world_gen_params),
         latest_snapshot: sim::LatestSnapshot::new(),
         always_encode: args.always_encode,
+        world_gen: AtomicU32::new(0),
     });
 
     info!(

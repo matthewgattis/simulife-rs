@@ -70,6 +70,27 @@ pub struct SimState {
     /// wire-chunk build + publish if `tick_tx.receiver_count() == 0`,
     /// saving the encode cost on idle servers.
     pub always_encode: bool,
+    /// Bumped each time `regenerate_world` swaps the world out from
+    /// under the sim. The sim tags every published snapshot with the
+    /// generation observed at publish time; the encoder re-checks
+    /// against the live generation right before broadcasting and
+    /// drops any encoded delta whose snapshot was built against an
+    /// already-replaced world. Without this, an old-world delta in
+    /// flight when a regenerate fires can land at the viewer *after*
+    /// the regenerate's direct ChunkBatch and clobber correct state.
+    pub world_gen: AtomicU32,
+}
+
+/// One sim snapshot in flight between the sim loop and the encoder.
+/// `world_gen` is sampled at publish time so the encoder can tell
+/// whether the world it's about to broadcast is still current — see
+/// `run_encode_loop` for the staleness check that protects viewers
+/// from old-world deltas arriving after a regenerate.
+#[derive(Debug)]
+pub struct Snapshot {
+    pub tick: u64,
+    pub world_gen: u32,
+    pub chunks: Vec<protocol::WireChunk>,
 }
 
 /// Single-slot "drop old, keep latest" handoff between the sim loop
@@ -77,7 +98,7 @@ pub struct SimState {
 /// non-blocking and overwrites any unread snapshot; encoder's `take`
 /// awaits the next publish and consumes the value.
 pub struct LatestSnapshot {
-    inner: std::sync::Mutex<Option<(u64, Vec<protocol::WireChunk>)>>,
+    inner: std::sync::Mutex<Option<Snapshot>>,
     notify: tokio::sync::Notify,
 }
 
@@ -89,14 +110,14 @@ impl LatestSnapshot {
         }
     }
 
-    pub fn publish(&self, value: (u64, Vec<protocol::WireChunk>)) {
+    pub fn publish(&self, value: Snapshot) {
         // Replaces any unread snapshot — old `Vec` drops here. Sim
         // never waits.
         *self.inner.lock().expect("snapshot poisoned") = Some(value);
         self.notify.notify_one();
     }
 
-    pub async fn take(&self) -> (u64, Vec<protocol::WireChunk>) {
+    pub async fn take(&self) -> Snapshot {
         loop {
             // Register the wait BEFORE checking the slot so a publish
             // that races between check and await still wakes us.
@@ -216,7 +237,11 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
                 // its place. Sim throughput is no longer gated on zstd
                 // time.
                 let _publish = tracing::info_span!("publish_snapshot").entered();
-                state.latest_snapshot.publish((tick, snapshot_chunks));
+                state.latest_snapshot.publish(Snapshot {
+                    tick,
+                    world_gen: state.world_gen.load(Ordering::Relaxed),
+                    chunks: snapshot_chunks,
+                });
             }
         }
 
@@ -239,7 +264,12 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
 pub async fn run_encode_loop(state: Arc<SimState>) {
     let mut prev_wire_chunks: Vec<protocol::WireChunk> = Vec::new();
     loop {
-        let (tick, curr) = state.latest_snapshot.take().await;
+        let snap = state.latest_snapshot.take().await;
+        let Snapshot {
+            tick,
+            world_gen: snap_gen,
+            chunks: curr,
+        } = snap;
         // Move the heavy diff + msgpack + zstd onto the blocking
         // thread pool. Without this, tokio's cooperative scheduler
         // tends to coalesce the encode task onto the same worker as
@@ -283,6 +313,26 @@ pub async fn run_encode_loop(state: Arc<SimState>) {
             },
         )
         .await;
+        // Re-check the world generation right before broadcasting. If
+        // it bumped while we were encoding, the snapshot we just
+        // produced reflects a world the viewers no longer have —
+        // regenerate's direct ChunkBatch already gave them the new
+        // one — and shipping our stale ChunkDelta would clobber it.
+        // Drop the bytes and reset the diff baseline so the next
+        // snapshot triggers a full send via the size-mismatch path.
+        let cur_gen = state.world_gen.load(Ordering::Relaxed);
+        if snap_gen != cur_gen {
+            prev_wire_chunks = Vec::new();
+            tracing::event!(
+                target: "phase",
+                tracing::Level::INFO,
+                tick,
+                snap_gen,
+                cur_gen,
+                "encode_dropped_stale_gen"
+            );
+            continue;
+        }
         match job {
             Ok((new_prev, Some(bytes))) => {
                 prev_wire_chunks = new_prev;
@@ -323,6 +373,10 @@ pub fn regenerate_world(state: &SimState, seed: u64, params: WorldGenParams) {
     state.seed.store(seed, Ordering::Relaxed);
     state.next_plant_id.store(count + 1, Ordering::Relaxed);
     state.current_tick.store(0, Ordering::Relaxed);
+    // Bump the world generation so any encoder snapshot still in
+    // flight against the *previous* world gets dropped before its
+    // bytes hit the wire.
+    state.world_gen.fetch_add(1, Ordering::Relaxed);
     info!(seed, chunks_x, chunks_y, "world regenerated");
 
     let (paused, tick_hz, tick_rate_limited) = {

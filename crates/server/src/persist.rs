@@ -272,6 +272,7 @@ mod tests {
             world_gen_params: Mutex::new(protocol::WorldGenParams::default()),
             latest_snapshot: crate::sim::LatestSnapshot::new(),
             always_encode: false,
+            world_gen: AtomicU32::new(0),
         }
     }
 
