@@ -524,15 +524,32 @@ pub enum ServerMessage {
 /// data we send.
 const SERVER_MSG_ZSTD_LEVEL: i32 = 1;
 
-/// Encode a `ServerMessage` for the wire: msgpack, then zstd. Symmetric
-/// with [`decode_server_message`].
+/// Worker threads zstd uses internally for ChunkBatch encoding. zstd
+/// splits the input into independently-compressed jobs across this many
+/// worker threads — most of the per-tick zstd cost is parallelizable on
+/// our 14 MB+ inputs. 0 = single-threaded (no extra threads spawned).
+const SERVER_MSG_ZSTD_WORKERS: u32 = 4;
+
+/// Encode a `ServerMessage` for the wire: msgpack, then zstd (with
+/// libzstd's internal multi-threading). Symmetric with
+/// [`decode_server_message`].
 pub fn encode_server_message(msg: &ServerMessage) -> std::io::Result<Vec<u8>> {
+    use std::io::Write;
+
     let raw = {
         let _span = tracing::info_span!("encode_msgpack").entered();
         rmp_serde::to_vec(msg).map_err(std::io::Error::other)?
     };
     let _span = tracing::info_span!("encode_zstd", raw_bytes = raw.len()).entered();
-    zstd::encode_all(&raw[..], SERVER_MSG_ZSTD_LEVEL)
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), SERVER_MSG_ZSTD_LEVEL)?;
+    if SERVER_MSG_ZSTD_WORKERS > 0 {
+        // Best-effort: if the linked libzstd was built without
+        // ZSTD_MULTITHREAD support this errors silently and we fall
+        // back to single-threaded compression.
+        let _ = encoder.multithread(SERVER_MSG_ZSTD_WORKERS);
+    }
+    encoder.write_all(&raw)?;
+    encoder.finish()
 }
 
 /// Decode a `ServerMessage` from the wire: zstd, then msgpack.
