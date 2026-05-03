@@ -166,12 +166,33 @@ async fn run_session(
                                 read_us,
                                 decode_us,
                                 inter_arrival_us,
-                                "tick received"
+                                "tick received (full)"
                             );
                         } else {
-                            debug!(count = chunks.len(), tick, "tick chunk batch");
+                            debug!(count = chunks.len(), tick, "tick chunk batch (full)");
                         }
                         let _ = proxy.send_event(UserEvent::Chunks { tick, chunks });
+                    }
+                    ServerMessage::ChunkDelta { tick, chunks } => {
+                        if tick_metrics {
+                            let now = Instant::now();
+                            let inter_arrival_us = last_tick_arrival
+                                .map(|t| now.duration_since(t).as_micros() as u64)
+                                .unwrap_or(0);
+                            last_tick_arrival = Some(now);
+                            info!(
+                                tick,
+                                bytes,
+                                read_us,
+                                decode_us,
+                                inter_arrival_us,
+                                dirty = chunks.len(),
+                                "tick received (delta)"
+                            );
+                        } else {
+                            debug!(dirty = chunks.len(), tick, "tick chunk delta");
+                        }
+                        let _ = proxy.send_event(UserEvent::ChunksDelta { tick, chunks });
                     }
                     ServerMessage::Welcome {
                         world_chunks_x,

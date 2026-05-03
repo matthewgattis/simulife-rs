@@ -23,7 +23,12 @@ use crate::render::{
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Network(NetworkStatus),
+    /// Full snapshot — replace local chunks vec wholesale. Sent on
+    /// initial Subscribe and after a regenerate.
     Chunks { tick: u64, chunks: Vec<WireChunk> },
+    /// Per-tick delta — overlay each delta chunk onto the local vec
+    /// by `coord`. Chunks not in the delta keep their previous state.
+    ChunksDelta { tick: u64, chunks: Vec<WireChunk> },
     Shutdown,
 }
 
@@ -265,6 +270,55 @@ impl ApplicationHandler<UserEvent> for App {
                         .map(|t| t.elapsed().as_micros() as u64)
                         .unwrap_or(0);
                     info!(tick, assign_us, upload_us, total_us, "tick applied");
+                }
+            }
+            UserEvent::ChunksDelta { tick, chunks: delta } => {
+                let _apply_span = tracing::info_span!("tick_apply_delta", tick).entered();
+                let dispatch_start = self.tick_metrics.then(Instant::now);
+                let dirty = delta.len();
+                // Overlay each delta chunk onto the local vec by
+                // coord. Chunks_x derived from current network status
+                // gives us O(1) index; we fall back to linear search
+                // if dims are unknown (shouldn't happen post-Welcome).
+                let world_chunks_x = match &self.network {
+                    NetworkStatus::Connected { world_chunks_x, .. } => Some(*world_chunks_x),
+                    _ => None,
+                };
+                let assign_start = self.tick_metrics.then(Instant::now);
+                for incoming in delta {
+                    let target_idx = match world_chunks_x {
+                        Some(wx) => Some(
+                            (incoming.coord.y as usize) * (wx as usize)
+                                + (incoming.coord.x as usize),
+                        ),
+                        None => self
+                            .chunks
+                            .iter()
+                            .position(|c| c.coord == incoming.coord),
+                    };
+                    if let Some(idx) = target_idx {
+                        if let Some(slot) = self.chunks.get_mut(idx) {
+                            *slot = incoming;
+                        }
+                    }
+                }
+                let assign_us = assign_start
+                    .map(|t| t.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
+                self.sim_tick = tick;
+                let upload_us = if let Some(state) = self.state.as_mut() {
+                    let _upload_span = tracing::info_span!("upload_chunks").entered();
+                    let t = self.tick_metrics.then(Instant::now);
+                    state.upload_chunks(&self.chunks);
+                    t.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0)
+                } else {
+                    0
+                };
+                if self.tick_metrics {
+                    let total_us = dispatch_start
+                        .map(|t| t.elapsed().as_micros() as u64)
+                        .unwrap_or(0);
+                    info!(tick, dirty, assign_us, upload_us, total_us, "delta applied");
                 }
             }
         }

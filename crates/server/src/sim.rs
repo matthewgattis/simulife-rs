@@ -216,10 +216,38 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
 /// previous one is still being encoded get dropped via the slot's
 /// publish-overwrite semantic.
 pub async fn run_encode_loop(state: Arc<SimState>) {
+    let mut prev_wire_chunks: Vec<protocol::WireChunk> = Vec::new();
     loop {
-        let (tick, chunks) = state.latest_snapshot.take().await;
+        let (tick, curr) = state.latest_snapshot.take().await;
         let _tick_span = tracing::info_span!("encode_tick", tick).entered();
-        let msg = ServerMessage::ChunkBatch { tick, chunks };
+        // Compute per-chunk diff against the previous broadcast.
+        // Falls back to "everything is new" on size mismatch (regen
+        // resized the world) — viewers overlay each chunk by coord
+        // either way, so the larger payload is still correct.
+        let dirty: Vec<protocol::WireChunk> = {
+            let _diff = tracing::info_span!("compute_diff").entered();
+            if prev_wire_chunks.len() != curr.len() {
+                curr.clone()
+            } else {
+                curr.iter()
+                    .zip(prev_wire_chunks.iter())
+                    .filter(|(c, p)| c.cells != p.cells)
+                    .map(|(c, _)| c.clone())
+                    .collect()
+            }
+        };
+        let dirty_count = dirty.len();
+        let total = curr.len();
+        prev_wire_chunks = curr;
+        tracing::event!(
+            target: "phase",
+            tracing::Level::INFO,
+            tick,
+            dirty_count,
+            total,
+            "chunk_diff"
+        );
+        let msg = ServerMessage::ChunkDelta { tick, chunks: dirty };
         let encode = tracing::info_span!("encode_msg").entered();
         match protocol::encode_server_message(&msg) {
             Ok(bytes) => {

@@ -299,7 +299,7 @@ pub struct Chunk {
 /// minus the genome, which dominates msgpack work for sprouts/seeds. The
 /// viewer doesn't need genomes to render, so we strip them at emit time
 /// and surface them via a separate request when the user inspects a cell.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum WireOccupant {
     Empty,
     Leaf {
@@ -346,7 +346,7 @@ pub enum WireOccupant {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WireCell {
     pub organic: u16,
     pub soil_energy: u16,
@@ -355,7 +355,7 @@ pub struct WireCell {
     pub occupant: WireOccupant,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WireChunk {
     pub coord: ChunkCoord,
     pub cells: Vec<WireCell>,
@@ -514,6 +514,15 @@ pub enum ServerMessage {
         world_gen_params: WorldGenParams,
     },
     ChunkBatch {
+        tick: u64,
+        chunks: Vec<WireChunk>,
+    },
+    /// Per-tick incremental update: contains only the chunks whose
+    /// contents differ from what the server last broadcast. The
+    /// viewer should overlay these on its local chunk vec by `coord`.
+    /// Initial Subscribe still gets a full `ChunkBatch`; deltas only
+    /// flow on the live tick stream.
+    ChunkDelta {
         tick: u64,
         chunks: Vec<WireChunk>,
     },
