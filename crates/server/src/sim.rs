@@ -219,44 +219,61 @@ pub async fn run_encode_loop(state: Arc<SimState>) {
     let mut prev_wire_chunks: Vec<protocol::WireChunk> = Vec::new();
     loop {
         let (tick, curr) = state.latest_snapshot.take().await;
-        let _tick_span = tracing::info_span!("encode_tick", tick).entered();
-        // Compute per-chunk diff against the previous broadcast.
-        // Falls back to "everything is new" on size mismatch (regen
-        // resized the world) — viewers overlay each chunk by coord
-        // either way, so the larger payload is still correct.
-        let dirty: Vec<protocol::WireChunk> = {
-            let _diff = tracing::info_span!("compute_diff").entered();
-            if prev_wire_chunks.len() != curr.len() {
-                curr.clone()
-            } else {
-                curr.iter()
-                    .zip(prev_wire_chunks.iter())
-                    .filter(|(c, p)| c.cells != p.cells)
-                    .map(|(c, _)| c.clone())
-                    .collect()
-            }
-        };
-        let dirty_count = dirty.len();
-        let total = curr.len();
-        prev_wire_chunks = curr;
-        tracing::event!(
-            target: "phase",
-            tracing::Level::INFO,
-            tick,
-            dirty_count,
-            total,
-            "chunk_diff"
-        );
-        let msg = ServerMessage::ChunkDelta { tick, chunks: dirty };
-        let encode = tracing::info_span!("encode_msg").entered();
-        match protocol::encode_server_message(&msg) {
-            Ok(bytes) => {
-                drop(encode);
+        // Move the heavy diff + msgpack + zstd onto the blocking
+        // thread pool. Without this, tokio's cooperative scheduler
+        // tends to coalesce the encode task onto the same worker as
+        // the sim loop — both monopolize their worker between awaits,
+        // so they end up serializing instead of running in parallel.
+        // spawn_blocking guarantees a separate OS thread.
+        let prev = std::mem::take(&mut prev_wire_chunks);
+        let job = tokio::task::spawn_blocking(
+            move || -> (Vec<protocol::WireChunk>, Option<Vec<u8>>) {
+                let _tick_span = tracing::info_span!("encode_tick", tick).entered();
+                // Compute per-chunk diff against the previous
+                // broadcast. Falls back to "everything is new" on size
+                // mismatch (regen resized the world) — viewers overlay
+                // each chunk by coord either way.
+                let dirty: Vec<protocol::WireChunk> = {
+                    let _diff = tracing::info_span!("compute_diff").entered();
+                    if prev.len() != curr.len() {
+                        curr.clone()
+                    } else {
+                        curr.iter()
+                            .zip(prev.iter())
+                            .filter(|(c, p)| c.cells != p.cells)
+                            .map(|(c, _)| c.clone())
+                            .collect()
+                    }
+                };
+                let dirty_count = dirty.len();
+                let total = curr.len();
+                tracing::event!(
+                    target: "phase",
+                    tracing::Level::INFO,
+                    tick,
+                    dirty_count,
+                    total,
+                    "chunk_diff"
+                );
+                let msg = ServerMessage::ChunkDelta { tick, chunks: dirty };
+                let _encode = tracing::info_span!("encode_msg").entered();
+                let bytes = protocol::encode_server_message(&msg).ok();
+                (curr, bytes)
+            },
+        )
+        .await;
+        match job {
+            Ok((new_prev, Some(bytes))) => {
+                prev_wire_chunks = new_prev;
                 let _broadcast =
                     tracing::info_span!("broadcast", bytes = bytes.len()).entered();
                 let _ = state.tick_tx.send(Arc::new(bytes));
             }
-            Err(e) => error!("serialize tick failed: {e:#}"),
+            Ok((new_prev, None)) => {
+                prev_wire_chunks = new_prev;
+                error!("serialize tick {tick} failed");
+            }
+            Err(e) => error!("encode task join failed: {e:#}"),
         }
     }
 }
