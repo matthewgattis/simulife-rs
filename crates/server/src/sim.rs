@@ -64,6 +64,12 @@ pub struct SimState {
     /// can't keep up, intermediate snapshots are dropped (sim never
     /// blocks on encode).
     pub latest_snapshot: LatestSnapshot,
+    /// When true, sim publishes a snapshot every tick regardless of
+    /// whether any viewers are connected — useful for profiling /
+    /// unattended runs. When false (default), the sim skips the
+    /// wire-chunk build + publish if `tick_tx.receiver_count() == 0`,
+    /// saving the encode cost on idle servers.
+    pub always_encode: bool,
 }
 
 /// Single-slot "drop old, keep latest" handoff between the sim loop
@@ -169,7 +175,15 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
         {
             let _tick_span = tracing::info_span!("tick", tick).entered();
 
-            let snapshot_chunks: Vec<protocol::WireChunk> = {
+            // Skip the wire-chunk build + publish if nobody is listening.
+            // Sim still mutates the world (the simulation must progress
+            // for the world to evolve); we just don't pay the ~2 ms
+            // to_wire_chunks + downstream encode cost when no viewer
+            // would ever consume it. `--always-encode` forces it on
+            // for profiling / unattended runs.
+            let publish_this_tick =
+                state.always_encode || state.tick_tx.receiver_count() > 0;
+            let snapshot_chunks: Option<Vec<protocol::WireChunk>> = {
                 let params = *state.params.lock().expect("params poisoned");
                 let mut chunks = state.world.lock().expect("sim lock poisoned");
                 let mut rng = state.rng.lock().expect("rng lock poisoned");
@@ -183,20 +197,27 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
                     &mut *rng,
                 );
                 drop(_mutate);
-                // Build the wire view directly from the locked world.
-                // Avoids cloning the full Chunks (with their
-                // Box<Genome>s) just to serialize a stripped version.
-                let _wire = tracing::info_span!("to_wire_chunks").entered();
-                chunks.iter().map(protocol::WireChunk::from).collect()
+                if publish_this_tick {
+                    // Build the wire view directly from the locked world.
+                    // Avoids cloning the full Chunks (with their
+                    // Box<Genome>s) just to serialize a stripped version.
+                    let _wire = tracing::info_span!("to_wire_chunks").entered();
+                    Some(chunks.iter().map(protocol::WireChunk::from).collect())
+                } else {
+                    None
+                }
             };
             state.current_tick.store(tick, Ordering::Relaxed);
 
-            // Hand the snapshot off to the encode loop. publish() is
-            // non-blocking: if the encoder hasn't drained the previous
-            // tick yet, it gets dropped here and the new one takes its
-            // place. Sim throughput is no longer gated on zstd time.
-            let _publish = tracing::info_span!("publish_snapshot").entered();
-            state.latest_snapshot.publish((tick, snapshot_chunks));
+            if let Some(snapshot_chunks) = snapshot_chunks {
+                // Hand the snapshot off to the encode loop. publish() is
+                // non-blocking: if the encoder hasn't drained the previous
+                // tick yet, it gets dropped here and the new one takes
+                // its place. Sim throughput is no longer gated on zstd
+                // time.
+                let _publish = tracing::info_span!("publish_snapshot").entered();
+                state.latest_snapshot.publish((tick, snapshot_chunks));
+            }
         }
 
         // When tick_rate_limited is off there's no `.await` in this

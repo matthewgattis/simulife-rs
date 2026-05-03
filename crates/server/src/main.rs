@@ -89,6 +89,14 @@ struct Args {
     /// trace data without manual intervention.
     #[arg(long)]
     profile_duration_secs: Option<u64>,
+
+    /// Force the encode pipeline to run every tick even when no
+    /// viewers are connected. Off by default — sim still ticks, but
+    /// the wire-chunk build, diff, msgpack, and zstd are skipped to
+    /// save CPU on long-running idle servers. Use this for profiling
+    /// or when you want trace events for an unattended run.
+    #[arg(long)]
+    always_encode: bool,
 }
 
 #[tokio::main]
@@ -159,6 +167,7 @@ async fn main() -> Result<()> {
         params: std::sync::Mutex::new(sim_params),
         world_gen_params: std::sync::Mutex::new(world_gen_params),
         latest_snapshot: sim::LatestSnapshot::new(),
+        always_encode: args.always_encode,
     });
 
     info!(
