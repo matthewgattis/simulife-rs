@@ -213,6 +213,14 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drop GPU resources while the display connection is still alive.
+        // On Linux (X11/Wayland), deferring this to normal struct drop
+        // causes a segfault because winit tears down the display before
+        // wgpu's Surface destructor runs.
+        self.state = None;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Reactive mode: idle blocks the event loop. Redraws happen only
         // when egui asks (via repaint_delay after each render) or when we

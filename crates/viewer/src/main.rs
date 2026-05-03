@@ -2,7 +2,7 @@ mod app;
 mod net;
 mod render;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, process, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
 
     let mut app = App::new(
-        rt,
+        rt.clone(),
         proxy,
         args.server_addr,
         outgoing_tx,
@@ -69,7 +69,15 @@ fn main() -> Result<()> {
         args.tick_metrics,
     );
     event_loop.run_app(&mut app)?;
-    Ok(())
+
+    // GPU resources were already released in `App::exiting()` (while the
+    // display connection was still live). On Linux, further teardown of the
+    // quinn QUIC endpoint's background UDP tasks races with the tokio
+    // runtime drop and segfaults. A hard exit is safe here — all important
+    // state (trace flush guard, etc.) lives on the stack above us.
+    drop(app);
+    drop(rt);
+    process::exit(0);
 }
 
 fn init_tracing(trace_chrome: Option<&std::path::Path>) -> Option<FlushGuard> {
