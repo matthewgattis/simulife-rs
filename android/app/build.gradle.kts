@@ -22,6 +22,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Sign release builds with the debug keystore so we can adb-install
+            // them locally. NOT for distribution — Play Store requires a real
+            // upload key.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
