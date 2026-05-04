@@ -73,10 +73,12 @@ mod android {
     use crate::app::UserEvent;
     use crate::{RunOptions, run_with_event_loop};
 
-    /// Hardcoded server address for the Android build. `10.0.2.2` is the
-    /// emulator's alias for the host machine's loopback; on a physical
-    /// device, change this to the LAN IP of whatever runs the server.
-    const ANDROID_SERVER_ADDR: &str = "10.0.2.2:4433";
+    /// Hardcoded server address for the Android build. The LAN IP of the
+    /// machine running the server. (`10.0.2.2` would route to host loopback
+    /// from the emulator, but the emulator's Vulkan driver currently
+    /// segfaults wgpu, so physical-device testing is the path of least
+    /// resistance and a LAN IP works for both cases.)
+    const ANDROID_SERVER_ADDR: &str = "192.168.0.49:4433";
 
     #[unsafe(no_mangle)]
     fn android_main(app: AndroidApp) {
