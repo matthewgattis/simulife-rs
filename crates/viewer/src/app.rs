@@ -335,8 +335,19 @@ impl ApplicationHandler<UserEvent> for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Android destroys the GPU surface when the app backgrounds; drop
         // wgpu state so we don't render to a dead surface. resumed() will
-        // recreate it (and skip the network re-spawn via network_started).
+        // recreate it.
         self.state = None;
+
+        // Tear down the network task too: holding a QUIC connection (with
+        // 2s keep-alives) while backgrounded burns battery and data, and
+        // the server gets to free the slot. Replacing self.outgoing with a
+        // fresh channel drops the old sender; the task's outgoing.recv()
+        // returns None and it exits cleanly. resumed() will spawn a new one.
+        let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.outgoing = new_tx;
+        self.pending_outgoing_rx = Some(new_rx);
+        self.network_started = false;
+        self.network = NetworkStatus::Connecting(None);
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
