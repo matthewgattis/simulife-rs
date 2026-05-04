@@ -123,10 +123,28 @@ impl Camera {
         anchor_pixel: glam::Vec2,
         window_size: glam::Vec2,
     ) {
+        self.zoom_pan_around(factor, anchor_pixel, anchor_pixel, window_size);
+    }
+
+    /// Combined zoom + pan: scale `cells_visible_y` by `factor` (clamped)
+    /// and shift `center` so the world point that was under `old_pivot`
+    /// is now under `new_pivot`. Reduces to `zoom_around` when the pivots
+    /// are equal. Used by two-finger pinch where the midpoint between
+    /// fingers can both move (pan) and change in spread (zoom) on the
+    /// same frame.
+    pub fn zoom_pan_around(
+        &mut self,
+        factor: f32,
+        old_pivot: glam::Vec2,
+        new_pivot: glam::Vec2,
+        window_size: glam::Vec2,
+    ) {
         let old_cells = self.cells_visible_y;
         let new_cells = (old_cells * factor).clamp(4.0, 4096.0);
-        let offset = anchor_pixel - window_size * 0.5;
-        self.center += offset * (old_cells - new_cells) / window_size.y.max(1.0);
+        let win_y = window_size.y.max(1.0);
+        let half = window_size * 0.5;
+        self.center +=
+            ((old_pivot - half) * old_cells - (new_pivot - half) * new_cells) / win_y;
         self.cells_visible_y = new_cells;
     }
 }
@@ -263,6 +281,7 @@ impl App {
                     let last_a = self.touches[&ids[0]].last_pos;
                     let last_b = self.touches[&ids[1]].last_pos;
                     let last_dist = (last_a - last_b).length();
+                    let last_mid = (last_a + last_b) * 0.5;
 
                     if let Some(t) = self.touches.get_mut(&touch.id) {
                         t.last_pos = pos;
@@ -280,15 +299,16 @@ impl App {
                     let new_a = self.touches[&ids[0]].last_pos;
                     let new_b = self.touches[&ids[1]].last_pos;
                     let new_dist = (new_a - new_b).length();
+                    let new_mid = (new_a + new_b) * 0.5;
 
                     if last_dist > 1.0 && new_dist > 1.0 {
                         let factor = last_dist / new_dist;
-                        let mid = (new_a + new_b) * 0.5;
                         let win_size = glam::vec2(
                             state.width().max(1) as f32,
                             state.height().max(1) as f32,
                         );
-                        self.camera.zoom_around(factor, mid, win_size);
+                        self.camera
+                            .zoom_pan_around(factor, last_mid, new_mid, win_size);
                         state.window().request_redraw();
                     }
                 }
@@ -833,6 +853,22 @@ mod tests {
         assert!(approx_eq(cam.center.x, center_before.x));
         assert!(approx_eq(cam.center.y, center_before.y));
         assert!(approx_eq(cam.cells_visible_y, 32.0));
+    }
+
+    #[test]
+    fn zoom_pan_around_moves_old_pivot_world_to_new_pivot() {
+        let mut cam = Camera {
+            center: glam::vec2(50.0, 30.0),
+            cells_visible_y: 64.0,
+        };
+        let win = glam::vec2(800.0, 600.0);
+        let old_pivot = glam::vec2(200.0, 450.0);
+        let new_pivot = glam::vec2(350.0, 200.0);
+        let world_under_old = cam.pixel_to_world(old_pivot, win);
+        cam.zoom_pan_around(0.7, old_pivot, new_pivot, win);
+        let world_under_new = cam.pixel_to_world(new_pivot, win);
+        assert!(approx_eq(world_under_old.x, world_under_new.x));
+        assert!(approx_eq(world_under_old.y, world_under_new.y));
     }
 
     #[test]
