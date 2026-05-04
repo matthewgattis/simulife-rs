@@ -114,18 +114,6 @@ impl Camera {
         self.center + offset * cells_per_pixel
     }
 
-    /// Apply a zoom factor anchored at `anchor_pixel`: scale
-    /// `cells_visible_y` by `factor` (clamped to [4, 4096]) and shift
-    /// `center` so the world point under `anchor_pixel` stays put.
-    pub fn zoom_around(
-        &mut self,
-        factor: f32,
-        anchor_pixel: glam::Vec2,
-        window_size: glam::Vec2,
-    ) {
-        self.zoom_pan_around(factor, anchor_pixel, anchor_pixel, window_size);
-    }
-
     /// Combined zoom + pan: scale `cells_visible_y` by `factor` (clamped)
     /// and shift `center` so the world point that was under `old_pivot`
     /// is now under `new_pivot`. Reduces to `zoom_around` when the pivots
@@ -827,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_around_keeps_anchor_world_position_invariant() {
+    fn zoom_pan_around_with_same_pivot_keeps_anchor_world_position() {
         let mut cam = Camera {
             center: glam::vec2(50.0, 30.0),
             cells_visible_y: 64.0,
@@ -835,21 +823,21 @@ mod tests {
         let win = glam::vec2(800.0, 600.0);
         let anchor = glam::vec2(200.0, 450.0);
         let world_before = cam.pixel_to_world(anchor, win);
-        cam.zoom_around(0.5, anchor, win);
+        cam.zoom_pan_around(0.5, anchor, anchor, win);
         let world_after = cam.pixel_to_world(anchor, win);
         assert!(approx_eq(world_before.x, world_after.x));
         assert!(approx_eq(world_before.y, world_after.y));
     }
 
     #[test]
-    fn zoom_around_window_center_leaves_camera_center_fixed() {
+    fn zoom_pan_around_at_window_center_leaves_camera_center_fixed() {
         let mut cam = Camera {
             center: glam::vec2(50.0, 30.0),
             cells_visible_y: 64.0,
         };
         let win = glam::vec2(800.0, 600.0);
         let center_before = cam.center;
-        cam.zoom_around(0.5, win * 0.5, win);
+        cam.zoom_pan_around(0.5, win * 0.5, win * 0.5, win);
         assert!(approx_eq(cam.center.x, center_before.x));
         assert!(approx_eq(cam.center.y, center_before.y));
         assert!(approx_eq(cam.cells_visible_y, 32.0));
@@ -872,13 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn zoom_around_clamps_cells_visible_y() {
+    fn zoom_pan_around_clamps_cells_visible_y() {
         let mut cam = Camera {
             center: glam::vec2(0.0, 0.0),
             cells_visible_y: 8.0,
         };
         let win = glam::vec2(800.0, 600.0);
-        cam.zoom_around(0.1, win * 0.5, win);
+        cam.zoom_pan_around(0.1, win * 0.5, win * 0.5, win);
         assert!(approx_eq(cam.cells_visible_y, 4.0));
     }
 
