@@ -69,9 +69,14 @@ struct TouchPoint {
     start_pos: glam::Vec2,
     start_time: Instant,
     last_pos: glam::Vec2,
-    /// Set true once this touch has participated in a multi-touch gesture
-    /// (pinch). Prevents the long-press handler from firing on lift.
-    consumed_by_gesture: bool,
+    /// Set at touch-down if the press landed on an egui panel/popup. Stays
+    /// true for the touch's lifetime; suppresses canvas pan/pinch/long-press
+    /// so the user can drag a slider or tap a button without affecting the
+    /// world view.
+    started_over_ui: bool,
+    /// Set during 2-finger pinch. Suppresses long-press on lift but does
+    /// NOT suppress further pinch updates the way `started_over_ui` would.
+    pinched: bool,
 }
 
 const LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
@@ -215,13 +220,15 @@ impl App {
 
         match touch.phase {
             TouchPhase::Started => {
+                let started_over_ui = state.point_over_ui(pos);
                 self.touches.insert(
                     touch.id,
                     TouchPoint {
                         start_pos: pos,
                         start_time: Instant::now(),
                         last_pos: pos,
-                        consumed_by_gesture: false,
+                        started_over_ui,
+                        pinched: false,
                     },
                 );
             }
@@ -229,7 +236,14 @@ impl App {
                 2 => {
                     // Pinch zoom: take old inter-touch distance, update this
                     // touch, take new distance, scale camera by the ratio.
+                    // Skip if either finger landed on UI so widget drags
+                    // (sliders, dialog moves) don't double as canvas zooms.
                     let ids: Vec<u64> = self.touches.keys().copied().collect();
+                    let any_started_over_ui = self
+                        .touches
+                        .values()
+                        .any(|t| t.started_over_ui);
+
                     let last_a = self.touches[&ids[0]].last_pos;
                     let last_b = self.touches[&ids[1]].last_pos;
                     let last_dist = (last_a - last_b).length();
@@ -237,8 +251,14 @@ impl App {
                     if let Some(t) = self.touches.get_mut(&touch.id) {
                         t.last_pos = pos;
                     }
+                    // Flag both as having pinched so long-press doesn't
+                    // fire when the second finger lifts.
                     for t in self.touches.values_mut() {
-                        t.consumed_by_gesture = true;
+                        t.pinched = true;
+                    }
+
+                    if any_started_over_ui {
+                        return;
                     }
 
                     let new_a = self.touches[&ids[0]].last_pos;
@@ -256,6 +276,9 @@ impl App {
                     if let Some(t) = self.touches.get_mut(&touch.id) {
                         let delta = pos - t.last_pos;
                         t.last_pos = pos;
+                        if t.started_over_ui {
+                            return;
+                        }
                         let cells_per_pixel =
                             self.camera.cells_visible_y / state.height().max(1) as f32;
                         self.camera.center -= delta * cells_per_pixel;
@@ -266,7 +289,7 @@ impl App {
             },
             TouchPhase::Ended | TouchPhase::Cancelled => {
                 if let Some(t) = self.touches.remove(&touch.id) {
-                    if t.consumed_by_gesture {
+                    if t.started_over_ui || t.pinched {
                         return;
                     }
                     let held = t.start_time.elapsed();

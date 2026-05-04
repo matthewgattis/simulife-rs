@@ -150,6 +150,23 @@ impl RenderState {
             .upload_chunks(&self.device, &self.queue, chunks);
     }
 
+    /// True if `physical_pos` falls over an interactive egui layer
+    /// (Window / popup / menu / tooltip). Lets the input handler suppress
+    /// canvas pan and pinch gestures when the user is interacting with UI.
+    ///
+    /// Background-order layers are excluded — egui maintains an implicit
+    /// background area that covers the whole screen for click-to-dismiss
+    /// behavior, and counting it would mark every touch as UI.
+    pub fn point_over_ui(&self, physical_pos: glam::Vec2) -> bool {
+        let scale = self.window.scale_factor() as f32;
+        let logical = physical_pos / scale.max(1.0);
+        let pos = egui::pos2(logical.x, logical.y);
+        match self.egui_ctx.layer_id_at(pos) {
+            Some(id) => id.order != egui::Order::Background,
+            None => false,
+        }
+    }
+
     pub fn render(
         &mut self,
         network: &NetworkStatus,
@@ -846,9 +863,9 @@ fn draw_ui(
     outgoing: &UnboundedSender<ClientMessage>,
 ) {
     egui::Window::new("Status")
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 40.0))
         .resizable(false)
-        .collapsible(false)
+        .collapsible(true)
         .show(ctx, |ui| {
             match network {
                 NetworkStatus::Connecting(None) => {
