@@ -391,6 +391,12 @@ impl ApplicationHandler<UserEvent> for App {
         self.pending_outgoing_rx = Some(new_rx);
         self.network_started = false;
         self.network = NetworkStatus::Connecting(None);
+
+        // Drop the cached world. The server resends a full snapshot via
+        // Welcome+Subscribe on every reconnect, so we'd just be holding
+        // chunks * CHUNK_AREA bytes of stale state in RAM otherwise.
+        self.chunks = Vec::new();
+        self.tps_samples.clear();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
