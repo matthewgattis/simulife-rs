@@ -221,6 +221,13 @@ impl ApplicationHandler<UserEvent> for App {
         self.state = None;
     }
 
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // Android destroys the GPU surface when the app backgrounds; drop
+        // wgpu state so we don't render to a dead surface. resumed() will
+        // recreate it (and skip the network re-spawn via network_started).
+        self.state = None;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Reactive mode: idle blocks the event loop. Redraws happen only
         // when egui asks (via repaint_delay after each render) or when we
