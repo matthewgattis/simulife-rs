@@ -10,7 +10,9 @@ Inspired by [this cellular-automata video](https://youtu.be/q2uuMY37JuA): each c
 crates/
   protocol/   wire types + msgpack/zstd codecs (no_async, no GPU)
   server/     simulation + QUIC listener + persistence
-  viewer/     wgpu/winit/egui client
+  viewer/     wgpu/winit/egui client (desktop bin + Android cdylib)
+android/      Gradle project that bundles libviewer.so into an APK
+docs/         build/deploy notes (currently: Android)
 scripts/
   analyze-trace.sh   summarises a tracing-chrome JSON trace
 ```
@@ -50,15 +52,30 @@ The server starts paused so you can attach a viewer first; press the **Resume** 
 
 ### Viewer controls
 
-- **Drag**: pan camera
-- **Scroll**: zoom
-- **Right-click**: cell context menu (spawn sprout, etc.)
+- **Drag** (mouse) / **one-finger drag** (touch): pan camera
+- **Scroll** (mouse) / **two-finger pinch** (touch): zoom — pinch anchors on the midpoint between fingers and pans with it as the midpoint moves
+- **Right-click** (mouse) / **long-press** (touch, ~500 ms): cell context menu (spawn sprout, etc.)
 - **Space**: toggle pause
 - **`.`**: step one tick (also pauses)
 - **`1`..`3`**: toggle Organic / Energy / Occupants layers
 - **`4` / `5`**: cycle Occupant tint (default ↔ clan ↔ mutation rate)
 - **`H`**: hide/show the Status panel
-- **Status panel** (collapsibles): Sim controls, Layers, Sim params (live-tunable scalars), Cursor inspector. Click *Regenerate…* to open the world-gen dialog.
+- **Status panel** (collapsibles): Sim controls, Layers, Sim params (live-tunable scalars), Cursor inspector. Click *Regenerate…* to open the world-gen dialog. Tap the title bar (Android) to collapse to just the title.
+
+Touches that land over a panel/popup go to egui — canvas pan/pinch/long-press are suppressed for them so widget drags (sliders, dialog moves) don't fight the camera.
+
+### Android
+
+The viewer also builds as a `cdylib` (`libviewer.so`) for ARM64 Android via cargo-ndk; a minimal Gradle project under `android/` packages it into an APK. The server is unchanged — the phone connects to it over the LAN like any other QUIC client.
+
+```sh
+./android/build_apk.sh --release        # builds .so + APK
+adb install -r android/app/build/outputs/apk/release/app-release.apk
+```
+
+The Android build's server address is hardcoded in `crates/viewer/src/lib.rs` (`ANDROID_SERVER_ADDR`); change and rebuild to retarget. The viewer disconnects from the server on background and reconnects on foreground (the cached world is dropped to free RAM; the server resends a fresh snapshot on reconnect).
+
+See [`docs/android.md`](docs/android.md) for one-time toolchain setup, install/launch/log commands, and the common failure modes.
 
 ## Simulation rules (high level)
 
