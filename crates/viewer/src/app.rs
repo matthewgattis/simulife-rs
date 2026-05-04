@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
@@ -61,6 +61,23 @@ pub struct ContextMenu {
     pub world_y: i32,
     pub screen_pos: glam::Vec2,
 }
+
+/// A single active touch point. Used to recognize one-finger pan,
+/// two-finger pinch, and long-press from raw winit touch events.
+#[derive(Debug, Clone, Copy)]
+struct TouchPoint {
+    start_pos: glam::Vec2,
+    start_time: Instant,
+    last_pos: glam::Vec2,
+    /// Set true once this touch has participated in a multi-touch gesture
+    /// (pinch). Prevents the long-press handler from firing on lift.
+    consumed_by_gesture: bool,
+}
+
+const LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
+/// Maximum total movement (logical pixels) a touch may have undergone and
+/// still count as a long-press rather than a drag.
+const LONG_PRESS_MAX_MOVEMENT: f32 = 20.0;
 
 #[derive(Debug, Clone)]
 pub struct RegenDialog {
@@ -120,6 +137,9 @@ pub struct App {
     ui_visible: bool,
     dragging: bool,
     last_cursor: Option<glam::Vec2>,
+    /// Active touch points keyed by winit Touch::id. Used for pan / pinch /
+    /// long-press gesture recognition on Android.
+    touches: HashMap<u64, TouchPoint>,
     context_menu: Option<ContextMenu>,
     regen_dialog: Option<RegenDialog>,
     server_addr: SocketAddr,
@@ -163,6 +183,7 @@ impl App {
             ui_visible: true,
             dragging: false,
             last_cursor: None,
+            touches: HashMap::new(),
             context_menu: None,
             regen_dialog: None,
             server_addr,
@@ -183,6 +204,96 @@ impl App {
     /// oldest_time)` over the rolling 1-second window — robust to
     /// drops (uses tick numbers, not sample counts) and to brief
     /// pauses (window naturally shrinks).
+    /// Recognize one-finger pan, two-finger pinch, and long-press from raw
+    /// winit touch events. Touch IDs persist across Started/Moved/Ended for
+    /// each finger; we keep per-id state in `self.touches`.
+    fn handle_touch(&mut self, touch: &Touch) {
+        let pos = glam::vec2(touch.location.x as f32, touch.location.y as f32);
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        match touch.phase {
+            TouchPhase::Started => {
+                self.touches.insert(
+                    touch.id,
+                    TouchPoint {
+                        start_pos: pos,
+                        start_time: Instant::now(),
+                        last_pos: pos,
+                        consumed_by_gesture: false,
+                    },
+                );
+            }
+            TouchPhase::Moved => match self.touches.len() {
+                2 => {
+                    // Pinch zoom: take old inter-touch distance, update this
+                    // touch, take new distance, scale camera by the ratio.
+                    let ids: Vec<u64> = self.touches.keys().copied().collect();
+                    let last_a = self.touches[&ids[0]].last_pos;
+                    let last_b = self.touches[&ids[1]].last_pos;
+                    let last_dist = (last_a - last_b).length();
+
+                    if let Some(t) = self.touches.get_mut(&touch.id) {
+                        t.last_pos = pos;
+                    }
+                    for t in self.touches.values_mut() {
+                        t.consumed_by_gesture = true;
+                    }
+
+                    let new_a = self.touches[&ids[0]].last_pos;
+                    let new_b = self.touches[&ids[1]].last_pos;
+                    let new_dist = (new_a - new_b).length();
+
+                    if last_dist > 1.0 && new_dist > 1.0 {
+                        let factor = last_dist / new_dist;
+                        self.camera.cells_visible_y =
+                            (self.camera.cells_visible_y * factor).clamp(4.0, 4096.0);
+                        state.window().request_redraw();
+                    }
+                }
+                1 => {
+                    if let Some(t) = self.touches.get_mut(&touch.id) {
+                        let delta = pos - t.last_pos;
+                        t.last_pos = pos;
+                        let cells_per_pixel =
+                            self.camera.cells_visible_y / state.height().max(1) as f32;
+                        self.camera.center -= delta * cells_per_pixel;
+                        state.window().request_redraw();
+                    }
+                }
+                _ => {}
+            },
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if let Some(t) = self.touches.remove(&touch.id) {
+                    if t.consumed_by_gesture {
+                        return;
+                    }
+                    let held = t.start_time.elapsed();
+                    let movement = (pos - t.start_pos).length();
+                    let single_finger = self.touches.is_empty();
+                    if single_finger
+                        && held >= LONG_PRESS_DURATION
+                        && movement <= LONG_PRESS_MAX_MOVEMENT
+                    {
+                        let win_size = glam::vec2(
+                            state.width().max(1) as f32,
+                            state.height().max(1) as f32,
+                        );
+                        let world = self.camera.pixel_to_world(pos, win_size);
+                        let scale = state.window().scale_factor() as f32;
+                        self.context_menu = Some(ContextMenu {
+                            world_x: world.x.floor() as i32,
+                            world_y: world.y.floor() as i32,
+                            screen_pos: pos / scale.max(1.0),
+                        });
+                        state.window().request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
     fn record_tick(&mut self, tick: u64) {
         let now = Instant::now();
         self.tps_samples.push_back((now, tick));
@@ -544,6 +655,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.camera.cells_visible_y =
                     (self.camera.cells_visible_y * factor).clamp(4.0, 4096.0);
                 state.window().request_redraw();
+            }
+            WindowEvent::Touch(touch) => {
+                self.handle_touch(&touch);
             }
             WindowEvent::RedrawRequested => {
                 let repaint_delay = state.render(
