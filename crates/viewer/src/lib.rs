@@ -62,7 +62,7 @@ fn run_with_event_loop(opts: RunOptions, event_loop: EventLoop<UserEvent>) -> Re
 
 #[cfg(target_os = "android")]
 mod android {
-    use std::net::SocketAddr;
+    use std::net::{SocketAddr, ToSocketAddrs};
 
     use android_activity::AndroidApp;
     use tracing_subscriber::layer::SubscriberExt;
@@ -73,19 +73,26 @@ mod android {
     use crate::app::UserEvent;
     use crate::{RunOptions, run_with_event_loop};
 
-    /// Hardcoded server address for the Android build. The LAN IP of the
-    /// machine running the server. (`10.0.2.2` would route to host loopback
-    /// from the emulator, but the emulator's Vulkan driver currently
-    /// segfaults wgpu, so physical-device testing is the path of least
-    /// resistance and a LAN IP works for both cases.)
-    const ANDROID_SERVER_ADDR: &str = "192.168.0.49:4433";
+    /// Hardcoded server address for the Android build. Hostname is
+    /// resolved once at startup via the system resolver — if the A record
+    /// changes you'll need to restart the app to pick it up.
+    const ANDROID_SERVER_ADDR: &str = "iapetusservers.net:4433";
 
     #[unsafe(no_mangle)]
     fn android_main(app: AndroidApp) {
         init_logging();
 
-        let server_addr: SocketAddr =
-            ANDROID_SERVER_ADDR.parse().expect("parse server addr");
+        let server_addr: SocketAddr = match ANDROID_SERVER_ADDR
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+        {
+            Some(addr) => addr,
+            None => {
+                tracing::error!("failed to resolve {ANDROID_SERVER_ADDR}; aborting");
+                return;
+            }
+        };
 
         let event_loop = match EventLoop::<UserEvent>::with_user_event()
             .with_android_app(app)
