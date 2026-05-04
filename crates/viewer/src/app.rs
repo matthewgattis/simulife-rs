@@ -267,8 +267,22 @@ impl App {
 
                     if last_dist > 1.0 && new_dist > 1.0 {
                         let factor = last_dist / new_dist;
-                        self.camera.cells_visible_y =
-                            (self.camera.cells_visible_y * factor).clamp(4.0, 4096.0);
+                        let old_cells = self.camera.cells_visible_y;
+                        let new_cells = (old_cells * factor).clamp(4.0, 4096.0);
+
+                        // Anchor the zoom on the midpoint between the two
+                        // fingers so the world point under it stays put as
+                        // cells_visible_y changes — pinching out from a
+                        // creature keeps that creature under your fingers.
+                        let mid = (new_a + new_b) * 0.5;
+                        let win_size = glam::vec2(
+                            state.width().max(1) as f32,
+                            state.height().max(1) as f32,
+                        );
+                        let offset = mid - win_size * 0.5;
+                        self.camera.center +=
+                            offset * (old_cells - new_cells) / win_size.y.max(1.0);
+                        self.camera.cells_visible_y = new_cells;
                         state.window().request_redraw();
                     }
                 }
