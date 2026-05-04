@@ -113,6 +113,22 @@ impl Camera {
         let offset = pixel - window_size * 0.5;
         self.center + offset * cells_per_pixel
     }
+
+    /// Apply a zoom factor anchored at `anchor_pixel`: scale
+    /// `cells_visible_y` by `factor` (clamped to [4, 4096]) and shift
+    /// `center` so the world point under `anchor_pixel` stays put.
+    pub fn zoom_around(
+        &mut self,
+        factor: f32,
+        anchor_pixel: glam::Vec2,
+        window_size: glam::Vec2,
+    ) {
+        let old_cells = self.cells_visible_y;
+        let new_cells = (old_cells * factor).clamp(4.0, 4096.0);
+        let offset = anchor_pixel - window_size * 0.5;
+        self.center += offset * (old_cells - new_cells) / window_size.y.max(1.0);
+        self.cells_visible_y = new_cells;
+    }
 }
 
 pub struct App {
@@ -267,22 +283,12 @@ impl App {
 
                     if last_dist > 1.0 && new_dist > 1.0 {
                         let factor = last_dist / new_dist;
-                        let old_cells = self.camera.cells_visible_y;
-                        let new_cells = (old_cells * factor).clamp(4.0, 4096.0);
-
-                        // Anchor the zoom on the midpoint between the two
-                        // fingers so the world point under it stays put as
-                        // cells_visible_y changes — pinching out from a
-                        // creature keeps that creature under your fingers.
                         let mid = (new_a + new_b) * 0.5;
                         let win_size = glam::vec2(
                             state.width().max(1) as f32,
                             state.height().max(1) as f32,
                         );
-                        let offset = mid - win_size * 0.5;
-                        self.camera.center +=
-                            offset * (old_cells - new_cells) / win_size.y.max(1.0);
-                        self.camera.cells_visible_y = new_cells;
+                        self.camera.zoom_around(factor, mid, win_size);
                         state.window().request_redraw();
                     }
                 }
@@ -792,6 +798,46 @@ mod tests {
         let world = cam.pixel_to_world(glam::vec2(400.0, 600.0), win);
         // 16 cells across 600 px → +300 px = +8 cells.
         assert!(approx_eq(world.y, 8.0));
+    }
+
+    #[test]
+    fn zoom_around_keeps_anchor_world_position_invariant() {
+        let mut cam = Camera {
+            center: glam::vec2(50.0, 30.0),
+            cells_visible_y: 64.0,
+        };
+        let win = glam::vec2(800.0, 600.0);
+        let anchor = glam::vec2(200.0, 450.0);
+        let world_before = cam.pixel_to_world(anchor, win);
+        cam.zoom_around(0.5, anchor, win);
+        let world_after = cam.pixel_to_world(anchor, win);
+        assert!(approx_eq(world_before.x, world_after.x));
+        assert!(approx_eq(world_before.y, world_after.y));
+    }
+
+    #[test]
+    fn zoom_around_window_center_leaves_camera_center_fixed() {
+        let mut cam = Camera {
+            center: glam::vec2(50.0, 30.0),
+            cells_visible_y: 64.0,
+        };
+        let win = glam::vec2(800.0, 600.0);
+        let center_before = cam.center;
+        cam.zoom_around(0.5, win * 0.5, win);
+        assert!(approx_eq(cam.center.x, center_before.x));
+        assert!(approx_eq(cam.center.y, center_before.y));
+        assert!(approx_eq(cam.cells_visible_y, 32.0));
+    }
+
+    #[test]
+    fn zoom_around_clamps_cells_visible_y() {
+        let mut cam = Camera {
+            center: glam::vec2(0.0, 0.0),
+            cells_visible_y: 8.0,
+        };
+        let win = glam::vec2(800.0, 600.0);
+        cam.zoom_around(0.1, win * 0.5, win);
+        assert!(approx_eq(cam.cells_visible_y, 4.0));
     }
 
     #[test]
