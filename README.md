@@ -76,7 +76,7 @@ Touches that land over a panel/popup go to egui — canvas pan/pinch/long-press 
 
 ### Android
 
-> **⚠️ Experimental.** The Android viewer runs but has significant performance issues. The biggest one is bandwidth: the server-to-client wire format ships full per-chunk state every tick (msgpack + zstd), which is fine over loopback but punishing over a phone's network stack. Decode and GPU upload on mobile-class hardware are also under-optimized. Expect dropped frames, stalls, and battery drain. Treat this as a proof-of-concept until the wire format moves to per-cell deltas and the client side gets a serious pass.
+> **⚠️ Experimental.** Tested on a flagship phone. Pan / pinch-zoom feels fluid, but performance suffers while the sim is actively running. The viewer's bytes/s indicator runs higher than expected, so bandwidth is a suspect — but nothing has been profiled yet, so the real cause is open.
 
 The viewer also builds as a `cdylib` (`libviewer.so`) for ARM64 Android via cargo-ndk; a minimal Gradle project under `android/` packages it into an APK. The server is unchanged — the phone connects to it over the LAN like any other QUIC client.
 
