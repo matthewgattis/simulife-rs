@@ -2,6 +2,8 @@
 
 A plant-evolution cellular automaton. The server runs the simulation; the viewer connects over QUIC and renders the world live with wgpu/egui.
 
+![viewer screenshot](docs/screenshot.png)
+
 ## Credit
 
 The simulation rules here are an implementation of the work of **[@wallcraft-video](https://www.youtube.com/@wallcraft-video)**, who runs the YouTube channel **Simulife Hub**. The cell taxonomy, genome model, soil dynamics, and growth/death pressures are all his design — see [this video](https://youtu.be/q2uuMY37JuA) for the rule walkthrough that this codebase is built on. Go watch his channel; it's the backbone of everything interesting that happens in this project.
