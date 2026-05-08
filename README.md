@@ -6,9 +6,9 @@ A plant-evolution cellular automaton. The server runs the simulation; the viewer
 
 ## Credit
 
-The simulation rules here are an implementation of the work of **[@wallcraft-video](https://www.youtube.com/@wallcraft-video)**, who runs the YouTube channel **Simulife Hub**. The cell taxonomy, genome model, soil dynamics, and growth/death pressures are all his design — see [this video](https://youtu.be/q2uuMY37JuA) for the rule walkthrough that this codebase is built on. Go watch his channel; it's the backbone of everything interesting that happens in this project.
+The simulation rules here are an implementation of the work of **[@wallcraft-video](https://www.youtube.com/@wallcraft-video)**, who runs the YouTube channel **Simulife Hub**. The cell taxonomy, genome model, soil dynamics, and growth/death pressures are all his design — see [this video](https://youtu.be/q2uuMY37JuA) for the rule walkthrough that this codebase is built on. Please go watch his channel.
 
-I built this as a Rust port to explore and experiment — to play with parameters and profile the inner loop. Any deviations from the source rules are mine, not his.
+I built this as a Rust project to explore and experiment. To learn new technologies, and play with neat ideas.
 
 ## Overview
 
@@ -75,6 +75,8 @@ The server starts paused so you can attach a viewer first; press the **Resume** 
 Touches that land over a panel/popup go to egui — canvas pan/pinch/long-press are suppressed for them so widget drags (sliders, dialog moves) don't fight the camera.
 
 ### Android
+
+> **⚠️ Experimental.** The Android viewer runs but has significant performance issues. The biggest one is bandwidth: the server-to-client wire format ships full per-chunk state every tick (msgpack + zstd), which is fine over loopback but punishing over a phone's network stack. Decode and GPU upload on mobile-class hardware are also under-optimized. Expect dropped frames, stalls, and battery drain. Treat this as a proof-of-concept until the wire format moves to per-cell deltas and the client side gets a serious pass.
 
 The viewer also builds as a `cdylib` (`libviewer.so`) for ARM64 Android via cargo-ndk; a minimal Gradle project under `android/` packages it into an APK. The server is unchanged — the phone connects to it over the LAN like any other QUIC client.
 
