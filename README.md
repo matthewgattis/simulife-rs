@@ -76,7 +76,7 @@ Touches that land over a panel/popup go to egui — canvas pan/pinch/long-press 
 
 ### Android
 
-> **⚠️ Experimental.** Tested on a flagship phone. Pan / pinch-zoom feels fluid, but performance suffers while the sim is actively running. The viewer's bytes/s indicator runs higher than expected, so bandwidth is a suspect — but nothing has been profiled yet, so the real cause is open.
+> **⚠️ Experimental.** Tested on a flagship phone. Pan / pinch-zoom feels fluid, but performance suffers while the sim is actively running. The viewer's bytes/s indicator runs high — be cautious about using this on a mobile network. Bandwidth is currently the leading hypothesis for the performance issue, but nothing has been profiled yet.
 
 The viewer also builds as a `cdylib` (`libviewer.so`) for ARM64 Android via cargo-ndk; a minimal Gradle project under `android/` packages it into an APK. The server is unchanged — the phone connects to it over the LAN like any other QUIC client.
 
