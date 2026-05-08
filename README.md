@@ -6,7 +6,7 @@ A plant-evolution cellular automaton. The server runs the simulation; the viewer
 
 The simulation rules here are an implementation of the work of **[@wallcraft-video](https://www.youtube.com/@wallcraft-video)**, who runs the YouTube channel **Simulife Hub**. The cell taxonomy, genome model, soil dynamics, and growth/death pressures are all his design — see [this video](https://youtu.be/q2uuMY37JuA) for the rule walkthrough that this codebase is built on. Go watch his channel; it's the backbone of everything interesting that happens in this project.
 
-I built this as a Rust port to explore and experiment — to play with parameters, profile the inner loop, and see what happens when you let it run on bigger worlds. Any deviations from the source rules are mine, not his.
+I built this as a Rust port to explore and experiment — to play with parameters and profile the inner loop. Any deviations from the source rules are mine, not his.
 
 ## Overview
 
