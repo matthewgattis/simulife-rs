@@ -1,4 +1,4 @@
-# cellular-automata
+# simulife-rs (cellular-automata)
 
 A plant-evolution cellular automaton. The server runs the simulation; the viewer connects over QUIC and renders the world live with wgpu/egui.
 
