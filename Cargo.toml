@@ -5,6 +5,7 @@ members = ["crates/protocol", "crates/server", "crates/viewer"]
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 protocol = { path = "crates/protocol" }

@@ -161,3 +161,12 @@ cargo test --workspace
 ```
 
 Unit tests live alongside the code (`#[cfg(test)] mod tests`) for sim rules, world generation, persistence, the wire format, and viewer pure helpers (Camera math, label formatting).
+
+## License
+
+Dual-licensed under either of:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option. This is the standard dual-license used across the Rust ecosystem — pick whichever fits your downstream project.
