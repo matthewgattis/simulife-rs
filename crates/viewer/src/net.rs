@@ -144,6 +144,7 @@ async fn run_session(
                     .map(|t| t.elapsed().as_micros() as u64)
                     .unwrap_or(0);
                 let bytes = buf.len();
+                let _ = proxy.send_event(UserEvent::WireBytes(bytes));
                 let decode_start = if tick_metrics { Some(Instant::now()) } else { None };
                 let msg = {
                     let _decode_span = tracing::info_span!("decode", bytes).entered();

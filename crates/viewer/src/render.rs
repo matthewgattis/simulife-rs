@@ -179,6 +179,7 @@ impl RenderState {
         sim_tick_rate_limited: &mut bool,
         sim_tick: u64,
         sim_tps: f32,
+        wire_bps: f32,
         sim_params: &mut SimParams,
         world_gen_params: &WorldGenParams,
         cursor_px: Option<glam::Vec2>,
@@ -230,6 +231,7 @@ impl RenderState {
                     sim_tick_rate_limited,
                     sim_tick,
                     sim_tps,
+                    wire_bps,
                     sim_params,
                     world_gen_params,
                     regen_dialog,
@@ -844,6 +846,23 @@ fn neighbor_present(
     false
 }
 
+/// Adaptive bytes/sec formatter — picks B/KB/MB by magnitude. Binary
+/// units (1024-based) since this is a display, not a network bandwidth
+/// quote.
+fn fmt_byte_rate(bps: f32) -> String {
+    const KB: f32 = 1024.0;
+    const MB: f32 = KB * 1024.0;
+    if !bps.is_finite() || bps <= 0.0 {
+        "—".to_string()
+    } else if bps < KB {
+        format!("{bps:.0} B/s")
+    } else if bps < MB {
+        format!("{:.1} KB/s", bps / KB)
+    } else {
+        format!("{:.2} MB/s", bps / MB)
+    }
+}
+
 fn draw_ui(
     ctx: &egui::Context,
     network: &NetworkStatus,
@@ -857,6 +876,7 @@ fn draw_ui(
     sim_tick_rate_limited: &mut bool,
     sim_tick: u64,
     sim_tps: f32,
+    wire_bps: f32,
     sim_params: &mut SimParams,
     world_gen_params: &WorldGenParams,
     regen_dialog: &mut Option<RegenDialog>,
@@ -898,6 +918,7 @@ fn draw_ui(
             }
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
+            ui.label(format!("Wire: {}", fmt_byte_rate(wire_bps)));
             ui.label("Drag = pan, Scroll = zoom, Right-click for menu");
             ui.label("H = hide UI");
             ui.separator();

@@ -30,6 +30,9 @@ pub enum UserEvent {
     /// Per-tick delta — overlay each delta chunk onto the local vec
     /// by `coord`. Chunks not in the delta keep their previous state.
     ChunksDelta { tick: u64, chunks: Vec<WireChunk> },
+    /// Raw on-the-wire byte count of one received QUIC stream, captured
+    /// before decompression. Drives the wire-rate readout.
+    WireBytes(usize),
     Shutdown,
 }
 
@@ -155,6 +158,13 @@ pub struct App {
     /// so the UI readout doesn't flicker. NaN until enough data lands.
     sim_tps: f32,
     last_tps_update: Option<Instant>,
+    /// Rolling 1-second window of (when-received, on-wire bytes) per
+    /// QUIC stream. Mirrors tps_samples; drives the wire-rate readout.
+    wire_byte_samples: VecDeque<(Instant, usize)>,
+    /// Most recent compressed bytes/sec, refreshed at most once per
+    /// second so the readout doesn't flicker.
+    wire_bps: f32,
+    last_wire_rate_update: Option<Instant>,
     sim_params: SimParams,
     world_gen_params: WorldGenParams,
     centered_once: bool,
@@ -204,6 +214,9 @@ impl App {
             tps_samples: VecDeque::new(),
             sim_tps: f32::NAN,
             last_tps_update: None,
+            wire_byte_samples: VecDeque::new(),
+            wire_bps: 0.0,
+            last_wire_rate_update: None,
             sim_params: SimParams::default(),
             world_gen_params: WorldGenParams::default(),
             centered_once: false,
@@ -372,6 +385,37 @@ impl App {
             }
         }
     }
+
+    /// Record one wire-stream arrival, drop expired samples, and refresh
+    /// the displayed bytes/sec at most once per second. Same shape as
+    /// `record_tick` but summed (each sample contributes a byte count
+    /// rather than a counter delta).
+    fn record_wire_bytes(&mut self, bytes: usize) {
+        let now = Instant::now();
+        self.wire_byte_samples.push_back((now, bytes));
+        let window = Duration::from_secs(1);
+        while let Some(&(t, _)) = self.wire_byte_samples.front() {
+            if now.duration_since(t) > window {
+                self.wire_byte_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let due = self
+            .last_wire_rate_update
+            .map(|t| now.duration_since(t) >= window)
+            .unwrap_or(true);
+        if due && self.wire_byte_samples.len() >= 2 {
+            let total: usize = self.wire_byte_samples.iter().map(|(_, b)| b).sum();
+            let t0 = self.wire_byte_samples.front().unwrap().0;
+            let t1 = self.wire_byte_samples.back().unwrap().0;
+            let dt = t1.duration_since(t0).as_secs_f32();
+            if dt > 0.0 {
+                self.wire_bps = total as f32 / dt;
+                self.last_wire_rate_update = Some(now);
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -405,6 +449,9 @@ impl ApplicationHandler<UserEvent> for App {
         // chunks * CHUNK_AREA bytes of stale state in RAM otherwise.
         self.chunks = Vec::new();
         self.tps_samples.clear();
+        self.wire_byte_samples.clear();
+        self.wire_bps = 0.0;
+        self.last_wire_rate_update = None;
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -480,6 +527,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.world_gen_params = *world_gen_params;
                 }
                 self.network = status;
+            }
+            UserEvent::WireBytes(bytes) => {
+                self.record_wire_bytes(bytes);
             }
             UserEvent::Chunks { tick, chunks } => {
                 let _apply_span = tracing::info_span!("tick_apply", tick).entered();
@@ -739,6 +789,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &mut self.sim_tick_rate_limited,
                     self.sim_tick,
                     self.sim_tps,
+                    self.wire_bps,
                     &mut self.sim_params,
                     &self.world_gen_params,
                     self.last_cursor,
