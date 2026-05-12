@@ -87,53 +87,53 @@ pub fn place_random_sprout_grid(
     while y < total_h - spacing {
         let mut x = spacing;
         while x < total_w - spacing {
-            if let Some(cell) = cell_at(chunks, chunks_x, x, y) {
-                if cell.sunlit {
-                    count += 1;
-                    let facing = match rng.r#gen::<u8>() % 4 {
-                        0 => Direction::North,
-                        1 => Direction::East,
-                        2 => Direction::South,
-                        _ => Direction::West,
-                    };
-                    let mut starter = Genome::default_vine();
-                    starter.mutation_rate = 1.0;
-                    let mut genome = crate::sim::mutate_genome(&starter, rng);
-                    // Log-uniform spread around DEFAULT controlled by
-                    // params.initial_mutation_rate_octaves. 0 = no
-                    // spread (everyone starts at DEFAULT).
-                    let oct = if octaves > 0.0 {
-                        rng.gen_range(-octaves..octaves)
-                    } else {
-                        0.0
-                    };
-                    let rate = protocol::DEFAULT_MUTATION_RATE * 2f32.powf(oct);
-                    genome.mutation_rate =
-                        rate.clamp(protocol::MUTATION_RATE_MIN, protocol::MUTATION_RATE_MAX);
-                    let stamp_rate = genome.mutation_rate;
-                    // Clan: which 2D box this sprout starts in. Encoded
-                    // row-major: clan = box_y * boxes_x + box_x.
-                    let bx = (x / box_w) as u32;
-                    let by = (y / box_h) as u32;
-                    let clan = (by * boxes_x + bx) as protocol::ClanId;
-                    place_at(
-                        chunks,
-                        chunks_x,
-                        x,
-                        y,
-                        Occupant::Sprout {
-                            plant: count,
-                            clan,
-                            energy: 100,
-                            facing,
-                            genome: Box::new(genome),
-                            parent: None,
-                            current_gene: 0,
-                        },
-                    );
-                    if let Some(cell) = cell_at_mut(chunks, chunks_x, x, y) {
-                        cell.lineage_mutation_rate = stamp_rate;
-                    }
+            if let Some(cell) = cell_at(chunks, chunks_x, x, y)
+                && cell.sunlit
+            {
+                count += 1;
+                let facing = match rng.r#gen::<u8>() % 4 {
+                    0 => Direction::North,
+                    1 => Direction::East,
+                    2 => Direction::South,
+                    _ => Direction::West,
+                };
+                let mut starter = Genome::default_vine();
+                starter.mutation_rate = 1.0;
+                let mut genome = crate::sim::mutate_genome(&starter, rng);
+                // Log-uniform spread around DEFAULT controlled by
+                // params.initial_mutation_rate_octaves. 0 = no
+                // spread (everyone starts at DEFAULT).
+                let oct = if octaves > 0.0 {
+                    rng.gen_range(-octaves..octaves)
+                } else {
+                    0.0
+                };
+                let rate = protocol::DEFAULT_MUTATION_RATE * 2f32.powf(oct);
+                genome.mutation_rate =
+                    rate.clamp(protocol::MUTATION_RATE_MIN, protocol::MUTATION_RATE_MAX);
+                let stamp_rate = genome.mutation_rate;
+                // Clan: which 2D box this sprout starts in. Encoded
+                // row-major: clan = box_y * boxes_x + box_x.
+                let bx = (x / box_w) as u32;
+                let by = (y / box_h) as u32;
+                let clan = (by * boxes_x + bx) as protocol::ClanId;
+                place_at(
+                    chunks,
+                    chunks_x,
+                    x,
+                    y,
+                    Occupant::Sprout {
+                        plant: count,
+                        clan,
+                        energy: 100,
+                        facing,
+                        genome: Box::new(genome),
+                        parent: None,
+                        current_gene: 0,
+                    },
+                );
+                if let Some(cell) = cell_at_mut(chunks, chunks_x, x, y) {
+                    cell.lineage_mutation_rate = stamp_rate;
                 }
             }
             x += spacing;
@@ -143,7 +143,7 @@ pub fn place_random_sprout_grid(
     count
 }
 
-fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&'a Cell> {
+fn cell_at(chunks: &[Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&Cell> {
     if x < 0 || y < 0 {
         return None;
     }
@@ -153,7 +153,7 @@ fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&'a
     chunks.get(chunk_idx)?.cells.get(cell_idx)
 }
 
-fn cell_at_mut<'a>(chunks: &'a mut [Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&'a mut Cell> {
+fn cell_at_mut(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32) -> Option<&mut Cell> {
     if x < 0 || y < 0 {
         return None;
     }
@@ -174,10 +174,10 @@ fn place_at(chunks: &mut [Chunk], chunks_x: u32, x: i32, y: i32, occupant: Occup
     let ly = (y % edge) as usize;
     let chunk_idx = (cy as usize) * (chunks_x as usize) + (cx as usize);
     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-    if let Some(chunk) = chunks.get_mut(chunk_idx) {
-        if let Some(cell) = chunk.cells.get_mut(cell_idx) {
-            cell.occupant = occupant;
-        }
+    if let Some(chunk) = chunks.get_mut(chunk_idx)
+        && let Some(cell) = chunk.cells.get_mut(cell_idx)
+    {
+        cell.occupant = occupant;
     }
 }
 
@@ -211,7 +211,7 @@ mod tests {
         }
     }
 
-    fn cell_at_test<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> &'a Cell {
+    fn cell_at_test(chunks: &[Chunk], chunks_x: u32, x: i32, y: i32) -> &Cell {
         let edge = CHUNK_EDGE as i32;
         let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
         let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;

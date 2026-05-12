@@ -465,10 +465,10 @@ fn mutate_world(
         let _span = tracing::info_span!("phase_photo").entered();
         for chunk in chunks.iter_mut() {
             for cell in chunk.cells.iter_mut() {
-                if cell.sunlit {
-                    if let Occupant::Leaf { energy, .. } = &mut cell.occupant {
-                        *energy = energy.saturating_add(params.leaf_photosynthesis);
-                    }
+                if cell.sunlit
+                    && let Occupant::Leaf { energy, .. } = &mut cell.occupant
+                {
+                    *energy = energy.saturating_add(params.leaf_photosynthesis);
                 }
             }
         }
@@ -643,11 +643,11 @@ fn mutate_world(
             if gain == 0 {
                 continue;
             }
-            if let Some(cell) = cell_at_mut(chunks, chunks_x, pwx, pwy) {
-                if let Some(e) = occupant_energy(&cell.occupant) {
-                    let new_e = (e as u32 + gain).min(Energy::MAX as u32) as Energy;
-                    set_occupant_energy(&mut cell.occupant, new_e);
-                }
+            if let Some(cell) = cell_at_mut(chunks, chunks_x, pwx, pwy)
+                && let Some(e) = occupant_energy(&cell.occupant)
+            {
+                let new_e = (e as u32 + gain).min(Energy::MAX as u32) as Energy;
+                set_occupant_energy(&mut cell.occupant, new_e);
             }
         }
     }
@@ -773,6 +773,7 @@ fn mutate_world(
     // In the threshold case the parent stem is still alive — clear its
     // children-bit pointing at the now-departing seed.
     let _phase_germ = tracing::info_span!("phase_germination").entered();
+    #[allow(clippy::type_complexity)]
     let mut germinations: Vec<(i32, i32, Option<(i32, i32, u8)>)> = Vec::new();
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
@@ -862,12 +863,11 @@ fn mutate_world(
                 current_gene: 0,
             };
         }
-        if let Some((px, py, bit)) = parent_clear {
-            if let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py) {
-                if let Occupant::Stem { children, .. } = &mut parent_cell.occupant {
-                    *children &= !bit;
-                }
-            }
+        if let Some((px, py, bit)) = parent_clear
+            && let Some(parent_cell) = cell_at_mut(chunks, chunks_x, px, py)
+            && let Occupant::Stem { children, .. } = &mut parent_cell.occupant
+        {
+            *children &= !bit;
         }
     }
     drop(_phase_germ);
@@ -910,7 +910,6 @@ fn mutate_world(
     // cell's own energy across the kernel, then replace cell with Empty.
     let _phase_death = tracing::info_span!("phase_death").entered();
     let mut dying: Vec<(i32, i32, Energy)> = Vec::new();
-    let death_count: u64;
     for cy in 0..chunks_y {
         for cx in 0..chunks_x {
             for ly in 0..(CHUNK_EDGE as usize) {
@@ -933,7 +932,7 @@ fn mutate_world(
             }
         }
     }
-    death_count = dying.len() as u64;
+    let death_count: u64 = dying.len() as u64;
     for (wx, wy, energy) in dying {
         deposit_kernel(
             chunks,
@@ -1254,11 +1253,7 @@ fn deposit_kernel(
     let kernel_sum: u32 = kernel.iter().flatten().map(|&w| w as u32).sum();
     // Integer-divide to keep the deposit lossless: per_unit * kernel_sum
     // never exceeds energy, so we don't manufacture energy from death.
-    let per_unit = if kernel_sum > 0 {
-        energy as u32 / kernel_sum
-    } else {
-        0
-    };
+    let per_unit = (energy as u32).checked_div(kernel_sum).unwrap_or(0);
     for dy in -1..=1i32 {
         for dx in -1..=1i32 {
             let weight = kernel[(dy + 1) as usize][(dx + 1) as usize];
@@ -1526,10 +1521,10 @@ fn phase_prune_pull(
                             // plant that spawns there doesn't get
                             // adopted as our child. Kin dead-end stems
                             // are kept here and handled by phase_drainage.
-                            if let Some(n) = neighbor_occ {
-                                if is_kin_descendable(n, parent_plant) {
-                                    kept_children |= bit;
-                                }
+                            if let Some(n) = neighbor_occ
+                                && is_kin_descendable(n, parent_plant)
+                            {
+                                kept_children |= bit;
                             }
                         }
                         if in_connections {
@@ -2236,7 +2231,7 @@ mod tests {
         v
     }
 
-    fn cell_at<'a>(chunks: &'a [Chunk], chunks_x: u32, x: i32, y: i32) -> &'a Cell {
+    fn cell_at(chunks: &[Chunk], chunks_x: u32, x: i32, y: i32) -> &Cell {
         let edge = CHUNK_EDGE as i32;
         let chunk_idx = (y / edge) as usize * chunks_x as usize + (x / edge) as usize;
         let cell_idx = (y % edge) as usize * (CHUNK_EDGE as usize) + (x % edge) as usize;

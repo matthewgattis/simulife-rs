@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 mod net;
 mod persist;
 mod sim;
@@ -178,22 +180,22 @@ async fn main() -> Result<()> {
         "world ready"
     );
 
-    if args.autosave_secs > 0 {
-        if let Some(path) = args.world_file.clone() {
-            let save_state = Arc::clone(&state);
-            let interval = Duration::from_secs(args.autosave_secs);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(interval);
+    if args.autosave_secs > 0
+        && let Some(path) = args.world_file.clone()
+    {
+        let save_state = Arc::clone(&state);
+        let interval = Duration::from_secs(args.autosave_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await;
+            loop {
                 tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    if let Err(e) = persist::save_world(&path, &save_state) {
-                        warn!("autosave failed: {e:#}");
-                    }
+                if let Err(e) = persist::save_world(&path, &save_state) {
+                    warn!("autosave failed: {e:#}");
                 }
-            });
-            info!(autosave_secs = args.autosave_secs, "autosave enabled");
-        }
+            }
+        });
+        info!(autosave_secs = args.autosave_secs, "autosave enabled");
     }
 
     let sim_state = Arc::clone(&state);
@@ -236,10 +238,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(path) = &args.world_file {
-        if let Err(e) = persist::save_world(path, &state) {
-            error!("final save failed: {e:#}");
-        }
+    if let Some(path) = &args.world_file
+        && let Err(e) = persist::save_world(path, &state)
+    {
+        error!("final save failed: {e:#}");
     }
 
     Ok(())

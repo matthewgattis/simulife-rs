@@ -127,10 +127,10 @@ pub fn load_or_build(
     world_file: Option<&Path>,
     initial_params: &protocol::WorldGenParams,
 ) -> Result<WorldSnapshot> {
-    if let Some(path) = world_file {
-        if path.exists() {
-            return load_world(path);
-        }
+    if let Some(path) = world_file
+        && path.exists()
+    {
+        return load_world(path);
     }
     let chunks = world::build_world(initial_params);
     Ok(WorldSnapshot {

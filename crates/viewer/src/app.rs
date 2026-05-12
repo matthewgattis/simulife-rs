@@ -373,15 +373,14 @@ impl App {
             .last_tps_update
             .map(|t| now.duration_since(t) >= window)
             .unwrap_or(true);
-        if due {
-            if let (Some(&(t0, n0)), Some(&(t1, n1))) =
+        if due
+            && let (Some(&(t0, n0)), Some(&(t1, n1))) =
                 (self.tps_samples.front(), self.tps_samples.back())
-            {
-                let dt = t1.duration_since(t0).as_secs_f32();
-                if dt > 0.0 && n1 > n0 {
-                    self.sim_tps = (n1 - n0) as f32 / dt;
-                    self.last_tps_update = Some(now);
-                }
+        {
+            let dt = t1.duration_since(t0).as_secs_f32();
+            if dt > 0.0 && n1 > n0 {
+                self.sim_tps = (n1 - n0) as f32 / dt;
+                self.last_tps_update = Some(now);
             }
         }
     }
@@ -589,10 +588,10 @@ impl ApplicationHandler<UserEvent> for App {
                             .iter()
                             .position(|c| c.coord == incoming.coord),
                     };
-                    if let Some(idx) = target_idx {
-                        if let Some(slot) = self.chunks.get_mut(idx) {
-                            *slot = incoming;
-                        }
+                    if let Some(idx) = target_idx
+                        && let Some(slot) = self.chunks.get_mut(idx)
+                    {
+                        *slot = incoming;
                     }
                 }
                 let assign_us = assign_start
@@ -657,14 +656,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = glam::vec2(position.x as f32, position.y as f32);
-                if self.dragging {
-                    if let Some(last) = self.last_cursor {
-                        let delta = cursor - last;
-                        let cells_per_pixel =
-                            self.camera.cells_visible_y / state.height().max(1) as f32;
-                        self.camera.center -= delta * cells_per_pixel;
-                        state.window().request_redraw();
-                    }
+                if self.dragging
+                    && let Some(last) = self.last_cursor
+                {
+                    let delta = cursor - last;
+                    let cells_per_pixel =
+                        self.camera.cells_visible_y / state.height().max(1) as f32;
+                    self.camera.center -= delta * cells_per_pixel;
+                    state.window().request_redraw();
                 }
                 self.last_cursor = Some(cursor);
             }
@@ -711,11 +710,9 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => match logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    if self.context_menu.is_some() {
-                        self.context_menu = None;
-                        state.window().request_redraw();
-                    }
+                Key::Named(NamedKey::Escape) if self.context_menu.is_some() => {
+                    self.context_menu = None;
+                    state.window().request_redraw();
                 }
                 Key::Named(NamedKey::Space) => {
                     // Server is authoritative — request the toggle; the

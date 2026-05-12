@@ -838,10 +838,10 @@ fn neighbor_present(
     let lx = wx.rem_euclid(edge) as usize;
     let ly = wy.rem_euclid(edge) as usize;
     let cell_idx = ly * (CHUNK_EDGE as usize) + lx;
-    if let Some(&chunk_idx) = lookup.get(&(cx, cy)) {
-        if let Some(cell) = chunks[chunk_idx].cells.get(cell_idx) {
-            return !matches!(cell.occupant, WireOccupant::Empty);
-        }
+    if let Some(&chunk_idx) = lookup.get(&(cx, cy))
+        && let Some(cell) = chunks[chunk_idx].cells.get(cell_idx)
+    {
+        return !matches!(cell.occupant, WireOccupant::Empty);
     }
     false
 }
@@ -1221,14 +1221,12 @@ fn draw_regen_dialog(
 
     if randomize {
         dialog.seed_text = format!("{:#018x}", rand::thread_rng().r#gen::<u64>());
-    } else if submit {
-        if let Some(seed) = parsed {
-            let _ = outgoing.send(ClientMessage::RegenerateWorld {
-                seed,
-                params: dialog.params,
-            });
-            close = true;
-        }
+    } else if submit && let Some(seed) = parsed {
+        let _ = outgoing.send(ClientMessage::RegenerateWorld {
+            seed,
+            params: dialog.params,
+        });
+        close = true;
     }
     if close {
         *regen_dialog = None;
