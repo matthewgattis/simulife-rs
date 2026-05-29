@@ -70,6 +70,11 @@ const LAYER_MUTATION_RATE: u32 = 16u;
 
 const CLEAR_COLOR: vec3<f32> = vec3<f32>(0.05, 0.07, 0.10);
 const OUTLINE_COLOR: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+// Outline half-width in world units, where 1.0 == one cell. The border
+// is a fixed fraction of a cell, so it stays the same thickness relative
+// to the world regardless of zoom (the band spans 2x this around the
+// shape edge).
+const OUTLINE_HALF_W: f32 = 0.005;
 
 @vertex
 fn vs_main(v: VsIn, i: InstanceIn) -> VsOut {
@@ -183,10 +188,15 @@ fn shape_sdf(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> vec2<f32> {
         }
         let p = (cell_uv - vec2<f32>(0.5)) / scale;
         let l = max(length(p), 1e-6);
-        let d = l - 1.0;
+        // (l - 1) is the raw ellipse metric, not a Euclidean distance: the
+        // /scale terms make its gradient much steeper than 1, which made
+        // the leaf outline read thinner than the rect/circle shapes.
+        // Divide by the gradient magnitude to recover an approximate signed
+        // distance in cell units, so the world-space outline width matches.
         let grad_uv = vec2<f32>(p.x / l / scale.x, p.y / l / scale.y);
-        let aa_d = abs(grad_uv.x) * aa_axis.x + abs(grad_uv.y) * aa_axis.y;
-        return vec2<f32>(d, aa_d);
+        let g = max(length(grad_uv), 1e-6);
+        let d = (l - 1.0) / g;
+        return vec2<f32>(d, aa_radial);
     }
     if (cell.kind == KIND_ROOT) {
         return vec2<f32>(rect_sdf(cell_uv, vec2<f32>(0.2), vec2<f32>(0.8)), aa_radial);
@@ -211,34 +221,35 @@ fn shape_sdf(cell: Cell, cell_uv: vec2<f32>, aa_axis: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(length(cell_uv - vec2<f32>(0.5)) - 0.3, aa_radial);
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let xy = in.chunk_uv * vec2<f32>(CHUNK_EDGE);
-    let aa_axis = fwidth(in.chunk_uv) * CHUNK_EDGE;
-
-    let lx = clamp(u32(floor(xy.x)), 0u, CHUNK_EDGE_U - 1u);
-    let ly = clamp(u32(floor(xy.y)), 0u, CHUNK_EDGE_U - 1u);
+// Shade a single sub-pixel sample at cell-space position `xy`. Pulled out
+// of fs_main so the 4x supersampler can call it per sample.
+fn shade(
+    xy: vec2<f32>,
+    first_cell: u32,
+    aa_axis: vec2<f32>,
+    show_organic: bool,
+    show_energy: bool,
+    show_fg: bool,
+    show_clan: bool,
+    show_mutation: bool,
+) -> vec3<f32> {
+    let lx = clamp(u32(floor(max(xy.x, 0.0))), 0u, CHUNK_EDGE_U - 1u);
+    let ly = clamp(u32(floor(max(xy.y, 0.0))), 0u, CHUNK_EDGE_U - 1u);
     let cell_uv = xy - vec2<f32>(f32(lx), f32(ly));
-    let cell_idx = in.chunk_first_cell + ly * CHUNK_EDGE_U + lx;
+    let cell_idx = first_cell + ly * CHUNK_EDGE_U + lx;
     let cell = cells[cell_idx];
-
-    let show_organic = (world.layer_flags & LAYER_ORGANIC) != 0u;
-    let show_energy = (world.layer_flags & LAYER_ENERGY) != 0u;
-    let show_fg = (world.layer_flags & LAYER_FG) != 0u;
-    let show_clan = (world.layer_flags & LAYER_CLAN) != 0u;
-    let show_mutation = (world.layer_flags & LAYER_MUTATION_RATE) != 0u;
 
     var color = soil_color(cell, show_organic, show_energy);
 
     if (show_fg && cell.kind != KIND_EMPTY) {
         let s = shape_sdf(cell, cell_uv, aa_axis);
         let d = s.x;
-        let aa_w = s.y;
-        let aa_pixel = max(aa_axis.x, aa_axis.y);
-        let outline_fade = 1.0 - smoothstep(0.05, 0.15, aa_pixel);
-        let outline_w = aa_w * 0.5 * outline_fade;
-        let alpha_outer = 1.0 - smoothstep(outline_w - aa_w, outline_w + aa_w, d);
-        let alpha_inner = 1.0 - smoothstep(-outline_w - aa_w, -outline_w + aa_w, d);
+        // World-space outline: a fixed fraction of a cell, constant
+        // thickness at any zoom. Hard edges per sample (no per-sample
+        // feathering) — the supersampler in fs_main does the smoothing.
+        let outline_w = OUTLINE_HALF_W;
+        let alpha_outer = 1.0 - step(outline_w, d);
+        let alpha_inner = 1.0 - step(-outline_w, d);
         // Resolve fill color: mutation > clan > occupant. Mutation
         // gradient takes priority because it's the most visually
         // distinct overlay; clan still beats default occupant colors.
@@ -248,6 +259,44 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = mix(color, OUTLINE_COLOR, alpha_outer);
         color = mix(color, fg, alpha_inner);
     }
+    return color;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let xy = in.chunk_uv * vec2<f32>(CHUNK_EDGE);
+    let aa_axis = fwidth(in.chunk_uv) * CHUNK_EDGE;
+    // Screen-space derivatives of the cell-space coordinate: how far xy
+    // moves for a one-pixel step along screen x / y. Computed here in
+    // uniform control flow — derivative ops are illegal inside branches.
+    let dx = dpdx(xy);
+    let dy = dpdy(xy);
+
+    let show_organic = (world.layer_flags & LAYER_ORGANIC) != 0u;
+    let show_energy = (world.layer_flags & LAYER_ENERGY) != 0u;
+    let show_fg = (world.layer_flags & LAYER_FG) != 0u;
+    let show_clan = (world.layer_flags & LAYER_CLAN) != 0u;
+    let show_mutation = (world.layer_flags & LAYER_MUTATION_RATE) != 0u;
+
+    // 4x MSAA-pattern supersampling. Standard D3D 4x sample positions, in
+    // 1/16-pixel units; converted to a cell-space displacement along the
+    // screen derivatives, shaded, and averaged.
+    var offsets = array<vec2<f32>, 4>(
+        vec2<f32>(-2.0, -6.0),
+        vec2<f32>( 6.0, -2.0),
+        vec2<f32>(-6.0,  2.0),
+        vec2<f32>( 2.0,  6.0),
+    );
+    var color = vec3<f32>(0.0);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let off = offsets[i] / 16.0;
+        let xy_s = xy + off.x * dx + off.y * dy;
+        color = color + shade(
+            xy_s, in.chunk_first_cell, aa_axis,
+            show_organic, show_energy, show_fg, show_clan, show_mutation,
+        );
+    }
+    color = color * 0.25;
 
     return vec4<f32>(color, 1.0);
 }
