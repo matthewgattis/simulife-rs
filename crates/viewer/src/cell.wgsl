@@ -247,9 +247,14 @@ fn shade(
         // World-space outline: a fixed fraction of a cell, constant
         // thickness at any zoom. Hard edges per sample (no per-sample
         // feathering) — the supersampler in fs_main does the smoothing.
-        let outline_w = OUTLINE_HALF_W;
-        let alpha_outer = 1.0 - step(outline_w, d);
-        let alpha_inner = 1.0 - step(-outline_w, d);
+        // Inside-only outline: the band sits entirely within the shape,
+        // running from the silhouette edge (d = 0) inward by line_w, so
+        // the shape's outer profile is unchanged. (Was a centered band
+        // straddling the edge, half of it outside the shape.) line_w is
+        // 2x the half-width so total thickness matches the old band.
+        let line_w = OUTLINE_HALF_W * 2.0;
+        let alpha_outer = 1.0 - step(0.0, d);
+        let alpha_inner = 1.0 - step(-line_w, d);
         // Resolve fill color: mutation > clan > occupant. Mutation
         // gradient takes priority because it's the most visually
         // distinct overlay; clan still beats default occupant colors.
