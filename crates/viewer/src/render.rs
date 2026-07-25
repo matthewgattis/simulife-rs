@@ -16,6 +16,33 @@ use crate::app::{Camera, ContextMenu, NetworkStatus, RegenDialog};
 
 const MSAA_SAMPLES: u32 = 4;
 
+/// Everything one frame needs from `App`.
+///
+/// This exists so `render` takes a single argument instead of the eighteen
+/// positional ones it grew: the fields are only weakly related, and at that
+/// count a mis-ordered pair of same-typed args compiles fine and misbehaves
+/// at runtime.
+pub struct FrameParams<'a> {
+    pub network: &'a NetworkStatus,
+    pub server_addr: SocketAddr,
+    pub chunks: &'a [WireChunk],
+    pub camera: &'a Camera,
+    pub layer_flags: &'a mut u32,
+    pub sim_paused: &'a mut bool,
+    pub sim_tick_hz: &'a mut u32,
+    pub sim_tick_rate_limited: &'a mut bool,
+    pub sim_tick: u64,
+    pub sim_tps: f32,
+    pub wire_bps: f32,
+    pub sim_params: &'a mut SimParams,
+    pub world_gen_params: &'a WorldGenParams,
+    pub cursor_px: Option<glam::Vec2>,
+    pub context_menu: &'a mut Option<ContextMenu>,
+    pub regen_dialog: &'a mut Option<RegenDialog>,
+    pub ui_visible: bool,
+    pub outgoing: &'a UnboundedSender<ClientMessage>,
+}
+
 pub const LAYER_ORGANIC: u32 = 1 << 0;
 pub const LAYER_FG: u32 = 1 << 1;
 pub const LAYER_ENERGY: u32 = 1 << 2;
@@ -167,27 +194,7 @@ impl RenderState {
         }
     }
 
-    pub fn render(
-        &mut self,
-        network: &NetworkStatus,
-        server_addr: SocketAddr,
-        chunks: &[WireChunk],
-        camera: &Camera,
-        layer_flags: &mut u32,
-        sim_paused: &mut bool,
-        sim_tick_hz: &mut u32,
-        sim_tick_rate_limited: &mut bool,
-        sim_tick: u64,
-        sim_tps: f32,
-        wire_bps: f32,
-        sim_params: &mut SimParams,
-        world_gen_params: &WorldGenParams,
-        cursor_px: Option<glam::Vec2>,
-        context_menu: &mut Option<ContextMenu>,
-        regen_dialog: &mut Option<RegenDialog>,
-        ui_visible: bool,
-        outgoing: &UnboundedSender<ClientMessage>,
-    ) -> Duration {
+    pub fn render(&mut self, mut p: FrameParams<'_>) -> Duration {
         let _render_span = tracing::info_span!("render_frame").entered();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -203,10 +210,13 @@ impl RenderState {
 
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         self.chunk_renderer
-            .upload_camera(&self.queue, camera.view_proj(aspect));
+            .upload_camera(&self.queue, p.camera.view_proj(aspect));
 
-        let cursor_world = cursor_px.map(|px| {
-            camera.pixel_to_world(
+        // Copied out of `p` so the shared borrow of the chunk slice outlives
+        // the mutable borrow of `p` taken by draw_ui below.
+        let chunks = p.chunks;
+        let cursor_world = p.cursor_px.map(|px| {
+            p.camera.pixel_to_world(
                 px,
                 glam::vec2(self.config.width as f32, self.config.height as f32),
             )
@@ -217,32 +227,15 @@ impl RenderState {
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui_output = self.egui_ctx.run(raw_input, |ctx| {
-            if ui_visible {
-                draw_ui(
-                    ctx,
-                    network,
-                    server_addr,
-                    chunks.len(),
-                    cursor_world,
-                    hovered_cell,
-                    layer_flags,
-                    sim_paused,
-                    sim_tick_hz,
-                    sim_tick_rate_limited,
-                    sim_tick,
-                    sim_tps,
-                    wire_bps,
-                    sim_params,
-                    world_gen_params,
-                    regen_dialog,
-                    outgoing,
-                );
+            if p.ui_visible {
+                draw_ui(ctx, &mut p, cursor_world, hovered_cell);
             }
-            draw_context_menu(ctx, context_menu, chunks, outgoing);
-            draw_regen_dialog(ctx, regen_dialog, outgoing);
+            draw_context_menu(ctx, p.context_menu, chunks, p.outgoing);
+            draw_regen_dialog(ctx, p.regen_dialog, p.outgoing);
         });
 
-        self.chunk_renderer.upload_world(&self.queue, *layer_flags);
+        self.chunk_renderer
+            .upload_world(&self.queue, *p.layer_flags);
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
 
@@ -865,23 +858,28 @@ fn fmt_byte_rate(bps: f32) -> String {
 
 fn draw_ui(
     ctx: &egui::Context,
-    network: &NetworkStatus,
-    server_addr: SocketAddr,
-    chunk_count: usize,
+    p: &mut FrameParams<'_>,
     cursor_world: Option<glam::Vec2>,
     hovered_cell: Option<(ChunkCoord, &WireCell)>,
-    layer_flags: &mut u32,
-    sim_paused: &mut bool,
-    sim_tick_hz: &mut u32,
-    sim_tick_rate_limited: &mut bool,
-    sim_tick: u64,
-    sim_tps: f32,
-    wire_bps: f32,
-    sim_params: &mut SimParams,
-    world_gen_params: &WorldGenParams,
-    regen_dialog: &mut Option<RegenDialog>,
-    outgoing: &UnboundedSender<ClientMessage>,
 ) {
+    // Reborrowed field by field (rather than destructured) so the body below
+    // keeps the exact types it had when these were positional parameters.
+    // The borrows are disjoint, so holding them all at once is fine.
+    let network = p.network;
+    let server_addr = p.server_addr;
+    let chunk_count = p.chunks.len();
+    let sim_tick = p.sim_tick;
+    let sim_tps = p.sim_tps;
+    let wire_bps = p.wire_bps;
+    let world_gen_params = p.world_gen_params;
+    let outgoing = p.outgoing;
+    let layer_flags = &mut *p.layer_flags;
+    let sim_paused = &mut *p.sim_paused;
+    let sim_tick_hz = &mut *p.sim_tick_hz;
+    let sim_tick_rate_limited = &mut *p.sim_tick_rate_limited;
+    let sim_params = &mut *p.sim_params;
+    let regen_dialog = &mut *p.regen_dialog;
+
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 40.0))
         .resizable(false)

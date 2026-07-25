@@ -18,7 +18,8 @@ use winit::{
 
 use crate::net;
 use crate::render::{
-    LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_MUTATION_RATE, LAYER_ORGANIC, RenderState,
+    FrameParams, LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_MUTATION_RATE, LAYER_ORGANIC,
+    RenderState,
 };
 
 #[derive(Debug, Clone)]
@@ -775,26 +776,26 @@ impl ApplicationHandler<UserEvent> for App {
                 self.handle_touch(&touch);
             }
             WindowEvent::RedrawRequested => {
-                let repaint_delay = state.render(
-                    &self.network,
-                    self.server_addr,
-                    &self.chunks,
-                    &self.camera,
-                    &mut self.layer_flags,
-                    &mut self.sim_paused,
-                    &mut self.sim_tick_hz,
-                    &mut self.sim_tick_rate_limited,
-                    self.sim_tick,
-                    self.sim_tps,
-                    self.wire_bps,
-                    &mut self.sim_params,
-                    &self.world_gen_params,
-                    self.last_cursor,
-                    &mut self.context_menu,
-                    &mut self.regen_dialog,
-                    self.ui_visible,
-                    &self.outgoing,
-                );
+                let repaint_delay = state.render(FrameParams {
+                    network: &self.network,
+                    server_addr: self.server_addr,
+                    chunks: &self.chunks,
+                    camera: &self.camera,
+                    layer_flags: &mut self.layer_flags,
+                    sim_paused: &mut self.sim_paused,
+                    sim_tick_hz: &mut self.sim_tick_hz,
+                    sim_tick_rate_limited: &mut self.sim_tick_rate_limited,
+                    sim_tick: self.sim_tick,
+                    sim_tps: self.sim_tps,
+                    wire_bps: self.wire_bps,
+                    sim_params: &mut self.sim_params,
+                    world_gen_params: &self.world_gen_params,
+                    cursor_px: self.last_cursor,
+                    context_menu: &mut self.context_menu,
+                    regen_dialog: &mut self.regen_dialog,
+                    ui_visible: self.ui_visible,
+                    outgoing: &self.outgoing,
+                });
                 // egui tells us when it next wants a frame (animation,
                 // hover effects, etc). Schedule a wake-up if finite;
                 // otherwise stay in Wait until a real event arrives.
