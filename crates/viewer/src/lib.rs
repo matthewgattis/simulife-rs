@@ -1,10 +1,9 @@
-#![allow(clippy::too_many_arguments)]
-
 mod app;
+mod config;
 mod net;
 mod render;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -12,9 +11,19 @@ use tracing::info;
 use winit::event_loop::EventLoop;
 
 use crate::app::{App, UserEvent};
+use crate::config::ServerHistory;
 
 pub struct RunOptions {
-    pub server_addr: SocketAddr,
+    /// Explicit address from the command line. Takes precedence over the
+    /// saved history.
+    pub server_addr: Option<String>,
+    /// Used when neither the command line nor the history supplies an
+    /// address. `None` means "ask the user" — the viewer opens the connect
+    /// dialog instead of connecting to anything.
+    pub fallback_addr: Option<String>,
+    /// Where to persist the list of servers that connected successfully.
+    /// `None` disables persistence for the session.
+    pub config_path: Option<PathBuf>,
     pub tick_metrics: bool,
     pub profile_duration: Option<Duration>,
 }
@@ -36,17 +45,27 @@ fn run_with_event_loop(opts: RunOptions, event_loop: EventLoop<UserEvent>) -> Re
         let shutdown_proxy = proxy.clone();
         rt.spawn(async move {
             tokio::time::sleep(d).await;
-            info!(secs = d.as_secs(), "profile duration elapsed; exiting viewer");
+            info!(
+                secs = d.as_secs(),
+                "profile duration elapsed; exiting viewer"
+            );
             let _ = shutdown_proxy.send_event(UserEvent::Shutdown);
         });
     }
 
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
 
+    let history = ServerHistory::load(opts.config_path);
+    let server_addr = opts
+        .server_addr
+        .or_else(|| history.last().map(str::to_string))
+        .or(opts.fallback_addr);
+
     let mut app = App::new(
         rt.clone(),
         proxy,
-        opts.server_addr,
+        server_addr,
+        history,
         outgoing_tx,
         outgoing_rx,
         opts.tick_metrics,
@@ -64,8 +83,6 @@ fn run_with_event_loop(opts: RunOptions, event_loop: EventLoop<UserEvent>) -> Re
 
 #[cfg(target_os = "android")]
 mod android {
-    use std::net::{SocketAddr, ToSocketAddrs};
-
     use android_activity::AndroidApp;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -75,26 +92,14 @@ mod android {
     use crate::app::UserEvent;
     use crate::{RunOptions, run_with_event_loop};
 
-    /// Hardcoded server address for the Android build. Hostname is
-    /// resolved once at startup via the system resolver — if the A record
-    /// changes you'll need to restart the app to pick it up.
-    const ANDROID_SERVER_ADDR: &str = "iapetusservers.net:4433";
-
     #[unsafe(no_mangle)]
     fn android_main(app: AndroidApp) {
         init_logging();
 
-        let server_addr: SocketAddr = match ANDROID_SERVER_ADDR
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.next())
-        {
-            Some(addr) => addr,
-            None => {
-                tracing::error!("failed to resolve {ANDROID_SERVER_ADDR}; aborting");
-                return;
-            }
-        };
+        // Servers are remembered in the app's private data dir. On a fresh
+        // install there is nothing saved and no fallback, so the viewer opens
+        // the connect dialog rather than dialling a compile-time constant.
+        let config_path = app.internal_data_path().map(|p| p.join("servers.toml"));
 
         let event_loop = match EventLoop::<UserEvent>::with_user_event()
             .with_android_app(app)
@@ -108,7 +113,9 @@ mod android {
         };
 
         let opts = RunOptions {
-            server_addr,
+            server_addr: None,
+            fallback_addr: None,
+            config_path,
             tick_metrics: false,
             profile_duration: None,
         };
