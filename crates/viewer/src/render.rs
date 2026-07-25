@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use protocol::{
@@ -12,7 +12,7 @@ use tracing::info;
 use wgpu::util::DeviceExt;
 use winit::{event::WindowEvent, window::Window};
 
-use crate::app::{Camera, ContextMenu, NetworkStatus, RegenDialog};
+use crate::app::{Camera, ConnectDialog, ContextMenu, NetworkStatus, RegenDialog};
 
 const MSAA_SAMPLES: u32 = 4;
 
@@ -24,7 +24,8 @@ const MSAA_SAMPLES: u32 = 4;
 /// at runtime.
 pub struct FrameParams<'a> {
     pub network: &'a NetworkStatus,
-    pub server_addr: SocketAddr,
+    /// `None` before the user has chosen a server.
+    pub server_addr: Option<&'a str>,
     pub chunks: &'a [WireChunk],
     pub camera: &'a Camera,
     pub layer_flags: &'a mut u32,
@@ -39,6 +40,10 @@ pub struct FrameParams<'a> {
     pub cursor_px: Option<glam::Vec2>,
     pub context_menu: &'a mut Option<ContextMenu>,
     pub regen_dialog: &'a mut Option<RegenDialog>,
+    pub connect_dialog: &'a mut Option<ConnectDialog>,
+    /// Set by the UI when "Change server..." is clicked. `App` owns the
+    /// saved history, so it constructs the dialog rather than the renderer.
+    pub request_connect_dialog: &'a mut bool,
     pub ui_visible: bool,
     pub outgoing: &'a UnboundedSender<ClientMessage>,
 }
@@ -232,6 +237,7 @@ impl RenderState {
             }
             draw_context_menu(ctx, p.context_menu, chunks, p.outgoing);
             draw_regen_dialog(ctx, p.regen_dialog, p.outgoing);
+            draw_connect_dialog(ctx, p.connect_dialog);
         });
 
         self.chunk_renderer
@@ -879,6 +885,9 @@ fn draw_ui(
     let sim_tick_rate_limited = &mut *p.sim_tick_rate_limited;
     let sim_params = &mut *p.sim_params;
     let regen_dialog = &mut *p.regen_dialog;
+    let request_connect_dialog = &mut *p.request_connect_dialog;
+
+    let server_label = server_addr.unwrap_or("(none)");
 
     egui::Window::new("Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 40.0))
@@ -886,12 +895,17 @@ fn draw_ui(
         .collapsible(true)
         .show(ctx, |ui| {
             match network {
+                // No address yet: the client task isn't running, so "connecting"
+                // would be a lie.
+                NetworkStatus::Connecting(None) if server_addr.is_none() => {
+                    ui.colored_label(egui::Color32::LIGHT_YELLOW, "No server configured");
+                }
                 NetworkStatus::Connecting(None) => {
-                    ui.label(format!("Connecting to {server_addr}..."));
+                    ui.label(format!("Connecting to {server_label}..."));
                 }
                 NetworkStatus::Connecting(Some(reason)) => {
                     ui.colored_label(egui::Color32::LIGHT_RED, "Reconnecting...");
-                    ui.label(format!("Server: {server_addr}"));
+                    ui.label(format!("Server: {server_label}"));
                     ui.weak(format!("Last error: {reason}"));
                 }
                 NetworkStatus::Connected {
@@ -901,7 +915,7 @@ fn draw_ui(
                     ..
                 } => {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
-                    ui.label(format!("Server: {server_addr}"));
+                    ui.label(format!("Server: {server_label}"));
                     ui.label(format!("World: {world_chunks_x} × {world_chunks_y} chunks"));
                     ui.horizontal(|ui| {
                         ui.label(format!("Seed: {seed:#018x}"));
@@ -913,6 +927,11 @@ fn draw_ui(
                         }
                     });
                 }
+            }
+            // App owns the saved history, so it builds the dialog itself —
+            // this only records that the user asked for it.
+            if ui.button("Change server...").clicked() {
+                *request_connect_dialog = true;
             }
             ui.separator();
             ui.label(format!("Loaded chunks: {chunk_count}"));
@@ -1228,6 +1247,63 @@ fn draw_regen_dialog(
     }
     if close {
         *regen_dialog = None;
+    }
+}
+
+fn draw_connect_dialog(ctx: &egui::Context, connect_dialog: &mut Option<ConnectDialog>) {
+    let Some(dialog) = connect_dialog.as_mut() else {
+        return;
+    };
+    let mut close = false;
+
+    egui::Window::new("Connect to server")
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label("Server address (host:port):");
+            ui.add(
+                egui::TextEdit::singleline(&mut dialog.addr_text)
+                    .desired_width(260.0)
+                    .hint_text("example.com:4433")
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.weak("A hostname or IP. Port defaults to 4433 if omitted.");
+
+            if !dialog.history.is_empty() {
+                ui.separator();
+                // from_id_salt rather than from_label: egui renders a
+                // ComboBox's label to its right, which reads backwards here.
+                egui::ComboBox::from_id_salt("recent_servers")
+                    .selected_text("Recent servers")
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for entry in &dialog.history {
+                            if ui.selectable_label(false, entry).clicked() {
+                                dialog.addr_text = entry.clone();
+                            }
+                        }
+                    });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let valid = !dialog.addr_text.trim().is_empty();
+                if ui
+                    .add_enabled(valid, egui::Button::new("Connect"))
+                    .clicked()
+                {
+                    dialog.submit = true;
+                }
+                // Nothing to cancel back to when no server is configured yet.
+                if !dialog.mandatory && ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        *connect_dialog = None;
     }
 }
 

@@ -178,19 +178,41 @@ with a backtrace.
 
 ## Server address
 
-The Android build has the server address hardcoded in
-`crates/viewer/src/lib.rs`:
+The address is chosen at runtime — there is no compile-time constant, and
+changing servers never requires a rebuild.
 
-```rust
-const ANDROID_SERVER_ADDR: &str = "iapetusservers.net:4433";
+On first launch (nothing saved yet) the viewer opens a **Connect to server**
+dialog prefilled with `iapetusservers.net:4433` as a suggestion. It does not
+connect to anything until you confirm. After that, the address is remembered
+and the app auto-connects on every subsequent start. **Change server...** in
+the Status panel reopens the dialog, which also offers a dropdown of previously
+successful addresses.
+
+A hostname or a literal IP both work, and the port may be omitted (defaults to
+4433). The address is re-resolved on every connection attempt, so a changed DNS
+record is picked up on the next retry rather than needing a restart, and a typo
+shows up as a red "Reconnecting…" status instead of killing the app.
+
+Successful addresses persist to `servers.toml`, most-recent-first:
+
+```toml
+[[server]]
+addr = "192.168.0.10:4433"
 ```
 
-It points at the public server, so no per-network configuration is needed for
-normal use. The hostname is resolved once at startup — if the A record changes,
-restart the app.
+- **Android**: in the app's private data dir
+  (`/data/data/net.iapetusservers.caviewer/files/servers.toml`, readable with
+  `adb shell run-as net.iapetusservers.caviewer cat files/servers.toml`).
+- **Desktop**: `$XDG_CONFIG_HOME/simulife-rs/servers.toml`, falling back to
+  `~/.config/simulife-rs/servers.toml`.
 
-To point the device at a server on your dev box instead, edit that constant to
-your LAN IP (`ip -4 addr show scope global`), rebuild, and reinstall:
+Only addresses that actually connected are recorded, so the list never fills
+with typos. Desktop additionally accepts `--server-addr <host:port>`, which
+overrides the saved value; with neither, it falls back to `127.0.0.1:4433` and
+connects without prompting, as it always has.
+
+To point the device at a server on your dev box, run one and enter its LAN IP
+(`ip -4 addr show scope global`) in the dialog:
 
 ```bash
 cargo run -p server --release -- \

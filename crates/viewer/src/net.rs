@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use protocol::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{Instrument, debug, info, warn};
@@ -16,13 +16,39 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Assumed when the user types a bare host with no `:port`.
+const DEFAULT_PORT: u16 = 4433;
+
+/// Appends [`DEFAULT_PORT`] when `addr` has no port, so the connect dialog
+/// accepts a bare `example.com` or `192.168.0.10`.
+///
+/// An unbracketed IPv6 literal (`::1`) is indistinguishable from a
+/// host:port pair here and is left alone — bracket it (`[::1]`) to get the
+/// default port appended.
+pub fn with_default_port(addr: &str) -> String {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return String::new();
+    }
+    // For `[::1]:4433` only the part after `]` can hold the port.
+    let tail = match addr.rfind(']') {
+        Some(i) => &addr[i + 1..],
+        None => addr,
+    };
+    if tail.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:{DEFAULT_PORT}")
+    }
+}
+
 enum SessionEnd {
     ServerClosed,
     Shutdown,
 }
 
 pub async fn run_client(
-    server_addr: SocketAddr,
+    server_addr: String,
     proxy: EventLoopProxy<UserEvent>,
     mut outgoing: UnboundedReceiver<ClientMessage>,
     tick_metrics: bool,
@@ -33,7 +59,7 @@ pub async fn run_client(
             last_reason.clone(),
         )));
 
-        match run_session(server_addr, &proxy, &mut outgoing, tick_metrics).await {
+        match run_session(&server_addr, &proxy, &mut outgoing, tick_metrics).await {
             Ok(SessionEnd::Shutdown) => return,
             Ok(SessionEnd::ServerClosed) => {
                 last_reason = Some("server closed connection".to_string());
@@ -49,15 +75,21 @@ pub async fn run_client(
 }
 
 async fn run_session(
-    server_addr: SocketAddr,
+    server_addr: &str,
     proxy: &EventLoopProxy<UserEvent>,
     outgoing: &mut UnboundedReceiver<ClientMessage>,
     tick_metrics: bool,
 ) -> Result<SessionEnd> {
+    // Resolved per attempt rather than once at startup: the address is
+    // user-supplied, so a typo has to surface as a retryable status instead
+    // of killing the app, and a hostname whose record changes is picked up
+    // without a restart.
+    let resolved = resolve(server_addr).await?;
+
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(make_client_config()?);
 
-    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    let conn = endpoint.connect(resolved, "localhost")?.await?;
     info!(remote = %conn.remote_address(), "connected");
 
     let welcome = request(&conn, &ClientMessage::Hello).await?;
@@ -229,6 +261,18 @@ async fn run_session(
     }
 }
 
+/// DNS (or literal-IP) resolution for a `host:port` string.
+///
+/// `tokio::net::lookup_host` runs the blocking resolver on a worker thread,
+/// so this is safe to call from the connect loop.
+async fn resolve(addr: &str) -> Result<SocketAddr> {
+    tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("resolve {addr}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no addresses for {addr}"))
+}
+
 async fn request(conn: &quinn::Connection, msg: &ClientMessage) -> Result<ServerMessage> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&rmp_serde::to_vec(msg)?).await?;
@@ -257,6 +301,40 @@ fn make_client_config() -> Result<quinn::ClientConfig> {
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
     config.transport_config(Arc::new(transport));
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_default_port;
+
+    #[test]
+    fn bare_host_gets_default_port() {
+        assert_eq!(with_default_port("example.com"), "example.com:4433");
+        assert_eq!(with_default_port("192.168.0.10"), "192.168.0.10:4433");
+    }
+
+    #[test]
+    fn explicit_port_is_preserved() {
+        assert_eq!(with_default_port("example.com:1234"), "example.com:1234");
+        assert_eq!(with_default_port("192.168.0.10:1234"), "192.168.0.10:1234");
+    }
+
+    #[test]
+    fn bracketed_ipv6_is_handled() {
+        assert_eq!(with_default_port("[::1]"), "[::1]:4433");
+        assert_eq!(with_default_port("[::1]:1234"), "[::1]:1234");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(with_default_port("  example.com  "), "example.com:4433");
+    }
+
+    #[test]
+    fn empty_stays_empty() {
+        assert_eq!(with_default_port(""), "");
+        assert_eq!(with_default_port("   "), "");
+    }
 }
 
 #[derive(Debug)]
