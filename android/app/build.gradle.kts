@@ -15,7 +15,10 @@ android {
         versionName = "0.1.0"
 
         ndk {
-            abiFilters += "arm64-v8a"
+            // arm64-v8a is physical devices; x86_64 is the emulator on an
+            // x86_64 host. build_apk.sh clears jniLibs each run, so the APK
+            // only carries the ABIs that invocation actually built.
+            abiFilters += listOf("arm64-v8a", "x86_64")
         }
     }
 

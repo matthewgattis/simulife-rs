@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,15 +9,19 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent},
+    event::{
+        ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+    },
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
+use crate::config::{DEFAULT_SERVER_ADDR, ServerHistory};
 use crate::net;
 use crate::render::{
-    LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_MUTATION_RATE, LAYER_ORGANIC, RenderState,
+    FrameParams, LAYER_CLAN, LAYER_ENERGY, LAYER_FG, LAYER_MUTATION_RATE, LAYER_ORGANIC,
+    RenderState,
 };
 
 #[derive(Debug, Clone)]
@@ -26,10 +29,16 @@ pub enum UserEvent {
     Network(NetworkStatus),
     /// Full snapshot — replace local chunks vec wholesale. Sent on
     /// initial Subscribe and after a regenerate.
-    Chunks { tick: u64, chunks: Vec<WireChunk> },
+    Chunks {
+        tick: u64,
+        chunks: Vec<WireChunk>,
+    },
     /// Per-tick delta — overlay each delta chunk onto the local vec
     /// by `coord`. Chunks not in the delta keep their previous state.
-    ChunksDelta { tick: u64, chunks: Vec<WireChunk> },
+    ChunksDelta {
+        tick: u64,
+        chunks: Vec<WireChunk>,
+    },
     /// Raw on-the-wire byte count of one received QUIC stream, captured
     /// before decompression. Drives the wire-rate readout.
     WireBytes(usize),
@@ -97,6 +106,23 @@ pub struct RegenDialog {
     pub params: WorldGenParams,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectDialog {
+    /// Address being edited, as `host:port`. A missing port is filled in
+    /// with the default at submit time.
+    pub addr_text: String,
+    /// Previously successful addresses, offered as a dropdown. Snapshotted
+    /// when the dialog opens so the UI doesn't borrow the live history.
+    pub history: Vec<String>,
+    /// Set by the UI when the user hits Connect. `App` consumes this after
+    /// the frame — the retarget tears down the network task, which can't
+    /// happen from inside the egui closure.
+    pub submit: bool,
+    /// True when the dialog was opened because no address is configured,
+    /// in which case there is nothing to cancel back to.
+    pub mandatory: bool,
+}
+
 impl Camera {
     pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
         let cells_y = self.cells_visible_y.max(1.0);
@@ -134,8 +160,7 @@ impl Camera {
         let new_cells = (old_cells * factor).clamp(4.0, 4096.0);
         let win_y = window_size.y.max(1.0);
         let half = window_size * 0.5;
-        self.center +=
-            ((old_pivot - half) * old_cells - (new_pivot - half) * new_cells) / win_y;
+        self.center += ((old_pivot - half) * old_cells - (new_pivot - half) * new_cells) / win_y;
         self.cells_visible_y = new_cells;
     }
 }
@@ -179,7 +204,14 @@ pub struct App {
     touches: HashMap<u64, TouchPoint>,
     context_menu: Option<ContextMenu>,
     regen_dialog: Option<RegenDialog>,
-    server_addr: SocketAddr,
+    connect_dialog: Option<ConnectDialog>,
+    /// Set by the UI's "Change server..." button, consumed after the frame.
+    request_connect_dialog: bool,
+    /// `None` until the user picks a server. The network task is only
+    /// spawned once this is set, so a fresh Android install idles on the
+    /// connect dialog instead of dialling nothing.
+    server_addr: Option<String>,
+    history: ServerHistory,
     outgoing: UnboundedSender<ClientMessage>,
     pending_outgoing_rx: Option<UnboundedReceiver<ClientMessage>>,
     proxy: EventLoopProxy<UserEvent>,
@@ -193,11 +225,20 @@ impl App {
     pub fn new(
         rt: Arc<tokio::runtime::Runtime>,
         proxy: EventLoopProxy<UserEvent>,
-        server_addr: SocketAddr,
+        server_addr: Option<String>,
+        history: ServerHistory,
         outgoing_tx: UnboundedSender<ClientMessage>,
         outgoing_rx: UnboundedReceiver<ClientMessage>,
         tick_metrics: bool,
     ) -> Self {
+        // Nothing configured (fresh Android install): open the dialog up
+        // front, prefilled with the public server as a suggestion.
+        let connect_dialog = server_addr.is_none().then(|| ConnectDialog {
+            addr_text: DEFAULT_SERVER_ADDR.to_string(),
+            history: history.entries().to_vec(),
+            submit: false,
+            mandatory: true,
+        });
         Self {
             state: None,
             network: NetworkStatus::Connecting(None),
@@ -226,7 +267,10 @@ impl App {
             touches: HashMap::new(),
             context_menu: None,
             regen_dialog: None,
+            connect_dialog,
+            request_connect_dialog: false,
             server_addr,
+            history,
             outgoing: outgoing_tx,
             pending_outgoing_rx: Some(outgoing_rx),
             proxy,
@@ -238,6 +282,94 @@ impl App {
 }
 
 impl App {
+    /// Drop the running network task and all state derived from the
+    /// connection. Replacing `outgoing` drops the old sender, so the task's
+    /// `outgoing.recv()` returns `None` and it exits cleanly — no cancellation
+    /// plumbing required. Callers are responsible for spawning a replacement.
+    fn reset_network(&mut self) {
+        let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.outgoing = new_tx;
+        self.pending_outgoing_rx = Some(new_rx);
+        self.network_started = false;
+        self.network = NetworkStatus::Connecting(None);
+
+        // Drop the cached world. The server resends a full snapshot via
+        // Welcome+Subscribe on every reconnect, so we'd just be holding
+        // chunks * CHUNK_AREA bytes of stale state in RAM otherwise.
+        self.chunks = Vec::new();
+        self.tps_samples.clear();
+        self.wire_byte_samples.clear();
+        self.wire_bps = 0.0;
+        self.last_wire_rate_update = None;
+        self.centered_once = false;
+    }
+
+    /// Start the client task, unless one is already running or no server has
+    /// been chosen yet. Safe to call repeatedly.
+    fn spawn_network(&mut self) {
+        if self.network_started {
+            return;
+        }
+        let Some(server_addr) = self.server_addr.clone() else {
+            return;
+        };
+        self.network_started = true;
+        let proxy = self.proxy.clone();
+        let outgoing_rx = self
+            .pending_outgoing_rx
+            .take()
+            .expect("outgoing receiver consumed twice");
+        let tick_metrics = self.tick_metrics;
+        self.rt.spawn(async move {
+            net::run_client(server_addr, proxy, outgoing_rx, tick_metrics).await;
+        });
+    }
+
+    /// Point the viewer at a different server, tearing down the current
+    /// session and dialling the new one.
+    fn set_server_addr(&mut self, addr: String) {
+        info!(%addr, "retargeting to new server");
+        self.server_addr = Some(addr);
+        self.reset_network();
+        // Only spawn once there's a surface to render into; otherwise
+        // resumed() picks it up when it creates one.
+        if self.state.is_some() {
+            self.spawn_network();
+        }
+        if let Some(state) = &self.state {
+            state.window().request_redraw();
+        }
+    }
+
+    fn open_connect_dialog(&mut self) {
+        self.connect_dialog = Some(ConnectDialog {
+            addr_text: self
+                .server_addr
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SERVER_ADDR.to_string()),
+            history: self.history.entries().to_vec(),
+            submit: false,
+            mandatory: self.server_addr.is_none(),
+        });
+    }
+
+    /// Apply a submitted connect dialog. Runs after the frame because
+    /// retargeting tears down the network task, which can't be done from
+    /// inside the egui closure that owns a borrow of the dialog.
+    fn apply_connect_dialog(&mut self) {
+        if std::mem::take(&mut self.request_connect_dialog) {
+            self.open_connect_dialog();
+        }
+        if !self.connect_dialog.as_ref().is_some_and(|d| d.submit) {
+            return;
+        }
+        let dialog = self.connect_dialog.take().expect("checked above");
+        let addr = net::with_default_port(&dialog.addr_text);
+        if !addr.is_empty() {
+            self.set_server_addr(addr);
+        }
+    }
+
     /// Record one tick reception, drop expired samples, and refresh
     /// the displayed TPS at most once per second. Computes TPS as
     /// `(latest_tick - oldest_tick_in_window) / (latest_time -
@@ -274,10 +406,7 @@ impl App {
                     // Skip if either finger landed on UI so widget drags
                     // (sliders, dialog moves) don't double as canvas zooms.
                     let ids: Vec<u64> = self.touches.keys().copied().collect();
-                    let any_started_over_ui = self
-                        .touches
-                        .values()
-                        .any(|t| t.started_over_ui);
+                    let any_started_over_ui = self.touches.values().any(|t| t.started_over_ui);
 
                     let last_a = self.touches[&ids[0]].last_pos;
                     let last_b = self.touches[&ids[1]].last_pos;
@@ -304,10 +433,8 @@ impl App {
 
                     if last_dist > 1.0 && new_dist > 1.0 {
                         let factor = last_dist / new_dist;
-                        let win_size = glam::vec2(
-                            state.width().max(1) as f32,
-                            state.height().max(1) as f32,
-                        );
+                        let win_size =
+                            glam::vec2(state.width().max(1) as f32, state.height().max(1) as f32);
                         self.camera
                             .zoom_pan_around(factor, last_mid, new_mid, win_size);
                         state.window().request_redraw();
@@ -340,10 +467,8 @@ impl App {
                         && held >= LONG_PRESS_DURATION
                         && movement <= LONG_PRESS_MAX_MOVEMENT
                     {
-                        let win_size = glam::vec2(
-                            state.width().max(1) as f32,
-                            state.height().max(1) as f32,
-                        );
+                        let win_size =
+                            glam::vec2(state.width().max(1) as f32, state.height().max(1) as f32);
                         let world = self.camera.pixel_to_world(pos, win_size);
                         let scale = state.window().scale_factor() as f32;
                         self.context_menu = Some(ContextMenu {
@@ -434,23 +559,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Tear down the network task too: holding a QUIC connection (with
         // 2s keep-alives) while backgrounded burns battery and data, and
-        // the server gets to free the slot. Replacing self.outgoing with a
-        // fresh channel drops the old sender; the task's outgoing.recv()
-        // returns None and it exits cleanly. resumed() will spawn a new one.
-        let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.outgoing = new_tx;
-        self.pending_outgoing_rx = Some(new_rx);
-        self.network_started = false;
-        self.network = NetworkStatus::Connecting(None);
-
-        // Drop the cached world. The server resends a full snapshot via
-        // Welcome+Subscribe on every reconnect, so we'd just be holding
-        // chunks * CHUNK_AREA bytes of stale state in RAM otherwise.
-        self.chunks = Vec::new();
-        self.tps_samples.clear();
-        self.wire_byte_samples.clear();
-        self.wire_bps = 0.0;
-        self.last_wire_rate_update = None;
+        // the server gets to free the slot. resumed() will spawn a new one.
+        self.reset_network();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -471,23 +581,10 @@ impl ApplicationHandler<UserEvent> for App {
                 )
                 .expect("create window"),
         );
-        let state = pollster::block_on(RenderState::new(window))
-            .expect("initialize wgpu");
+        let state = pollster::block_on(RenderState::new(window)).expect("initialize wgpu");
         self.state = Some(state);
 
-        if !self.network_started {
-            self.network_started = true;
-            let proxy = self.proxy.clone();
-            let server_addr = self.server_addr;
-            let outgoing_rx = self
-                .pending_outgoing_rx
-                .take()
-                .expect("outgoing receiver consumed twice");
-            let tick_metrics = self.tick_metrics;
-            self.rt.spawn(async move {
-                net::run_client(server_addr, proxy, outgoing_rx, tick_metrics).await;
-            });
-        }
+        self.spawn_network();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -524,6 +621,12 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sim_tick = *tick;
                     self.sim_params = *sim_params;
                     self.world_gen_params = *world_gen_params;
+
+                    // Only remember addresses that actually worked, so the
+                    // history never accumulates typos.
+                    if let Some(addr) = self.server_addr.clone() {
+                        self.history.record(&addr);
+                    }
                 }
                 self.network = status;
             }
@@ -564,7 +667,10 @@ impl ApplicationHandler<UserEvent> for App {
                     info!(tick, assign_us, upload_us, total_us, "tick applied");
                 }
             }
-            UserEvent::ChunksDelta { tick, chunks: delta } => {
+            UserEvent::ChunksDelta {
+                tick,
+                chunks: delta,
+            } => {
                 let _apply_span = tracing::info_span!("tick_apply_delta", tick).entered();
                 let dispatch_start = self.tick_metrics.then(Instant::now);
                 let dirty = delta.len();
@@ -583,10 +689,7 @@ impl ApplicationHandler<UserEvent> for App {
                             (incoming.coord.y as usize) * (wx as usize)
                                 + (incoming.coord.x as usize),
                         ),
-                        None => self
-                            .chunks
-                            .iter()
-                            .position(|c| c.coord == incoming.coord),
+                        None => self.chunks.iter().position(|c| c.coord == incoming.coord),
                     };
                     if let Some(idx) = target_idx
                         && let Some(slot) = self.chunks.get_mut(idx)
@@ -620,12 +723,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -674,10 +772,8 @@ impl ApplicationHandler<UserEvent> for App {
             } => match (button, button_state) {
                 (MouseButton::Right, ElementState::Pressed) => {
                     if let Some(cursor) = self.last_cursor {
-                        let win_size = glam::vec2(
-                            state.width().max(1) as f32,
-                            state.height().max(1) as f32,
-                        );
+                        let win_size =
+                            glam::vec2(state.width().max(1) as f32, state.height().max(1) as f32);
                         let world = self.camera.pixel_to_world(cursor, win_size);
                         let scale = state.window().scale_factor() as f32;
                         self.context_menu = Some(ContextMenu {
@@ -739,8 +835,8 @@ impl ApplicationHandler<UserEvent> for App {
                             if (self.layer_flags & LAYER_CLAN) != 0 {
                                 self.layer_flags &= !LAYER_CLAN;
                             } else {
-                                self.layer_flags = (self.layer_flags & !LAYER_MUTATION_RATE)
-                                    | LAYER_CLAN;
+                                self.layer_flags =
+                                    (self.layer_flags & !LAYER_MUTATION_RATE) | LAYER_CLAN;
                             }
                         }
                         "5" => {
@@ -775,41 +871,46 @@ impl ApplicationHandler<UserEvent> for App {
                 self.handle_touch(&touch);
             }
             WindowEvent::RedrawRequested => {
-                let repaint_delay = state.render(
-                    &self.network,
-                    self.server_addr,
-                    &self.chunks,
-                    &self.camera,
-                    &mut self.layer_flags,
-                    &mut self.sim_paused,
-                    &mut self.sim_tick_hz,
-                    &mut self.sim_tick_rate_limited,
-                    self.sim_tick,
-                    self.sim_tps,
-                    self.wire_bps,
-                    &mut self.sim_params,
-                    &self.world_gen_params,
-                    self.last_cursor,
-                    &mut self.context_menu,
-                    &mut self.regen_dialog,
-                    self.ui_visible,
-                    &self.outgoing,
-                );
+                let repaint_delay = state.render(FrameParams {
+                    network: &self.network,
+                    server_addr: self.server_addr.as_deref(),
+                    chunks: &self.chunks,
+                    camera: &self.camera,
+                    layer_flags: &mut self.layer_flags,
+                    sim_paused: &mut self.sim_paused,
+                    sim_tick_hz: &mut self.sim_tick_hz,
+                    sim_tick_rate_limited: &mut self.sim_tick_rate_limited,
+                    sim_tick: self.sim_tick,
+                    sim_tps: self.sim_tps,
+                    wire_bps: self.wire_bps,
+                    sim_params: &mut self.sim_params,
+                    world_gen_params: &self.world_gen_params,
+                    cursor_px: self.last_cursor,
+                    context_menu: &mut self.context_menu,
+                    regen_dialog: &mut self.regen_dialog,
+                    connect_dialog: &mut self.connect_dialog,
+                    request_connect_dialog: &mut self.request_connect_dialog,
+                    ui_visible: self.ui_visible,
+                    outgoing: &self.outgoing,
+                });
                 // egui tells us when it next wants a frame (animation,
                 // hover effects, etc). Schedule a wake-up if finite;
                 // otherwise stay in Wait until a real event arrives.
                 if repaint_delay == Duration::ZERO {
                     state.window().request_redraw();
                 } else if repaint_delay < Duration::MAX {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(
-                        Instant::now() + repaint_delay,
-                    ));
+                    event_loop
+                        .set_control_flow(ControlFlow::WaitUntil(Instant::now() + repaint_delay));
                 } else {
                     event_loop.set_control_flow(ControlFlow::Wait);
                 }
             }
             _ => {}
         }
+
+        // Deferred until the `state` borrow above has ended: retargeting
+        // needs `&mut self` to tear down and respawn the network task.
+        self.apply_connect_dialog();
     }
 }
 

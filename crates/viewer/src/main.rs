@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, process, time::Duration};
+use std::{path::PathBuf, process, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -11,9 +11,11 @@ use viewer::{RunOptions, run_viewer};
 #[derive(Parser, Debug)]
 #[command(version, about = "cellular-automata viewer")]
 struct Args {
-    /// Server address to connect to.
-    #[arg(long, default_value = "127.0.0.1:4433")]
-    server_addr: SocketAddr,
+    /// Server address to connect to, as `host:port`. Accepts a hostname.
+    /// When omitted, the last address that connected successfully is reused,
+    /// falling back to 127.0.0.1:4433.
+    #[arg(long)]
+    server_addr: Option<String>,
 
     /// Log per-tick timing (read/decode/upload times). Off by default.
     #[arg(long)]
@@ -36,6 +38,10 @@ fn main() -> Result<()> {
 
     run_viewer(RunOptions {
         server_addr: args.server_addr,
+        // Desktop keeps its historical behaviour: connect on launch without
+        // prompting, even on a first run with nothing saved.
+        fallback_addr: Some("127.0.0.1:4433".to_string()),
+        config_path: config_path(),
         tick_metrics: args.tick_metrics,
         profile_duration: args.profile_duration_secs.map(Duration::from_secs),
     })?;
@@ -45,6 +51,15 @@ fn main() -> Result<()> {
     // A hard exit here is safe — all important state (trace flush guard, etc.)
     // lives on the stack above us.
     process::exit(0);
+}
+
+/// `$XDG_CONFIG_HOME/simulife-rs/servers.toml`, falling back to `~/.config`.
+/// `None` when neither variable is set, which just disables persistence.
+fn config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("simulife-rs").join("servers.toml"))
 }
 
 fn init_tracing(trace_chrome: Option<&std::path::Path>) -> Option<FlushGuard> {
