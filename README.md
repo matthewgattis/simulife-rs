@@ -25,6 +25,7 @@ android/      Gradle project that bundles libviewer.so into an APK
 docs/         build/deploy notes (currently: Android)
 scripts/
   analyze-trace.sh   summarises a tracing-chrome JSON trace
+Dockerfile    multi-stage build for a slim server image (see Docker section)
 ```
 
 ## Build & run
@@ -88,6 +89,26 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 The Android build's server address is hardcoded in `crates/viewer/src/lib.rs` (`ANDROID_SERVER_ADDR`); change and rebuild to retarget. The viewer disconnects from the server on background and reconnects on foreground (the cached world is dropped to free RAM; the server resends a fresh snapshot on reconnect).
 
 See [`docs/android.md`](docs/android.md) for one-time toolchain setup, install/launch/log commands, and the common failure modes.
+
+### Docker (server)
+
+The server can run as a container — the target machine needs only Docker, no Rust toolchain. The [`Dockerfile`](Dockerfile) is a multi-stage build (commented line-by-line): a `rust:1-bookworm` stage compiles `-p server`, then only the binary ships in a `debian:bookworm-slim` runtime image, running as a non-root user.
+
+```sh
+docker build -t simulife-server .
+docker run --rm -p 4433:4433/udp simulife-server
+```
+
+- **The `/udp` matters** — QUIC runs over UDP, and `-p` publishes TCP by default.
+- The image bakes in `--listen 0.0.0.0:4433` (a container's loopback isn't reachable from outside). Any other server flags can be appended after the image name.
+- To persist world snapshots, mount a volume at `/data` (the image's working directory):
+
+```sh
+docker run --rm -p 4433:4433/udp -v simulife-data:/data \
+  simulife-server --world-file /data/world.bin
+```
+
+- Images are architecture-specific: a build on Apple Silicon produces a `linux/arm64` image. For an x86 target, cross-build with `docker build --platform linux/amd64 .` (works via emulation, but compiles slowly).
 
 ## Simulation rules (high level)
 

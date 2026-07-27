@@ -1,0 +1,9 @@
+# Like .gitignore, but for `docker build`: anything listed here is never sent
+# to the Docker daemon as part of the "build context". Keeping the context
+# small makes builds start faster and avoids cache-busting on irrelevant files.
+target/
+.git/
+android/
+docs/
+scripts/
+*.md
