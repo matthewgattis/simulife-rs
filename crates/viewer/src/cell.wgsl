@@ -259,7 +259,7 @@ fn shade(
         // gradient takes priority because it's the most visually
         // distinct overlay; clan still beats default occupant colors.
         var fg = occupant_color(cell);
-        if (show_clan) { fg = clan_color(cell.clan); }
+        if (show_clan) { fg = mix(fg, clan_color(cell.clan), 0.5); }
         if (show_mutation) { fg = mutation_rate_color(cell.mutation_rate); }
         color = mix(color, OUTLINE_COLOR, alpha_outer);
         color = mix(color, fg, alpha_inner);
