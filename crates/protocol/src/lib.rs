@@ -35,13 +35,17 @@ pub const GENOME_MAX: usize = 128;
 /// Initial per-genome mutation rate. Each lineage's actual rate
 /// drifts under selection pressure (mutation_rate is itself
 /// mutable per-copy).
-pub const DEFAULT_MUTATION_RATE: f32 = 0.05;
-pub const MUTATION_RATE_MAX: f32 = 0.2;
+/// Scale factor for fixed-point mutation rates. Stored values = actual_rate * RATE_SCALE.
+/// 10000 gives 4 decimal places of precision; max value ~4.2 billion (safe in u32).
+pub const RATE_SCALE: u32 = 10000;
+
+pub const DEFAULT_MUTATION_RATE: u32 = 500;   // 0.05
+pub const MUTATION_RATE_MAX: u32 = 2000;      // 0.2
 /// Hard floor for genome mutation rates. Prevents an absorbing state
 /// at zero (where the meta-mutation gate `rng < rate` can never fire
 /// again) and gives every lineage at least a tiny pressure toward
 /// change. Clamped in `mutate_genome`.
-pub const MUTATION_RATE_MIN: f32 = 0.01;
+pub const MUTATION_RATE_MIN: u32 = 100;       // 0.01
 
 /// Live-tunable simulation scalars. The server owns the authoritative
 /// copy in `SimState.params`; the viewer mirrors it via `Welcome` and
@@ -192,10 +196,10 @@ impl Default for Gene {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Genome {
     pub genes: Vec<Gene>,
-    /// Per-genome mutation rate. Mutates with each copy, so a lineage
-    /// can evolve toward stability or chaos under selection. Bounded
-    /// by [0.0, MUTATION_RATE_MAX].
-    pub mutation_rate: f32,
+    /// Per-genome mutation rate (fixed-point: value * RATE_SCALE = actual_rate).
+    /// Mutates with each copy, so a lineage can evolve toward stability or chaos
+    /// under selection. Bounded by [MUTATION_RATE_MIN, MUTATION_RATE_MAX].
+    pub mutation_rate: u32,
 }
 
 impl Genome {

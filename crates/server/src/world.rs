@@ -98,7 +98,7 @@ pub fn place_random_sprout_grid(
                     _ => Direction::West,
                 };
                 let mut starter = Genome::default_vine();
-                starter.mutation_rate = 1.0;
+                starter.mutation_rate = protocol::DEFAULT_MUTATION_RATE;
                 let mut genome = crate::sim::mutate_genome(&starter, rng);
                 // Log-uniform spread around DEFAULT controlled by
                 // params.initial_mutation_rate_octaves. 0 = no
@@ -108,10 +108,13 @@ pub fn place_random_sprout_grid(
                 } else {
                     0.0
                 };
-                let rate = protocol::DEFAULT_MUTATION_RATE * 2f32.powf(oct);
+                // Convert float octaves to fixed-point rate: DEFAULT_MUTATION_RATE * 2^oct.
+                // Keep octave math in float, then convert result to fixed-point.
+                let rate_float = (protocol::DEFAULT_MUTATION_RATE as f32 / protocol::RATE_SCALE as f32) * 2f32.powf(oct);
+                let rate = (rate_float * protocol::RATE_SCALE as f32).round() as u32;
                 genome.mutation_rate =
                     rate.clamp(protocol::MUTATION_RATE_MIN, protocol::MUTATION_RATE_MAX);
-                let stamp_rate = genome.mutation_rate;
+                let stamp_rate = genome.mutation_rate as f32 / protocol::RATE_SCALE as f32;
                 // Clan: which 2D box this sprout starts in. Encoded
                 // row-major: clan = box_y * boxes_x + box_x.
                 let bx = (x / box_w) as u32;

@@ -10,7 +10,7 @@ use rand::SeedableRng;
 
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ClanId, Direction, Energy, GENOME_MAX, GENOME_MIN, Gene,
-    Genome, MUTATION_RATE_MAX, MUTATION_RATE_MIN, Occupant, STEM_CONNECT_EAST, STEM_CONNECT_NORTH,
+    Genome, MUTATION_RATE_MAX, MUTATION_RATE_MIN, Occupant, RATE_SCALE, STEM_CONNECT_EAST, STEM_CONNECT_NORTH,
     STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, ServerMessage, SimParams, SlotProduct, WorldGenParams,
 };
 use rand::Rng;
@@ -431,7 +431,7 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     // we can compute it from (x, y) the same way world::place_random does.
     let mut chunks = state.world.lock().expect("sim lock poisoned");
     let genome = Genome::default_vine();
-    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = genome.mutation_rate;
+    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = genome.mutation_rate as f32 / protocol::RATE_SCALE as f32;
     chunks[chunk_idx].cells[cell_idx].occupant = Occupant::Sprout {
         plant,
         clan: 0,
@@ -1867,7 +1867,7 @@ fn phase_growth_pull(
             rng,
         ) {
             let cell = &mut chunks[bid.dst_chunk_idx].cells[bid.dst_cell_idx];
-            cell.lineage_mutation_rate = sprout.genome.mutation_rate;
+            cell.lineage_mutation_rate = sprout.genome.mutation_rate as f32 / protocol::RATE_SCALE as f32;
             cell.occupant = occ;
         }
     }
@@ -1991,19 +1991,22 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
     // 1. Maybe perturb the mutation rate itself (multiplicative jitter).
     // Always clamp the result so a genome handed in with an out-of-band
     // rate gets normalized on its first copy.
+    // Fixed-point arithmetic: rate and RATE_SCALE are integers, no float variance.
     let mut rate = g.mutation_rate;
-    if rng.r#gen::<f32>() < rate {
-        rate *= rng.gen_range(0.5..1.5);
+    if rng.gen_range(0..RATE_SCALE) < rate {
+        // Perturb: multiply by a factor in [0.5, 1.5) represented as [5000, 15000) / 10000
+        let perturb = rng.gen_range(5000..15000);
+        rate = ((rate as u64 * perturb as u64) / 10000) as u32;
     }
     rate = rate.clamp(MUTATION_RATE_MIN, MUTATION_RATE_MAX);
-    let insert_rate = rate * 0.1;
-    let delete_rate = rate * 0.1;
+    let insert_rate = rate / 10;
+    let delete_rate = rate / 10;
 
     // 2. Decide deletions per old gene. Never let the genome drop
     // below GENOME_MIN; if too many were marked, unmark from the
     // start until we're at the floor.
     let mut delete: Vec<bool> = (0..old_len)
-        .map(|_| rng.r#gen::<f32>() < delete_rate)
+        .map(|_| rng.gen_range(0..RATE_SCALE) < delete_rate)
         .collect();
     let mut alive = old_len - delete.iter().filter(|&&d| d).count();
     if alive < GENOME_MIN && old_len >= GENOME_MIN {
@@ -2028,7 +2031,7 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
         if planned >= GENOME_MAX {
             break;
         }
-        if rng.r#gen::<f32>() < insert_rate {
+        if rng.gen_range(0..RATE_SCALE) < insert_rate {
             *ins = true;
             planned += 1;
         }
@@ -2058,16 +2061,16 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
             continue;
         }
         let mut new_gene = g.genes[i];
-        if rng.r#gen::<f32>() < rate {
+        if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.front = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < rate {
+        if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.left = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < rate {
+        if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.right = random_slot(rng);
         }
-        let next_remap = if rng.r#gen::<f32>() < rate {
+        let next_remap = if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.next = rng.r#gen::<u8>();
             None
         } else {
@@ -3170,7 +3173,7 @@ mod tests {
         // Rates below MUTATION_RATE_MIN should be lifted to MIN on the
         // next copy, so no lineage gets stuck at the absorbing zero.
         let mut g = Genome::default_vine();
-        g.mutation_rate = 0.0;
+        g.mutation_rate = 0;
         let copied = mutate_genome(&g, &mut det_rng());
         assert!(
             copied.mutation_rate >= MUTATION_RATE_MIN,
@@ -3186,7 +3189,7 @@ mod tests {
     #[test]
     fn mutate_genome_with_same_seed_is_deterministic() {
         let mut g = Genome::default_vine();
-        g.mutation_rate = 0.5;
+        g.mutation_rate = 5000;  // 0.5 in fixed-point
         let a = mutate_genome(&g, &mut ChaCha12Rng::seed_from_u64(42));
         let b = mutate_genome(&g, &mut ChaCha12Rng::seed_from_u64(42));
         assert_eq!(
@@ -3203,7 +3206,7 @@ mod tests {
         // and run many generations to confirm the size envelope holds.
         let mut g = Genome {
             genes: vec![Gene::default()],
-            mutation_rate: 0.5,
+            mutation_rate: 5000,  // 0.5 in fixed-point
         };
         let mut rng = det_rng();
         for _ in 0..200 {
@@ -3255,7 +3258,7 @@ mod tests {
                     next: 0,
                 },
             ],
-            mutation_rate: 0.0, // no field mutations
+            mutation_rate: 0,  // no field mutations (zero → mutations won't fire)
         };
         // No rate → no inserts/deletes. Genome should clone exactly.
         let copy = mutate_genome(&g, &mut det_rng());
