@@ -507,6 +507,9 @@ pub fn mutate_world(
     next_plant_id: &AtomicU32,
     rng: &mut impl Rng,
 ) {
+    // For determinism debugging: log the RNG state before phases that use it
+    // (We can't inspect ChaCha12Rng state directly, but we can trace RNG usage)
+    let _tick_marker = tracing::debug_span!("mutate_world_tick");
     let edge = CHUNK_EDGE as i32;
     let max_x = chunks_x as i32 * edge;
     let max_y = chunks_y as i32 * edge;

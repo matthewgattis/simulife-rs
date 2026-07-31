@@ -108,13 +108,30 @@ struct Args {
     determinism_test: Option<String>,
 }
 
+fn count_occupants(chunks: &[protocol::Chunk]) -> (u32, u32, u32) {
+    let mut sprouts = 0;
+    let mut seeds = 0;
+    let mut leaves = 0;
+    for chunk in chunks {
+        for cell in &chunk.cells {
+            match cell.occupant {
+                protocol::Occupant::Sprout { .. } => sprouts += 1,
+                protocol::Occupant::Seed { .. } => seeds += 1,
+                protocol::Occupant::Leaf { .. } => leaves += 1,
+                _ => {}
+            }
+        }
+    }
+    (sprouts, seeds, leaves)
+}
+
 fn run_determinism_test(
     spec: &str,
     _chunks: Vec<protocol::Chunk>,
     chunks_x: u32,
     chunks_y: u32,
     world_gen_params: protocol::WorldGenParams,
-    sim_params: protocol::SimParams,
+    _sim_params: protocol::SimParams,
     _seed: u64,
     _rng: ChaCha12Rng,
     _next_plant_id: u32,
@@ -127,6 +144,12 @@ fn run_determinism_test(
         .ok_or_else(|| anyhow::anyhow!("expected SEED:TICKS format"))?;
     let test_seed: u64 = seed_str.parse()?;
     let test_ticks: u64 = ticks_str.parse()?;
+
+    // Test with world_wrap=true (the default that causes issues)
+    let test_sim_params = protocol::SimParams {
+        world_wrap: true,
+        ..protocol::SimParams::default()
+    };
 
     println!("🔬 Determinism Test: seed={}, ticks={}", test_seed, test_ticks);
 
@@ -172,28 +195,33 @@ fn run_determinism_test(
 
     let next_id = AtomicU32::new(count + 1);
     for tick in 1..=test_ticks {
-        let hash_before = if tick <= 3 { Some(hash_chunks(&chunks)) } else { None };
+        // Count occupants before tick
+        let (sprouts_before, seeds_before, leaves_before) = count_occupants(&chunks);
 
         sim::mutate_world(
             &mut chunks,
             chunks_x,
             chunks_y,
-            &sim_params,
+            &test_sim_params,
             &next_id,
             &mut rng,
         );
+
         let hash_after = hash_chunks(&chunks);
 
-        if tick <= 3 || tick % 10 == 0 || tick == test_ticks {
+        // Count occupants after tick
+        let (sprouts_after, seeds_after, leaves_after) = count_occupants(&chunks);
+        let next_id_value = next_id.load(std::sync::atomic::Ordering::Relaxed);
+
+        if tick <= 5 || tick % 10 == 0 || tick == test_ticks {
             println!(
-                "  Tick {}: hash={:016x}",
-                tick, hash_after
+                "  Tick {}: hash={:016x} | sprouts:{}->{} seeds:{}->{} leaves:{}->{} next_id={}",
+                tick, hash_after,
+                sprouts_before, sprouts_after,
+                seeds_before, seeds_after,
+                leaves_before, leaves_after,
+                next_id_value
             );
-            if let Some(h_before) = hash_before {
-                if h_before == hash_after {
-                    println!("    (no changes in this tick)");
-                }
-            }
         }
     }
 
