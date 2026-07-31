@@ -294,44 +294,36 @@ Client and server exchange **binary** messages (msgpack + optional zstd compress
 skinparam backgroundColor #f5f5f5
 skinparam fontSize 10
 
-rectangle "ClientMessage (client → server)" {
-  card Pause
-  card Resume
-  card Tick
-  card SetSimParams {
-    parameter
-    value
-  }
-  card RegenerateWorld {
-    seed
-    WorldGenParams
-  }
+package "ClientMessage (client → server)" {
+  component "Pause"
+  component "Resume"
+  component "Tick"
+  component "SetSimParams\n(parameter, value)"
+  component "RegenerateWorld\n(seed, WorldGenParams)"
 }
 
-rectangle "ServerMessage (server → client)" {
-  card Welcome {
-    tick: u64
-    chunks_x/y: u32
-    sim_params: SimParams
-    world_gen_params: WorldGenParams
-    chunks: Vec<Chunk>
-    seed: u64
-    rng: ChaCha12Rng
+package "ServerMessage (server → client)" {
+  component "Welcome" {
+    portin tick
+    portin chunks_x/y
+    portin sim_params
+    portin world_gen_params
+    portin chunks
+    portin seed
+    portin rng
   }
-  card TickUpdate {
-    tick: u64
-    chunk_updates: Vec<ChunkBatch>
+  component "TickUpdate" {
+    portin tick
+    portin chunk_updates
   }
 }
 
 note right
   **Welcome**: Sent on connect and after Regenerate.
-  Establishes synchronized state.
-  Allows viewer to mirror sim controls.
+  Establishes synchronized state. Allows viewer to mirror sim controls.
 
   **TickUpdate**: Sent every tick (if running).
-  Only modified chunks included.
-  Msgpack + optional zstd compress.
+  Only modified chunks included. Msgpack + optional zstd compress.
 end note
 @enduml
 ```
