@@ -294,28 +294,17 @@ Client and server exchange **binary** messages (msgpack + optional zstd compress
 skinparam backgroundColor #f5f5f5
 skinparam fontSize 10
 
-package "ClientMessage (client → server)" {
-  component "Pause"
-  component "Resume"
-  component "Tick"
-  component "SetSimParams\n(parameter, value)"
-  component "RegenerateWorld\n(seed, WorldGenParams)"
+package "ClientMessage" {
+  [Pause]
+  [Resume]
+  [Tick]
+  [SetSimParams: parameter, value]
+  [RegenerateWorld: seed, WorldGenParams]
 }
 
-package "ServerMessage (server → client)" {
-  component "Welcome" {
-    portin tick
-    portin chunks_x/y
-    portin sim_params
-    portin world_gen_params
-    portin chunks
-    portin seed
-    portin rng
-  }
-  component "TickUpdate" {
-    portin tick
-    portin chunk_updates
-  }
+package "ServerMessage" {
+  [Welcome: tick, chunks_x/y, sim_params, world_gen_params, chunks, seed, rng]
+  [TickUpdate: tick, chunk_updates]
 }
 
 note right
