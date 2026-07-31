@@ -4489,4 +4489,98 @@ mod tests {
             other => panic!("expected sprout, got {other:?}"),
         }
     }
+
+    #[test]
+    fn mutate_world_deterministic_with_same_seed() {
+        // Test if mutate_world produces identical results when called twice
+        // with worlds built from the same seed. This tests the full
+        // simulation path, not just world generation.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_chunks(chunks: &[Chunk]) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            for chunk in chunks {
+                for cell in &chunk.cells {
+                    cell.organic.hash(&mut hasher);
+                    cell.soil_energy.hash(&mut hasher);
+                    // Hash occupant including genome details
+                    match &cell.occupant {
+                        Occupant::Sprout {
+                            energy,
+                            genome,
+                            current_gene,
+                            ..
+                        } => {
+                            energy.hash(&mut hasher);
+                            current_gene.hash(&mut hasher);
+                            for gene in &genome.genes {
+                                gene.next.hash(&mut hasher);
+                            }
+                            genome.mutation_rate.hash(&mut hasher);
+                        }
+                        Occupant::Seed { energy, genome, .. } => {
+                            energy.hash(&mut hasher);
+                            for gene in &genome.genes {
+                                gene.next.hash(&mut hasher);
+                            }
+                            genome.mutation_rate.hash(&mut hasher);
+                        }
+                        Occupant::Leaf { energy, .. }
+                        | Occupant::Root { energy, .. }
+                        | Occupant::Antenna { energy, .. }
+                        | Occupant::Stem { energy, .. } => {
+                            energy.hash(&mut hasher);
+                        }
+                        Occupant::Empty => {}
+                    }
+                }
+            }
+            hasher.finish()
+        }
+
+        // Build two identical worlds from the same seed
+        let world_gen = protocol::WorldGenParams {
+            chunks_x: 2,
+            chunks_y: 2,
+            boxes_x: 1,
+            boxes_y: 1,
+            sunlit_margin_frac: 0.1,
+            sprout_grid_spacing: 8,
+            toxic_border_thickness: 1,
+            toxic_border_organic: 1000,
+            default_organic: 40,
+            default_soil_energy: 100,
+            initial_mutation_rate_octaves: 1.0,
+        };
+
+        let seed = 9999;
+        let mut chunks1 = crate::world::build_world(&world_gen);
+        let mut rng1 = ChaCha12Rng::seed_from_u64(seed);
+        let count1 = crate::world::place_random_sprout_grid(&mut chunks1, &world_gen, &mut rng1);
+
+        let mut chunks2 = crate::world::build_world(&world_gen);
+        let mut rng2 = ChaCha12Rng::seed_from_u64(seed);
+        let count2 = crate::world::place_random_sprout_grid(&mut chunks2, &world_gen, &mut rng2);
+
+        let hash_before1 = hash_chunks(&chunks1);
+        let hash_before2 = hash_chunks(&chunks2);
+        assert_eq!(hash_before1, hash_before2, "initial worlds should hash identically");
+
+        // Advance both worlds one tick with mutate_world
+        let params = test_params();
+        let next_id_1 = AtomicU32::new(count1 + 1);
+        let next_id_2 = AtomicU32::new(count2 + 1);
+
+        mutate_world(&mut chunks1, 2, 2, &params, &next_id_1, &mut rng1);
+        mutate_world(&mut chunks2, 2, 2, &params, &next_id_2, &mut rng2);
+
+        let hash_after1 = hash_chunks(&chunks1);
+        let hash_after2 = hash_chunks(&chunks2);
+
+        assert_eq!(
+            hash_after1, hash_after2,
+            "after mutate_world with same seed, worlds should remain identical"
+        );
+    }
 }
