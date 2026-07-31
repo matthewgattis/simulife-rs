@@ -499,7 +499,7 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     info!(x, y, plant, ?facing, "sprout spawned");
 }
 
-fn mutate_world(
+pub fn mutate_world(
     chunks: &mut [Chunk],
     chunks_x: u32,
     chunks_y: u32,

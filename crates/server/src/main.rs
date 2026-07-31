@@ -99,6 +99,107 @@ struct Args {
     /// or when you want trace events for an unattended run.
     #[arg(long)]
     always_encode: bool,
+
+    /// Determinism test mode: regenerate world with given seed, run for
+    /// N ticks, print the final world state hash, and exit. Use this to
+    /// verify that running with the same seed produces identical results.
+    /// Example: --determinism-test 42:100 (seed 42, run 100 ticks).
+    #[arg(long, value_name = "SEED:TICKS")]
+    determinism_test: Option<String>,
+}
+
+fn run_determinism_test(
+    spec: &str,
+    _chunks: Vec<protocol::Chunk>,
+    chunks_x: u32,
+    chunks_y: u32,
+    world_gen_params: protocol::WorldGenParams,
+    sim_params: protocol::SimParams,
+    _seed: u64,
+    _rng: ChaCha12Rng,
+    _next_plant_id: u32,
+) -> Result<()> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let (seed_str, ticks_str) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected SEED:TICKS format"))?;
+    let test_seed: u64 = seed_str.parse()?;
+    let test_ticks: u64 = ticks_str.parse()?;
+
+    println!("🔬 Determinism Test: seed={}, ticks={}", test_seed, test_ticks);
+
+    // Rebuild world with test seed
+    let mut chunks = world::build_world(&world_gen_params);
+    let mut rng = ChaCha12Rng::seed_from_u64(test_seed);
+    let count = world::place_random_sprout_grid(&mut chunks, &world_gen_params, &mut rng);
+
+    fn hash_chunks(chunks: &[protocol::Chunk]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for chunk in chunks {
+            for cell in &chunk.cells {
+                cell.organic.hash(&mut hasher);
+                cell.soil_energy.hash(&mut hasher);
+                match &cell.occupant {
+                    protocol::Occupant::Sprout { energy, genome, current_gene, .. } => {
+                        energy.hash(&mut hasher);
+                        current_gene.hash(&mut hasher);
+                        genome.mutation_rate.hash(&mut hasher);
+                    }
+                    protocol::Occupant::Seed { energy, genome, .. } => {
+                        energy.hash(&mut hasher);
+                        genome.mutation_rate.hash(&mut hasher);
+                    }
+                    protocol::Occupant::Leaf { energy, .. }
+                    | protocol::Occupant::Root { energy, .. }
+                    | protocol::Occupant::Antenna { energy, .. }
+                    | protocol::Occupant::Stem { energy, .. } => {
+                        energy.hash(&mut hasher);
+                    }
+                    protocol::Occupant::Empty => {}
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    let hash_tick0 = hash_chunks(&chunks);
+    println!("  Tick 0: hash={:016x}, chunks={}", hash_tick0, chunks.len());
+
+    // Log RNG state before first tick
+    println!("  RNG state before tick 1: (ChaCha12Rng is opaque, can't inspect directly)");
+
+    let next_id = AtomicU32::new(count + 1);
+    for tick in 1..=test_ticks {
+        let hash_before = if tick <= 3 { Some(hash_chunks(&chunks)) } else { None };
+
+        sim::mutate_world(
+            &mut chunks,
+            chunks_x,
+            chunks_y,
+            &sim_params,
+            &next_id,
+            &mut rng,
+        );
+        let hash_after = hash_chunks(&chunks);
+
+        if tick <= 3 || tick % 10 == 0 || tick == test_ticks {
+            println!(
+                "  Tick {}: hash={:016x}",
+                tick, hash_after
+            );
+            if let Some(h_before) = hash_before {
+                if h_before == hash_after {
+                    println!("    (no changes in this tick)");
+                }
+            }
+        }
+    }
+
+    let final_hash = hash_chunks(&chunks);
+    println!("✓ Final state hash: {:016x}", final_hash);
+    Ok(())
 }
 
 #[tokio::main]
@@ -150,6 +251,21 @@ async fn main() -> Result<()> {
         initial.next_plant_id = count + 1;
         info!(sprouts = count, "placed initial sprout grid");
     }
+    // Handle determinism test mode
+    if let Some(test_spec) = args.determinism_test.as_deref() {
+        return run_determinism_test(
+            test_spec,
+            initial.chunks,
+            initial.chunks_x,
+            initial.chunks_y,
+            world_gen_params,
+            sim_params,
+            seed,
+            rng,
+            initial.next_plant_id,
+        );
+    }
+
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
         chunks_x: AtomicU32::new(initial.chunks_x),
