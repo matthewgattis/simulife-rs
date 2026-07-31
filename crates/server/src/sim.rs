@@ -1881,8 +1881,9 @@ fn phase_growth_pull(
     }
 
     // Pass B: per-destination tiebreak. Track winning bid index per dst.
-    let mut winning_bid: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::with_capacity(bids.len());
+    // Use BTreeMap for deterministic iteration order.
+    let mut winning_bid: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     for (bidi, bid) in bids.iter().enumerate() {
         match winning_bid.get(&bid.dst_global_idx).copied() {
             None => {
@@ -1901,7 +1902,7 @@ fn phase_growth_pull(
         let bid = &bids[bidi];
         sprouts[bid.sprout_idx].won[bid.slot_idx] = true;
     }
-    let mut eaten_sprout: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut eaten_sprout: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for sprout in &sprouts {
         let src_global = sprout.src_chunk_idx * CHUNK_AREA + sprout.src_cell_idx;
         if winning_bid.contains_key(&src_global) {
@@ -4579,19 +4580,20 @@ mod tests {
         }
 
         // Build two identical worlds from the same seed
+        // Use world_wrap: true (the default) and larger world to test determinism
         let world_gen = protocol::WorldGenParams {
-            chunks_x: 2,
-            chunks_y: 2,
-            boxes_x: 1,
-            boxes_y: 1,
+            chunks_x: 36,
+            chunks_y: 24,
+            boxes_x: 3,
+            boxes_y: 2,
             sunlit_margin_frac: 0.1,
-            sprout_grid_spacing: 8,
-            toxic_border_thickness: 1,
+            sprout_grid_spacing: 6,
+            toxic_border_thickness: 2,
             toxic_border_organic: 1000,
-            default_organic: 40,
-            default_soil_energy: 100,
-            initial_mutation_rate_octaves: 1.0,
-            world_wrap: false,
+            default_organic: 0,
+            default_soil_energy: 10,
+            initial_mutation_rate_octaves: 3.0,
+            world_wrap: true,
         };
 
         let seed = 9999;
@@ -4607,20 +4609,28 @@ mod tests {
         let hash_before2 = hash_chunks(&chunks2);
         assert_eq!(hash_before1, hash_before2, "initial worlds should hash identically");
 
-        // Advance both worlds one tick with mutate_world
+        // Advance both worlds multiple ticks with mutate_world
         let params = test_params();
-        let next_id_1 = AtomicU32::new(count1 + 1);
-        let next_id_2 = AtomicU32::new(count2 + 1);
+        let mut next_id_1 = count1 + 1;
+        let mut next_id_2 = count2 + 1;
 
-        mutate_world(&mut chunks1, 2, 2, &params, &test_world_gen_params(), &next_id_1, &mut rng1);
-        mutate_world(&mut chunks2, 2, 2, &params, &test_world_gen_params(), &next_id_2, &mut rng2);
+        for tick in 1..=10 {
+            let next_id_atomic_1 = AtomicU32::new(next_id_1);
+            let next_id_atomic_2 = AtomicU32::new(next_id_2);
 
-        let hash_after1 = hash_chunks(&chunks1);
-        let hash_after2 = hash_chunks(&chunks2);
+            mutate_world(&mut chunks1, 2, 2, &params, &test_world_gen_params(), &next_id_atomic_1, &mut rng1);
+            mutate_world(&mut chunks2, 2, 2, &params, &test_world_gen_params(), &next_id_atomic_2, &mut rng2);
 
-        assert_eq!(
-            hash_after1, hash_after2,
-            "after mutate_world with same seed, worlds should remain identical"
-        );
+            let hash1 = hash_chunks(&chunks1);
+            let hash2 = hash_chunks(&chunks2);
+
+            assert_eq!(
+                hash1, hash2,
+                "after tick {}: worlds should remain identical, but diverged", tick
+            );
+
+            next_id_1 = next_id_atomic_1.load(std::sync::atomic::Ordering::Relaxed);
+            next_id_2 = next_id_atomic_2.load(std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }

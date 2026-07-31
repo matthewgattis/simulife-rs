@@ -145,19 +145,16 @@ fn run_determinism_test(
     let test_seed: u64 = seed_str.parse()?;
     let test_ticks: u64 = ticks_str.parse()?;
 
-    // Use the same params as unit tests for consistency
+    // Use the same params as the running server for testing
     let test_sim_params = protocol::SimParams::default();
-    let test_world_gen_params = protocol::WorldGenParams {
-        world_wrap: false,
-        ..protocol::WorldGenParams::default()
-    };
+    let test_world_gen_params = world_gen_params;
 
     println!("🔬 Determinism Test: seed={}, ticks={}, world_wrap={}", test_seed, test_ticks, test_world_gen_params.world_wrap);
 
-    // Rebuild world with test seed
-    let mut chunks = world::build_world(&world_gen_params);
+    // Rebuild world with test seed, using the same world_gen_params
+    let mut chunks = world::build_world(&test_world_gen_params);
     let mut rng = ChaCha12Rng::seed_from_u64(test_seed);
-    let count = world::place_random_sprout_grid(&mut chunks, &world_gen_params, &mut rng);
+    let count = world::place_random_sprout_grid(&mut chunks, &test_world_gen_params, &mut rng);
 
     fn hash_chunks(chunks: &[protocol::Chunk]) -> u64 {
         let mut hasher = DefaultHasher::new();
