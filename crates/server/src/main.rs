@@ -145,13 +145,13 @@ fn run_determinism_test(
     let test_seed: u64 = seed_str.parse()?;
     let test_ticks: u64 = ticks_str.parse()?;
 
-    // Test with world_wrap=true (the default that causes issues)
+    // Use the same params as unit tests for consistency
     let test_sim_params = protocol::SimParams {
-        world_wrap: true,
+        world_wrap: false,
         ..protocol::SimParams::default()
     };
 
-    println!("🔬 Determinism Test: seed={}, ticks={}", test_seed, test_ticks);
+    println!("🔬 Determinism Test: seed={}, ticks={}, world_wrap={}", test_seed, test_ticks, test_sim_params.world_wrap);
 
     // Rebuild world with test seed
     let mut chunks = world::build_world(&world_gen_params);
@@ -162,23 +162,68 @@ fn run_determinism_test(
         let mut hasher = DefaultHasher::new();
         for chunk in chunks {
             for cell in &chunk.cells {
+                // Hash ALL cell state comprehensively
                 cell.organic.hash(&mut hasher);
                 cell.soil_energy.hash(&mut hasher);
+                cell.sunlit.hash(&mut hasher);
+                cell.lineage_mutation_rate.to_bits().hash(&mut hasher);
+
                 match &cell.occupant {
-                    protocol::Occupant::Sprout { energy, genome, current_gene, .. } => {
+                    protocol::Occupant::Sprout { plant, clan, energy, facing, genome, current_gene, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
                         energy.hash(&mut hasher);
+                        std::mem::discriminant(facing).hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
                         current_gene.hash(&mut hasher);
+                        for gene in &genome.genes {
+                            std::mem::discriminant(&gene.front).hash(&mut hasher);
+                            std::mem::discriminant(&gene.left).hash(&mut hasher);
+                            std::mem::discriminant(&gene.right).hash(&mut hasher);
+                            gene.next.hash(&mut hasher);
+                        }
                         genome.mutation_rate.hash(&mut hasher);
                     }
-                    protocol::Occupant::Seed { energy, genome, .. } => {
+                    protocol::Occupant::Seed { plant, clan, energy, facing, genome, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
                         energy.hash(&mut hasher);
+                        std::mem::discriminant(facing).hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                        for gene in &genome.genes {
+                            std::mem::discriminant(&gene.front).hash(&mut hasher);
+                            std::mem::discriminant(&gene.left).hash(&mut hasher);
+                            std::mem::discriminant(&gene.right).hash(&mut hasher);
+                            gene.next.hash(&mut hasher);
+                        }
                         genome.mutation_rate.hash(&mut hasher);
                     }
-                    protocol::Occupant::Leaf { energy, .. }
-                    | protocol::Occupant::Root { energy, .. }
-                    | protocol::Occupant::Antenna { energy, .. }
-                    | protocol::Occupant::Stem { energy, .. } => {
+                    protocol::Occupant::Leaf { plant, clan, energy, facing, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
                         energy.hash(&mut hasher);
+                        std::mem::discriminant(facing).hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                    }
+                    protocol::Occupant::Root { plant, clan, energy, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                    }
+                    protocol::Occupant::Antenna { plant, clan, energy, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                    }
+                    protocol::Occupant::Stem { plant, clan, energy, connections, parent, children } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        connections.hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                        children.hash(&mut hasher);
                     }
                     protocol::Occupant::Empty => {}
                 }
