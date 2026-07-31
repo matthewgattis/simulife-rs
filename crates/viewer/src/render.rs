@@ -1217,6 +1217,7 @@ fn draw_regen_dialog(
                     .text("initial mut-rate octaves")
                     .max_decimals(1),
             );
+            ui.checkbox(&mut p.world_wrap, "World wrap (toroidal)");
             if ui.button("Reset world layout to defaults").clicked() {
                 dialog.params = WorldGenParams::default();
             }
