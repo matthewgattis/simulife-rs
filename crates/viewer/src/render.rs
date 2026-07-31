@@ -1096,8 +1096,6 @@ fn sim_params_ui(
                     .max_decimals(2),
             );
             ui.separator();
-            ui.checkbox(&mut params.world_wrap, "World wrap (toroidal)");
-            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Reset to defaults").clicked() {
                     *params = SimParams::default();

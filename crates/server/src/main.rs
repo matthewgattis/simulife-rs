@@ -146,12 +146,13 @@ fn run_determinism_test(
     let test_ticks: u64 = ticks_str.parse()?;
 
     // Use the same params as unit tests for consistency
-    let test_sim_params = protocol::SimParams {
+    let test_sim_params = protocol::SimParams::default();
+    let test_world_gen_params = protocol::WorldGenParams {
         world_wrap: false,
-        ..protocol::SimParams::default()
+        ..protocol::WorldGenParams::default()
     };
 
-    println!("🔬 Determinism Test: seed={}, ticks={}, world_wrap={}", test_seed, test_ticks, test_sim_params.world_wrap);
+    println!("🔬 Determinism Test: seed={}, ticks={}, world_wrap={}", test_seed, test_ticks, test_world_gen_params.world_wrap);
 
     // Rebuild world with test seed
     let mut chunks = world::build_world(&world_gen_params);
@@ -248,6 +249,7 @@ fn run_determinism_test(
             chunks_x,
             chunks_y,
             &test_sim_params,
+            &test_world_gen_params,
             &next_id,
             &mut rng,
         );

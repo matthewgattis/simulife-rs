@@ -211,6 +211,7 @@ mod tests {
             default_organic: DEFAULT_ORGANIC,
             default_soil_energy: 100,
             initial_mutation_rate_octaves: 3.0,
+            world_wrap: true,
         }
     }
 
@@ -456,6 +457,7 @@ mod tests {
             default_organic: 0,
             default_soil_energy: 10,
             initial_mutation_rate_octaves: 2.0,
+            world_wrap: true,
         };
 
         // Build twice with same seed

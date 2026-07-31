@@ -208,6 +208,7 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
                 state.always_encode || state.tick_tx.receiver_count() > 0;
             let snapshot_chunks: Option<Vec<protocol::WireChunk>> = {
                 let params = *state.params.lock().expect("params poisoned");
+                let world_gen_params = *state.world_gen_params.lock().expect("wgp poisoned");
                 let mut chunks = state.world.lock().expect("sim lock poisoned");
                 let mut rng = state.rng.lock().expect("rng lock poisoned");
                 let _mutate = tracing::info_span!("mutate_world").entered();
@@ -216,6 +217,7 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
                     state.chunks_x.load(Ordering::Relaxed),
                     state.chunks_y.load(Ordering::Relaxed),
                     &params,
+                    &world_gen_params,
                     &state.next_plant_id,
                     &mut *rng,
                 );
@@ -504,6 +506,7 @@ pub fn mutate_world(
     chunks_x: u32,
     chunks_y: u32,
     params: &SimParams,
+    world_gen_params: &WorldGenParams,
     next_plant_id: &AtomicU32,
     rng: &mut impl Rng,
 ) {
@@ -513,7 +516,7 @@ pub fn mutate_world(
     let edge = CHUNK_EDGE as i32;
     let max_x = chunks_x as i32 * edge;
     let max_y = chunks_y as i32 * edge;
-    let wrap = params.world_wrap;
+    let wrap = world_gen_params.world_wrap;
     let root_kernel = scaled_kernel(params.root_pull_scale);
     let antenna_kernel = scaled_kernel(params.antenna_pull_scale);
     let death_kernel = scaled_kernel(params.death_deposit_scale);
@@ -946,6 +949,7 @@ pub fn mutate_world(
         max_x,
         max_y,
         params,
+        world_gen_params,
         &death_kernel,
         rng,
     );
@@ -1736,11 +1740,12 @@ fn phase_growth_pull(
     max_x: i32,
     max_y: i32,
     params: &SimParams,
+    world_gen_params: &WorldGenParams,
     death_kernel: &[[u16; 3]; 3],
     rng: &mut impl Rng,
 ) -> u64 {
     let edge = CHUNK_EDGE as i32;
-    let wrap = params.world_wrap;
+    let wrap = world_gen_params.world_wrap;
     let mut sprouts: Vec<SproutSnapshot> = Vec::new();
     let mut bids: Vec<SproutBid> = Vec::new();
 
@@ -2257,12 +2262,16 @@ mod tests {
     const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [[1, 2, 1], [2, 4, 2], [1, 2, 1]];
 
     fn test_params() -> SimParams {
+        SimParams::default()
+    }
+
+    fn test_world_gen_params() -> WorldGenParams {
         // Tests pre-date world wrap and assume hard edges (e.g. growth
         // at y=0 facing North is OOB, not a wrap to y=max). Override
         // the default so each test doesn't have to set this manually.
-        SimParams {
+        WorldGenParams {
             world_wrap: false,
-            ..SimParams::default()
+            ..WorldGenParams::default()
         }
     }
 
@@ -2366,6 +2375,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2407,6 +2417,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2456,6 +2467,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2507,6 +2519,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2587,6 +2600,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2635,6 +2649,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2716,6 +2731,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2766,6 +2782,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -3390,6 +3407,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3464,6 +3482,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3533,6 +3552,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3628,6 +3648,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3693,6 +3714,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3752,6 +3774,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3820,6 +3843,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3859,6 +3883,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3919,6 +3944,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3949,6 +3975,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3978,6 +4005,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4044,6 +4072,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4084,6 +4113,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4131,6 +4161,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4212,6 +4243,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4268,6 +4300,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4364,6 +4397,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4417,6 +4451,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4469,6 +4504,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(100),
             &mut det_rng(),
         );
@@ -4555,6 +4591,7 @@ mod tests {
             default_organic: 40,
             default_soil_energy: 100,
             initial_mutation_rate_octaves: 1.0,
+            world_wrap: false,
         };
 
         let seed = 9999;
@@ -4575,8 +4612,8 @@ mod tests {
         let next_id_1 = AtomicU32::new(count1 + 1);
         let next_id_2 = AtomicU32::new(count2 + 1);
 
-        mutate_world(&mut chunks1, 2, 2, &params, &next_id_1, &mut rng1);
-        mutate_world(&mut chunks2, 2, 2, &params, &next_id_2, &mut rng2);
+        mutate_world(&mut chunks1, 2, 2, &params, &test_world_gen_params(), &next_id_1, &mut rng1);
+        mutate_world(&mut chunks2, 2, 2, &params, &test_world_gen_params(), &next_id_2, &mut rng2);
 
         let hash_after1 = hash_chunks(&chunks1);
         let hash_after2 = hash_chunks(&chunks2);
