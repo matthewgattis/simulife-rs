@@ -1,4 +1,4 @@
-# Architecture Overview
+∂# Architecture Overview
 
 Simulife-rs is a distributed plant-evolution cellular automaton with a Rust server engine and networked wgpu/egui viewer clients connected via QUIC.
 
@@ -276,7 +276,7 @@ package "Determinism Guarantees" {
   end note
 }
 
-note bottom of "Determinism Architecture"
+note bottom
   Each change can affect state hash but not break determinism.
   Same seed → identical hash at every tick across restarts.
   Different seeds → different outcomes, still deterministic.
@@ -298,8 +298,14 @@ rectangle "ClientMessage (client → server)" {
   card Pause
   card Resume
   card Tick
-  card SetSimParams { parameter value }
-  card RegenerateWorld { seed, WorldGenParams }
+  card SetSimParams {
+    parameter
+    value
+  }
+  card RegenerateWorld {
+    seed
+    WorldGenParams
+  }
 }
 
 rectangle "ServerMessage (server → client)" {
@@ -318,14 +324,12 @@ rectangle "ServerMessage (server → client)" {
   }
 }
 
-note bottom of Welcome
-  Sent on connect and after Regenerate.
+note right
+  **Welcome**: Sent on connect and after Regenerate.
   Establishes synchronized state.
   Allows viewer to mirror sim controls.
-end note
 
-note bottom of TickUpdate
-  Sent every tick (if running).
+  **TickUpdate**: Sent every tick (if running).
   Only modified chunks included.
   Msgpack + optional zstd compress.
 end note
