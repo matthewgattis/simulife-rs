@@ -51,6 +51,7 @@ The server starts paused so you can attach a viewer first; press the **Resume** 
 | `--start-running` | off | skip the default paused state |
 | `--trace-chrome <path>` | (none) | record a Chrome-trace JSON profile |
 | `--profile-duration-secs <n>` | (none) | graceful exit after `n` seconds (flushes trace) |
+| `--determinism-test <seed:ticks>` | (none) | test determinism: rebuild world, run N ticks, verify identical hashes across reruns |
 
 ### Useful viewer flags
 
@@ -127,9 +128,21 @@ Each tick runs phases in order:
 
 **Soil toxicity** is governed by `soil_organic_poison` and `soil_energy_poison`. When organic exceeds the threshold, everything except Roots dies in that cell; when soil_energy exceeds, everything except Antennas dies; both poisoned → nobody.
 
-**Live tuning**: every numeric scalar above lives on `SimParams` (live, takes effect next tick) or `WorldGenParams` (regen-time only). Both are edited from the viewer's Status panel and persisted in the world snapshot. The `world_wrap` toggle on `SimParams` switches edges between toroidal and hard-walled — also live.
+**Live tuning**: numeric scalars live on `SimParams` (live, takes effect next tick) or `WorldGenParams` (regen-time only). Both are edited from the viewer's Status panel and persisted in the world snapshot. The `world_wrap` setting (toroidal vs hard-walled edges) is part of `WorldGenParams` — immutable after world generation to preserve determinism.
 
 **Multi-client**: any number of viewers can connect. Sim controls (pause, tick rate, params, regenerate) are server-authoritative — any control change broadcasts a fresh `Welcome` so every viewer's UI mirror updates.
+
+## Determinism
+
+The simulation is **fully deterministic** given a fixed seed and world-generation parameters. The same seed will always produce identical state at every tick, across restarts and across multiple runs. This is guaranteed by:
+
+- Using seeded ChaCha12Rng (cryptographically deterministic PRNG) for all randomness
+- Storing world generation and mutation rates as fixed-point integers (u32) to avoid floating-point non-determinism
+- Using BTreeMap/BTreeSet for all iteration-order-sensitive data structures (instead of HashMap/HashSet) so bid resolution order is deterministic
+
+You can verify determinism with `--determinism-test <seed:ticks>` — it rebuilds the world with the given seed and runs N ticks, printing state hashes at each tick. Multiple invocations with the same seed will show identical hashes across all ticks.
+
+**Note**: Changing `SimParams` (live-tunable parameters) at runtime is acceptable — it won't break determinism. Changing `WorldGenParams` requires world regeneration since those settings are immutable after world-gen.
 
 ## Persistence
 

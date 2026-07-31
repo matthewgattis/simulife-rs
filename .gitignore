@@ -3,3 +3,4 @@
 /world.bin.bak
 /traces
 .DS_Store
+*.log

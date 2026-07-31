@@ -35,13 +35,17 @@ pub const GENOME_MAX: usize = 128;
 /// Initial per-genome mutation rate. Each lineage's actual rate
 /// drifts under selection pressure (mutation_rate is itself
 /// mutable per-copy).
-pub const DEFAULT_MUTATION_RATE: f32 = 0.05;
-pub const MUTATION_RATE_MAX: f32 = 0.2;
+/// Scale factor for fixed-point mutation rates. Stored values = actual_rate * RATE_SCALE.
+/// 10000 gives 4 decimal places of precision; max value ~4.2 billion (safe in u32).
+pub const RATE_SCALE: u32 = 10000;
+
+pub const DEFAULT_MUTATION_RATE: u32 = 500;   // 0.05
+pub const MUTATION_RATE_MAX: u32 = 2000;      // 0.2
 /// Hard floor for genome mutation rates. Prevents an absorbing state
 /// at zero (where the meta-mutation gate `rng < rate` can never fire
 /// again) and gives every lineage at least a tiny pressure toward
 /// change. Clamped in `mutate_genome`.
-pub const MUTATION_RATE_MIN: f32 = 0.01;
+pub const MUTATION_RATE_MIN: u32 = 100;       // 0.01
 
 /// Live-tunable simulation scalars. The server owns the authoritative
 /// copy in `SimState.params`; the viewer mirrors it via `Welcome` and
@@ -68,10 +72,6 @@ pub struct SimParams {
     pub root_pull_scale: f32,
     pub antenna_pull_scale: f32,
     pub death_deposit_scale: f32,
-    /// When true, world edges wrap (toroidal — opposite edges are
-    /// neighbors). When false, edges are hard walls. Live-tunable; the
-    /// world geometry doesn't change, only the neighbor lookup rule.
-    pub world_wrap: bool,
 }
 
 /// World-generation knobs. Applied at world-build time only — changing
@@ -113,6 +113,10 @@ pub struct WorldGenParams {
     /// mutation rates around DEFAULT. 0 = uniform DEFAULT, 3 = ±3
     /// octaves (rate × 1/8 .. × 8).
     pub initial_mutation_rate_octaves: f32,
+    /// When true, world edges wrap (toroidal — opposite edges are
+    /// neighbors). When false, edges are hard walls. Immutable after
+    /// world-gen; affects world topology and determinism.
+    pub world_wrap: bool,
 }
 
 impl Default for WorldGenParams {
@@ -129,6 +133,7 @@ impl Default for WorldGenParams {
             default_organic: 0,
             default_soil_energy: 10,
             initial_mutation_rate_octaves: 3.0,
+            world_wrap: true,
         }
     }
 }
@@ -153,7 +158,6 @@ impl Default for SimParams {
             root_pull_scale: 1.0,
             antenna_pull_scale: 1.0,
             death_deposit_scale: 1.0,
-            world_wrap: true,
         }
     }
 }
@@ -192,10 +196,10 @@ impl Default for Gene {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Genome {
     pub genes: Vec<Gene>,
-    /// Per-genome mutation rate. Mutates with each copy, so a lineage
-    /// can evolve toward stability or chaos under selection. Bounded
-    /// by [0.0, MUTATION_RATE_MAX].
-    pub mutation_rate: f32,
+    /// Per-genome mutation rate (fixed-point: value * RATE_SCALE = actual_rate).
+    /// Mutates with each copy, so a lineage can evolve toward stability or chaos
+    /// under selection. Bounded by [MUTATION_RATE_MIN, MUTATION_RATE_MAX].
+    pub mutation_rate: u32,
 }
 
 impl Genome {

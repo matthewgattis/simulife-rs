@@ -1096,8 +1096,6 @@ fn sim_params_ui(
                     .max_decimals(2),
             );
             ui.separator();
-            ui.checkbox(&mut params.world_wrap, "World wrap (toroidal)");
-            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Reset to defaults").clicked() {
                     *params = SimParams::default();
@@ -1219,6 +1217,7 @@ fn draw_regen_dialog(
                     .text("initial mut-rate octaves")
                     .max_decimals(1),
             );
+            ui.checkbox(&mut p.world_wrap, "World wrap (toroidal)");
             if ui.button("Reset world layout to defaults").clicked() {
                 dialog.params = WorldGenParams::default();
             }

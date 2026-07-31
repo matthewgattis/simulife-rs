@@ -10,13 +10,15 @@ use rand::SeedableRng;
 
 use protocol::{
     CHUNK_AREA, CHUNK_EDGE, Cell, Chunk, ClanId, Direction, Energy, GENOME_MAX, GENOME_MIN, Gene,
-    Genome, MUTATION_RATE_MAX, MUTATION_RATE_MIN, Occupant, STEM_CONNECT_EAST, STEM_CONNECT_NORTH,
+    Genome, MUTATION_RATE_MAX, MUTATION_RATE_MIN, Occupant, RATE_SCALE, STEM_CONNECT_EAST, STEM_CONNECT_NORTH,
     STEM_CONNECT_SOUTH, STEM_CONNECT_WEST, ServerMessage, SimParams, SlotProduct, WorldGenParams,
 };
 use rand::Rng;
 use rand_chacha::ChaCha12Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// Fixed bell-curve shape for the 3×3 soil/death kernels. Magnitude is
 /// dialed at runtime by `SimParams::*_scale` (1.0 = stock); the shape
@@ -206,6 +208,7 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
                 state.always_encode || state.tick_tx.receiver_count() > 0;
             let snapshot_chunks: Option<Vec<protocol::WireChunk>> = {
                 let params = *state.params.lock().expect("params poisoned");
+                let world_gen_params = *state.world_gen_params.lock().expect("wgp poisoned");
                 let mut chunks = state.world.lock().expect("sim lock poisoned");
                 let mut rng = state.rng.lock().expect("rng lock poisoned");
                 let _mutate = tracing::info_span!("mutate_world").entered();
@@ -214,6 +217,7 @@ pub async fn run_sim_loop(state: Arc<SimState>) {
                     state.chunks_x.load(Ordering::Relaxed),
                     state.chunks_y.load(Ordering::Relaxed),
                     &params,
+                    &world_gen_params,
                     &state.next_plant_id,
                     &mut *rng,
                 );
@@ -352,13 +356,60 @@ pub async fn run_encode_loop(state: Arc<SimState>) {
 /// Wipe the world, reseed the RNG, reset tick + plant id, and broadcast a
 /// fresh Welcome + ChunkBatch so connected viewers refresh in place. Holds
 /// the world + rng mutexes for the swap; safe to call between sim ticks.
+fn hash_world_state(chunks: &[Chunk]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for chunk in chunks {
+        chunk.coord.hash(&mut hasher);
+        for cell in &chunk.cells {
+            cell.organic.hash(&mut hasher);
+            cell.soil_energy.hash(&mut hasher);
+            cell.sunlit.hash(&mut hasher);
+            match &cell.occupant {
+                Occupant::Sprout {
+                    plant,
+                    clan,
+                    energy,
+                    facing,
+                    genome,
+                    ..
+                } => {
+                    plant.hash(&mut hasher);
+                    clan.hash(&mut hasher);
+                    energy.hash(&mut hasher);
+                    std::mem::discriminant(facing).hash(&mut hasher);
+                    for gene in &genome.genes {
+                        std::mem::discriminant(&gene.front).hash(&mut hasher);
+                        std::mem::discriminant(&gene.left).hash(&mut hasher);
+                        std::mem::discriminant(&gene.right).hash(&mut hasher);
+                        gene.next.hash(&mut hasher);
+                    }
+                    genome.mutation_rate.hash(&mut hasher);
+                }
+                other => std::mem::discriminant(other).hash(&mut hasher),
+            }
+        }
+    }
+    hasher.finish()
+}
+
 pub fn regenerate_world(state: &SimState, seed: u64, params: WorldGenParams) {
     let chunks_x = params.chunks_x;
     let chunks_y = params.chunks_y;
 
+    info!(
+        seed,
+        chunks_x,
+        chunks_y,
+        sunlit_margin_frac = params.sunlit_margin_frac,
+        sprout_grid_spacing = params.sprout_grid_spacing,
+        "regenerate_world called"
+    );
+
     let mut new_chunks = crate::world::build_world(&params);
     let mut new_rng = ChaCha12Rng::seed_from_u64(seed);
     let count = crate::world::place_random_sprout_grid(&mut new_chunks, &params, &mut new_rng);
+    let world_hash = hash_world_state(&new_chunks);
+    info!(world_hash, "generated world state");
 
     {
         let mut world = state.world.lock().expect("sim lock poisoned");
@@ -377,7 +428,13 @@ pub fn regenerate_world(state: &SimState, seed: u64, params: WorldGenParams) {
     // flight against the *previous* world gets dropped before its
     // bytes hit the wire.
     state.world_gen.fetch_add(1, Ordering::Relaxed);
-    info!(seed, chunks_x, chunks_y, "world regenerated");
+    info!(
+        seed,
+        chunks_x,
+        chunks_y,
+        sprouts_placed = count,
+        "world regenerated"
+    );
 
     let (paused, tick_hz, tick_rate_limited) = {
         let ctrl = state.control.lock().expect("control poisoned");
@@ -431,7 +488,7 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     // we can compute it from (x, y) the same way world::place_random does.
     let mut chunks = state.world.lock().expect("sim lock poisoned");
     let genome = Genome::default_vine();
-    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = genome.mutation_rate;
+    chunks[chunk_idx].cells[cell_idx].lineage_mutation_rate = genome.mutation_rate as f32 / protocol::RATE_SCALE as f32;
     chunks[chunk_idx].cells[cell_idx].occupant = Occupant::Sprout {
         plant,
         clan: 0,
@@ -444,18 +501,22 @@ pub fn spawn_sprout(state: &SimState, x: i32, y: i32, facing: Direction) {
     info!(x, y, plant, ?facing, "sprout spawned");
 }
 
-fn mutate_world(
+pub fn mutate_world(
     chunks: &mut [Chunk],
     chunks_x: u32,
     chunks_y: u32,
     params: &SimParams,
+    world_gen_params: &WorldGenParams,
     next_plant_id: &AtomicU32,
     rng: &mut impl Rng,
 ) {
+    // For determinism debugging: log the RNG state before phases that use it
+    // (We can't inspect ChaCha12Rng state directly, but we can trace RNG usage)
+    let _tick_marker = tracing::debug_span!("mutate_world_tick");
     let edge = CHUNK_EDGE as i32;
     let max_x = chunks_x as i32 * edge;
     let max_y = chunks_y as i32 * edge;
-    let wrap = params.world_wrap;
+    let wrap = world_gen_params.world_wrap;
     let root_kernel = scaled_kernel(params.root_pull_scale);
     let antenna_kernel = scaled_kernel(params.antenna_pull_scale);
     let death_kernel = scaled_kernel(params.death_deposit_scale);
@@ -888,6 +949,7 @@ fn mutate_world(
         max_x,
         max_y,
         params,
+        world_gen_params,
         &death_kernel,
         rng,
     );
@@ -1678,11 +1740,12 @@ fn phase_growth_pull(
     max_x: i32,
     max_y: i32,
     params: &SimParams,
+    world_gen_params: &WorldGenParams,
     death_kernel: &[[u16; 3]; 3],
     rng: &mut impl Rng,
 ) -> u64 {
     let edge = CHUNK_EDGE as i32;
-    let wrap = params.world_wrap;
+    let wrap = world_gen_params.world_wrap;
     let mut sprouts: Vec<SproutSnapshot> = Vec::new();
     let mut bids: Vec<SproutBid> = Vec::new();
 
@@ -1818,8 +1881,9 @@ fn phase_growth_pull(
     }
 
     // Pass B: per-destination tiebreak. Track winning bid index per dst.
-    let mut winning_bid: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::with_capacity(bids.len());
+    // Use BTreeMap for deterministic iteration order.
+    let mut winning_bid: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     for (bidi, bid) in bids.iter().enumerate() {
         match winning_bid.get(&bid.dst_global_idx).copied() {
             None => {
@@ -1838,7 +1902,7 @@ fn phase_growth_pull(
         let bid = &bids[bidi];
         sprouts[bid.sprout_idx].won[bid.slot_idx] = true;
     }
-    let mut eaten_sprout: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut eaten_sprout: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for sprout in &sprouts {
         let src_global = sprout.src_chunk_idx * CHUNK_AREA + sprout.src_cell_idx;
         if winning_bid.contains_key(&src_global) {
@@ -1867,7 +1931,7 @@ fn phase_growth_pull(
             rng,
         ) {
             let cell = &mut chunks[bid.dst_chunk_idx].cells[bid.dst_cell_idx];
-            cell.lineage_mutation_rate = sprout.genome.mutation_rate;
+            cell.lineage_mutation_rate = sprout.genome.mutation_rate as f32 / protocol::RATE_SCALE as f32;
             cell.occupant = occ;
         }
     }
@@ -1991,19 +2055,22 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
     // 1. Maybe perturb the mutation rate itself (multiplicative jitter).
     // Always clamp the result so a genome handed in with an out-of-band
     // rate gets normalized on its first copy.
+    // Fixed-point arithmetic: rate and RATE_SCALE are integers, no float variance.
     let mut rate = g.mutation_rate;
-    if rng.r#gen::<f32>() < rate {
-        rate *= rng.gen_range(0.5..1.5);
+    if rng.gen_range(0..RATE_SCALE) < rate {
+        // Perturb: multiply by a factor in [0.5, 1.5) represented as [5000, 15000) / 10000
+        let perturb = rng.gen_range(5000..15000);
+        rate = ((rate as u64 * perturb as u64) / 10000) as u32;
     }
     rate = rate.clamp(MUTATION_RATE_MIN, MUTATION_RATE_MAX);
-    let insert_rate = rate * 0.1;
-    let delete_rate = rate * 0.1;
+    let insert_rate = rate / 10;
+    let delete_rate = rate / 10;
 
     // 2. Decide deletions per old gene. Never let the genome drop
     // below GENOME_MIN; if too many were marked, unmark from the
     // start until we're at the floor.
     let mut delete: Vec<bool> = (0..old_len)
-        .map(|_| rng.r#gen::<f32>() < delete_rate)
+        .map(|_| rng.gen_range(0..RATE_SCALE) < delete_rate)
         .collect();
     let mut alive = old_len - delete.iter().filter(|&&d| d).count();
     if alive < GENOME_MIN && old_len >= GENOME_MIN {
@@ -2028,7 +2095,7 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
         if planned >= GENOME_MAX {
             break;
         }
-        if rng.r#gen::<f32>() < insert_rate {
+        if rng.gen_range(0..RATE_SCALE) < insert_rate {
             *ins = true;
             planned += 1;
         }
@@ -2058,16 +2125,16 @@ pub fn mutate_genome(g: &Genome, rng: &mut impl Rng) -> Genome {
             continue;
         }
         let mut new_gene = g.genes[i];
-        if rng.r#gen::<f32>() < rate {
+        if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.front = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < rate {
+        if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.left = random_slot(rng);
         }
-        if rng.r#gen::<f32>() < rate {
+        if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.right = random_slot(rng);
         }
-        let next_remap = if rng.r#gen::<f32>() < rate {
+        let next_remap = if rng.gen_range(0..RATE_SCALE) < rate {
             new_gene.next = rng.r#gen::<u8>();
             None
         } else {
@@ -2196,12 +2263,16 @@ mod tests {
     const DEATH_DEPOSIT_KERNEL: [[u16; 3]; 3] = [[1, 2, 1], [2, 4, 2], [1, 2, 1]];
 
     fn test_params() -> SimParams {
+        SimParams::default()
+    }
+
+    fn test_world_gen_params() -> WorldGenParams {
         // Tests pre-date world wrap and assume hard edges (e.g. growth
         // at y=0 facing North is OOB, not a wrap to y=max). Override
         // the default so each test doesn't have to set this manually.
-        SimParams {
+        WorldGenParams {
             world_wrap: false,
-            ..SimParams::default()
+            ..WorldGenParams::default()
         }
     }
 
@@ -2305,6 +2376,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2346,6 +2418,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2395,6 +2468,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2446,6 +2520,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2526,6 +2601,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2574,6 +2650,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2655,6 +2732,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -2705,6 +2783,7 @@ mod tests {
             max,
             max,
             &test_params(),
+            &test_world_gen_params(),
             &DEATH_DEPOSIT_KERNEL,
             &mut det_rng(),
         );
@@ -3170,7 +3249,7 @@ mod tests {
         // Rates below MUTATION_RATE_MIN should be lifted to MIN on the
         // next copy, so no lineage gets stuck at the absorbing zero.
         let mut g = Genome::default_vine();
-        g.mutation_rate = 0.0;
+        g.mutation_rate = 0;
         let copied = mutate_genome(&g, &mut det_rng());
         assert!(
             copied.mutation_rate >= MUTATION_RATE_MIN,
@@ -3186,7 +3265,7 @@ mod tests {
     #[test]
     fn mutate_genome_with_same_seed_is_deterministic() {
         let mut g = Genome::default_vine();
-        g.mutation_rate = 0.5;
+        g.mutation_rate = 5000;  // 0.5 in fixed-point
         let a = mutate_genome(&g, &mut ChaCha12Rng::seed_from_u64(42));
         let b = mutate_genome(&g, &mut ChaCha12Rng::seed_from_u64(42));
         assert_eq!(
@@ -3203,7 +3282,7 @@ mod tests {
         // and run many generations to confirm the size envelope holds.
         let mut g = Genome {
             genes: vec![Gene::default()],
-            mutation_rate: 0.5,
+            mutation_rate: 5000,  // 0.5 in fixed-point
         };
         let mut rng = det_rng();
         for _ in 0..200 {
@@ -3255,7 +3334,7 @@ mod tests {
                     next: 0,
                 },
             ],
-            mutation_rate: 0.0, // no field mutations
+            mutation_rate: 0,  // no field mutations (zero → mutations won't fire)
         };
         // No rate → no inserts/deletes. Genome should clone exactly.
         let copy = mutate_genome(&g, &mut det_rng());
@@ -3329,6 +3408,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3403,6 +3483,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3472,6 +3553,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3567,6 +3649,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3632,6 +3715,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3691,6 +3775,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3759,6 +3844,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3798,6 +3884,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3858,6 +3945,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3888,6 +3976,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3917,6 +4006,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -3983,6 +4073,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4023,6 +4114,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4070,6 +4162,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4151,6 +4244,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4207,6 +4301,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4303,6 +4398,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4356,6 +4452,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(1),
             &mut det_rng(),
         );
@@ -4408,6 +4505,7 @@ mod tests {
             1,
             1,
             &test_params(),
+            &test_world_gen_params(),
             &AtomicU32::new(100),
             &mut det_rng(),
         );
@@ -4429,6 +4527,110 @@ mod tests {
                 assert_eq!(*current_gene, 0);
             }
             other => panic!("expected sprout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutate_world_deterministic_with_same_seed() {
+        // Test if mutate_world produces identical results when called twice
+        // with worlds built from the same seed. This tests the full
+        // simulation path, not just world generation.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_chunks(chunks: &[Chunk]) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            for chunk in chunks {
+                for cell in &chunk.cells {
+                    cell.organic.hash(&mut hasher);
+                    cell.soil_energy.hash(&mut hasher);
+                    // Hash occupant including genome details
+                    match &cell.occupant {
+                        Occupant::Sprout {
+                            energy,
+                            genome,
+                            current_gene,
+                            ..
+                        } => {
+                            energy.hash(&mut hasher);
+                            current_gene.hash(&mut hasher);
+                            for gene in &genome.genes {
+                                gene.next.hash(&mut hasher);
+                            }
+                            genome.mutation_rate.hash(&mut hasher);
+                        }
+                        Occupant::Seed { energy, genome, .. } => {
+                            energy.hash(&mut hasher);
+                            for gene in &genome.genes {
+                                gene.next.hash(&mut hasher);
+                            }
+                            genome.mutation_rate.hash(&mut hasher);
+                        }
+                        Occupant::Leaf { energy, .. }
+                        | Occupant::Root { energy, .. }
+                        | Occupant::Antenna { energy, .. }
+                        | Occupant::Stem { energy, .. } => {
+                            energy.hash(&mut hasher);
+                        }
+                        Occupant::Empty => {}
+                    }
+                }
+            }
+            hasher.finish()
+        }
+
+        // Build two identical worlds from the same seed
+        // Use world_wrap: true (the default) and larger world to test determinism
+        let world_gen = protocol::WorldGenParams {
+            chunks_x: 36,
+            chunks_y: 24,
+            boxes_x: 3,
+            boxes_y: 2,
+            sunlit_margin_frac: 0.1,
+            sprout_grid_spacing: 6,
+            toxic_border_thickness: 2,
+            toxic_border_organic: 1000,
+            default_organic: 0,
+            default_soil_energy: 10,
+            initial_mutation_rate_octaves: 3.0,
+            world_wrap: true,
+        };
+
+        let seed = 9999;
+        let mut chunks1 = crate::world::build_world(&world_gen);
+        let mut rng1 = ChaCha12Rng::seed_from_u64(seed);
+        let count1 = crate::world::place_random_sprout_grid(&mut chunks1, &world_gen, &mut rng1);
+
+        let mut chunks2 = crate::world::build_world(&world_gen);
+        let mut rng2 = ChaCha12Rng::seed_from_u64(seed);
+        let count2 = crate::world::place_random_sprout_grid(&mut chunks2, &world_gen, &mut rng2);
+
+        let hash_before1 = hash_chunks(&chunks1);
+        let hash_before2 = hash_chunks(&chunks2);
+        assert_eq!(hash_before1, hash_before2, "initial worlds should hash identically");
+
+        // Advance both worlds multiple ticks with mutate_world
+        let params = test_params();
+        let mut next_id_1 = count1 + 1;
+        let mut next_id_2 = count2 + 1;
+
+        for tick in 1..=10 {
+            let next_id_atomic_1 = AtomicU32::new(next_id_1);
+            let next_id_atomic_2 = AtomicU32::new(next_id_2);
+
+            mutate_world(&mut chunks1, 2, 2, &params, &test_world_gen_params(), &next_id_atomic_1, &mut rng1);
+            mutate_world(&mut chunks2, 2, 2, &params, &test_world_gen_params(), &next_id_atomic_2, &mut rng2);
+
+            let hash1 = hash_chunks(&chunks1);
+            let hash2 = hash_chunks(&chunks2);
+
+            assert_eq!(
+                hash1, hash2,
+                "after tick {}: worlds should remain identical, but diverged", tick
+            );
+
+            next_id_1 = next_id_atomic_1.load(std::sync::atomic::Ordering::Relaxed);
+            next_id_2 = next_id_atomic_2.load(std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

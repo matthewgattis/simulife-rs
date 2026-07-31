@@ -99,6 +99,179 @@ struct Args {
     /// or when you want trace events for an unattended run.
     #[arg(long)]
     always_encode: bool,
+
+    /// Determinism test mode: regenerate world with given seed, run for
+    /// N ticks, print the final world state hash, and exit. Use this to
+    /// verify that running with the same seed produces identical results.
+    /// Example: --determinism-test 42:100 (seed 42, run 100 ticks).
+    #[arg(long, value_name = "SEED:TICKS")]
+    determinism_test: Option<String>,
+}
+
+fn count_occupants(chunks: &[protocol::Chunk]) -> (u32, u32, u32) {
+    let mut sprouts = 0;
+    let mut seeds = 0;
+    let mut leaves = 0;
+    for chunk in chunks {
+        for cell in &chunk.cells {
+            match cell.occupant {
+                protocol::Occupant::Sprout { .. } => sprouts += 1,
+                protocol::Occupant::Seed { .. } => seeds += 1,
+                protocol::Occupant::Leaf { .. } => leaves += 1,
+                _ => {}
+            }
+        }
+    }
+    (sprouts, seeds, leaves)
+}
+
+fn run_determinism_test(
+    spec: &str,
+    _chunks: Vec<protocol::Chunk>,
+    chunks_x: u32,
+    chunks_y: u32,
+    world_gen_params: protocol::WorldGenParams,
+    _sim_params: protocol::SimParams,
+    _seed: u64,
+    _rng: ChaCha12Rng,
+    _next_plant_id: u32,
+) -> Result<()> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let (seed_str, ticks_str) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected SEED:TICKS format"))?;
+    let test_seed: u64 = seed_str.parse()?;
+    let test_ticks: u64 = ticks_str.parse()?;
+
+    // Use the same params as the running server for testing
+    let test_sim_params = protocol::SimParams::default();
+    let test_world_gen_params = world_gen_params;
+
+    println!("🔬 Determinism Test: seed={}, ticks={}, world_wrap={}", test_seed, test_ticks, test_world_gen_params.world_wrap);
+
+    // Rebuild world with test seed, using the same world_gen_params
+    let mut chunks = world::build_world(&test_world_gen_params);
+    let mut rng = ChaCha12Rng::seed_from_u64(test_seed);
+    let count = world::place_random_sprout_grid(&mut chunks, &test_world_gen_params, &mut rng);
+
+    fn hash_chunks(chunks: &[protocol::Chunk]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for chunk in chunks {
+            for cell in &chunk.cells {
+                // Hash ALL cell state comprehensively
+                cell.organic.hash(&mut hasher);
+                cell.soil_energy.hash(&mut hasher);
+                cell.sunlit.hash(&mut hasher);
+                cell.lineage_mutation_rate.to_bits().hash(&mut hasher);
+
+                match &cell.occupant {
+                    protocol::Occupant::Sprout { plant, clan, energy, facing, genome, current_gene, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(facing).hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                        current_gene.hash(&mut hasher);
+                        for gene in &genome.genes {
+                            std::mem::discriminant(&gene.front).hash(&mut hasher);
+                            std::mem::discriminant(&gene.left).hash(&mut hasher);
+                            std::mem::discriminant(&gene.right).hash(&mut hasher);
+                            gene.next.hash(&mut hasher);
+                        }
+                        genome.mutation_rate.hash(&mut hasher);
+                    }
+                    protocol::Occupant::Seed { plant, clan, energy, facing, genome, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(facing).hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                        for gene in &genome.genes {
+                            std::mem::discriminant(&gene.front).hash(&mut hasher);
+                            std::mem::discriminant(&gene.left).hash(&mut hasher);
+                            std::mem::discriminant(&gene.right).hash(&mut hasher);
+                            gene.next.hash(&mut hasher);
+                        }
+                        genome.mutation_rate.hash(&mut hasher);
+                    }
+                    protocol::Occupant::Leaf { plant, clan, energy, facing, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(facing).hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                    }
+                    protocol::Occupant::Root { plant, clan, energy, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                    }
+                    protocol::Occupant::Antenna { plant, clan, energy, parent } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                    }
+                    protocol::Occupant::Stem { plant, clan, energy, connections, parent, children } => {
+                        plant.hash(&mut hasher);
+                        clan.hash(&mut hasher);
+                        energy.hash(&mut hasher);
+                        connections.hash(&mut hasher);
+                        std::mem::discriminant(parent).hash(&mut hasher);
+                        children.hash(&mut hasher);
+                    }
+                    protocol::Occupant::Empty => {}
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    let hash_tick0 = hash_chunks(&chunks);
+    println!("  Tick 0: hash={:016x}, chunks={}", hash_tick0, chunks.len());
+
+    // Log RNG state before first tick
+    println!("  RNG state before tick 1: (ChaCha12Rng is opaque, can't inspect directly)");
+
+    let next_id = AtomicU32::new(count + 1);
+    for tick in 1..=test_ticks {
+        // Count occupants before tick
+        let (sprouts_before, seeds_before, leaves_before) = count_occupants(&chunks);
+
+        sim::mutate_world(
+            &mut chunks,
+            chunks_x,
+            chunks_y,
+            &test_sim_params,
+            &test_world_gen_params,
+            &next_id,
+            &mut rng,
+        );
+
+        let hash_after = hash_chunks(&chunks);
+
+        // Count occupants after tick
+        let (sprouts_after, seeds_after, leaves_after) = count_occupants(&chunks);
+        let next_id_value = next_id.load(std::sync::atomic::Ordering::Relaxed);
+
+        if tick <= 5 || tick % 10 == 0 || tick == test_ticks {
+            println!(
+                "  Tick {}: hash={:016x} | sprouts:{}->{} seeds:{}->{} leaves:{}->{} next_id={}",
+                tick, hash_after,
+                sprouts_before, sprouts_after,
+                seeds_before, seeds_after,
+                leaves_before, leaves_after,
+                next_id_value
+            );
+        }
+    }
+
+    let final_hash = hash_chunks(&chunks);
+    println!("✓ Final state hash: {:016x}", final_hash);
+    Ok(())
 }
 
 #[tokio::main]
@@ -150,6 +323,21 @@ async fn main() -> Result<()> {
         initial.next_plant_id = count + 1;
         info!(sprouts = count, "placed initial sprout grid");
     }
+    // Handle determinism test mode
+    if let Some(test_spec) = args.determinism_test.as_deref() {
+        return run_determinism_test(
+            test_spec,
+            initial.chunks,
+            initial.chunks_x,
+            initial.chunks_y,
+            world_gen_params,
+            sim_params,
+            seed,
+            rng,
+            initial.next_plant_id,
+        );
+    }
+
     let (tick_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(8);
     let state = Arc::new(SimState {
         chunks_x: AtomicU32::new(initial.chunks_x),

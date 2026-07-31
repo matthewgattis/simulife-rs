@@ -98,7 +98,7 @@ pub fn place_random_sprout_grid(
                     _ => Direction::West,
                 };
                 let mut starter = Genome::default_vine();
-                starter.mutation_rate = 1.0;
+                starter.mutation_rate = protocol::DEFAULT_MUTATION_RATE;
                 let mut genome = crate::sim::mutate_genome(&starter, rng);
                 // Log-uniform spread around DEFAULT controlled by
                 // params.initial_mutation_rate_octaves. 0 = no
@@ -108,10 +108,13 @@ pub fn place_random_sprout_grid(
                 } else {
                     0.0
                 };
-                let rate = protocol::DEFAULT_MUTATION_RATE * 2f32.powf(oct);
+                // Convert float octaves to fixed-point rate: DEFAULT_MUTATION_RATE * 2^oct.
+                // Keep octave math in float, then convert result to fixed-point.
+                let rate_float = (protocol::DEFAULT_MUTATION_RATE as f32 / protocol::RATE_SCALE as f32) * 2f32.powf(oct);
+                let rate = (rate_float * protocol::RATE_SCALE as f32).round() as u32;
                 genome.mutation_rate =
                     rate.clamp(protocol::MUTATION_RATE_MIN, protocol::MUTATION_RATE_MAX);
-                let stamp_rate = genome.mutation_rate;
+                let stamp_rate = genome.mutation_rate as f32 / protocol::RATE_SCALE as f32;
                 // Clan: which 2D box this sprout starts in. Encoded
                 // row-major: clan = box_y * boxes_x + box_x.
                 let bx = (x / box_w) as u32;
@@ -208,6 +211,7 @@ mod tests {
             default_organic: DEFAULT_ORGANIC,
             default_soil_energy: 100,
             initial_mutation_rate_octaves: 3.0,
+            world_wrap: true,
         }
     }
 
@@ -395,6 +399,155 @@ mod tests {
         // Other chunks untouched.
         for cell in &chunks[0].cells {
             assert!(matches!(cell.occupant, Occupant::Empty));
+        }
+    }
+
+    #[test]
+    fn determinism_same_seed_produces_identical_worlds() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_chunks(chunks: &[Chunk]) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            for chunk in chunks {
+                chunk.coord.hash(&mut hasher);
+                for cell in &chunk.cells {
+                    cell.organic.hash(&mut hasher);
+                    cell.soil_energy.hash(&mut hasher);
+                    cell.sunlit.hash(&mut hasher);
+                    // Hash the occupant. For sprouts, include the genome.
+                    match &cell.occupant {
+                        Occupant::Sprout {
+                            plant,
+                            clan,
+                            energy,
+                            facing,
+                            genome,
+                            ..
+                        } => {
+                            plant.hash(&mut hasher);
+                            clan.hash(&mut hasher);
+                            energy.hash(&mut hasher);
+                            std::mem::discriminant(facing).hash(&mut hasher);
+                            // Hash genome content to catch RNG variance
+                            for gene in &genome.genes {
+                                std::mem::discriminant(&gene.front).hash(&mut hasher);
+                                std::mem::discriminant(&gene.left).hash(&mut hasher);
+                                std::mem::discriminant(&gene.right).hash(&mut hasher);
+                                gene.next.hash(&mut hasher);
+                            }
+                            genome.mutation_rate.hash(&mut hasher);
+                        }
+                        other => std::mem::discriminant(other).hash(&mut hasher),
+                    }
+                }
+            }
+            hasher.finish()
+        }
+
+        let params = WorldGenParams {
+            chunks_x: 4,
+            chunks_y: 3,
+            boxes_x: 2,
+            boxes_y: 2,
+            sunlit_margin_frac: 0.10,
+            sprout_grid_spacing: 4,
+            toxic_border_thickness: 1,
+            toxic_border_organic: 1000,
+            default_organic: 0,
+            default_soil_energy: 10,
+            initial_mutation_rate_octaves: 2.0,
+            world_wrap: true,
+        };
+
+        // Build twice with same seed
+        let mut chunks1 = build_world(&params);
+        let mut rng1 = rand_chacha::ChaCha12Rng::seed_from_u64(42);
+        let count1 = place_random_sprout_grid(&mut chunks1, &params, &mut rng1);
+        let hash1 = hash_chunks(&chunks1);
+
+        let mut chunks2 = build_world(&params);
+        let mut rng2 = rand_chacha::ChaCha12Rng::seed_from_u64(42);
+        let count2 = place_random_sprout_grid(&mut chunks2, &params, &mut rng2);
+        let hash2 = hash_chunks(&chunks2);
+
+        // Build with different seed
+        let mut chunks3 = build_world(&params);
+        let mut rng3 = rand_chacha::ChaCha12Rng::seed_from_u64(99);
+        let _count3 = place_random_sprout_grid(&mut chunks3, &params, &mut rng3);
+        let hash3 = hash_chunks(&chunks3);
+
+        // Same seed → identical results
+        assert_eq!(
+            count1, count2,
+            "sprout count should be identical for same seed"
+        );
+        assert_eq!(hash1, hash2, "world hash should be identical for same seed");
+
+        // Different seed → different results (with high probability)
+        assert_ne!(hash1, hash3, "world hash should differ for different seed");
+    }
+
+    #[test]
+    fn determinism_multiple_runs_produce_same_state() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_chunks(chunks: &[Chunk]) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            for chunk in chunks {
+                for cell in &chunk.cells {
+                    cell.organic.hash(&mut hasher);
+                    cell.soil_energy.hash(&mut hasher);
+                    cell.sunlit.hash(&mut hasher);
+                    // Hash occupant including genome for sprouts
+                    match &cell.occupant {
+                        Occupant::Sprout {
+                            plant,
+                            clan,
+                            energy,
+                            facing,
+                            genome,
+                            ..
+                        } => {
+                            plant.hash(&mut hasher);
+                            clan.hash(&mut hasher);
+                            energy.hash(&mut hasher);
+                            std::mem::discriminant(facing).hash(&mut hasher);
+                            for gene in &genome.genes {
+                                std::mem::discriminant(&gene.front).hash(&mut hasher);
+                                std::mem::discriminant(&gene.left).hash(&mut hasher);
+                                std::mem::discriminant(&gene.right).hash(&mut hasher);
+                                gene.next.hash(&mut hasher);
+                            }
+                            genome.mutation_rate.hash(&mut hasher);
+                        }
+                        other => std::mem::discriminant(other).hash(&mut hasher),
+                    }
+                }
+            }
+            hasher.finish()
+        }
+
+        let params = WorldGenParams::default();
+        let seed = 123456;
+
+        // Run world generation 5 times with the same seed
+        let mut hashes = Vec::new();
+        for _ in 0..5 {
+            let mut chunks = build_world(&params);
+            let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(seed);
+            place_random_sprout_grid(&mut chunks, &params, &mut rng);
+            hashes.push(hash_chunks(&chunks));
+        }
+
+        // All runs should produce identical state
+        for (i, hash) in hashes.iter().enumerate().skip(1) {
+            assert_eq!(
+                *hash, hashes[0],
+                "run {} produced different world state than run 0",
+                i
+            );
         }
     }
 }
