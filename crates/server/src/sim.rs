@@ -17,6 +17,8 @@ use rand::Rng;
 use rand_chacha::ChaCha12Rng;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// Fixed bell-curve shape for the 3×3 soil/death kernels. Magnitude is
 /// dialed at runtime by `SimParams::*_scale` (1.0 = stock); the shape
@@ -352,13 +354,60 @@ pub async fn run_encode_loop(state: Arc<SimState>) {
 /// Wipe the world, reseed the RNG, reset tick + plant id, and broadcast a
 /// fresh Welcome + ChunkBatch so connected viewers refresh in place. Holds
 /// the world + rng mutexes for the swap; safe to call between sim ticks.
+fn hash_world_state(chunks: &[Chunk]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for chunk in chunks {
+        chunk.coord.hash(&mut hasher);
+        for cell in &chunk.cells {
+            cell.organic.hash(&mut hasher);
+            cell.soil_energy.hash(&mut hasher);
+            cell.sunlit.hash(&mut hasher);
+            match &cell.occupant {
+                Occupant::Sprout {
+                    plant,
+                    clan,
+                    energy,
+                    facing,
+                    genome,
+                    ..
+                } => {
+                    plant.hash(&mut hasher);
+                    clan.hash(&mut hasher);
+                    energy.hash(&mut hasher);
+                    std::mem::discriminant(facing).hash(&mut hasher);
+                    for gene in &genome.genes {
+                        std::mem::discriminant(&gene.front).hash(&mut hasher);
+                        std::mem::discriminant(&gene.left).hash(&mut hasher);
+                        std::mem::discriminant(&gene.right).hash(&mut hasher);
+                        gene.next.hash(&mut hasher);
+                    }
+                    genome.mutation_rate.hash(&mut hasher);
+                }
+                other => std::mem::discriminant(other).hash(&mut hasher),
+            }
+        }
+    }
+    hasher.finish()
+}
+
 pub fn regenerate_world(state: &SimState, seed: u64, params: WorldGenParams) {
     let chunks_x = params.chunks_x;
     let chunks_y = params.chunks_y;
 
+    info!(
+        seed,
+        chunks_x,
+        chunks_y,
+        sunlit_margin_frac = params.sunlit_margin_frac,
+        sprout_grid_spacing = params.sprout_grid_spacing,
+        "regenerate_world called"
+    );
+
     let mut new_chunks = crate::world::build_world(&params);
     let mut new_rng = ChaCha12Rng::seed_from_u64(seed);
     let count = crate::world::place_random_sprout_grid(&mut new_chunks, &params, &mut new_rng);
+    let world_hash = hash_world_state(&new_chunks);
+    info!(world_hash, "generated world state");
 
     {
         let mut world = state.world.lock().expect("sim lock poisoned");
@@ -377,7 +426,13 @@ pub fn regenerate_world(state: &SimState, seed: u64, params: WorldGenParams) {
     // flight against the *previous* world gets dropped before its
     // bytes hit the wire.
     state.world_gen.fetch_add(1, Ordering::Relaxed);
-    info!(seed, chunks_x, chunks_y, "world regenerated");
+    info!(
+        seed,
+        chunks_x,
+        chunks_y,
+        sprouts_placed = count,
+        "world regenerated"
+    );
 
     let (paused, tick_hz, tick_rate_limited) = {
         let ctrl = state.control.lock().expect("control poisoned");
