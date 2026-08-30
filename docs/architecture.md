@@ -1,4 +1,4 @@
-∂# Architecture Overview
+# Architecture Overview
 
 Simulife-rs is a distributed plant-evolution cellular automaton with a Rust server engine and networked wgpu/egui viewer clients connected via QUIC.
 

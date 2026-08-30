@@ -167,6 +167,7 @@ mkdir -p traces
 ./target/release/server --start-running \
   --trace-chrome traces/server.json --profile-duration-secs 10 &
 ./target/release/viewer \
+  --server-addr 127.0.0.1:4433 \
   --trace-chrome traces/viewer.json --profile-duration-secs 8 \
   --tick-metrics
 wait
